@@ -35,3 +35,18 @@ class SinusoidDataset(Dataset):
         L = np.random.randint(self.min, self.max+1)
         seq = make_sinusoidal_sequence(L, self.noise, self.num_cycles_fn, self.x_int_fn)
         return seq
+
+class GoedelDataset(Dataset):
+    def __init__(self, n_samples=1000):
+        self.n = n_samples
+        # Dummy data
+        self.data = [{
+            "context": "theorem square_equation_solution {x y : ℝ} (h : x^2 + y^2 = 2*x - 4*y - 5) : x + y = -1 := by",
+            "response": "  rw [← sub_eq_zero] at h\n  have h\' : (x - 1)^2 + (y + 2)^2 = 0 := by\n    linarith\n  have hx : x - 1 = 0 := by\n    have h_nonneg : (x - 1)^2 ≥ 0 := by apply sq_nonneg\n    have h_nonneg\' : (y + 2)^2 ≥ 0 := by apply sq_nonneg\n    have h_le := by linarith [h_nonneg, h_nonneg']\n    exact pow_eq_zero h_le\n  have hy : y + 2 = 0 := by\n    have h_nonneg : (x - 1)^2 ≥ 0 := by apply sq_nonneg\n    have h_nonneg\' : (y + 2)^2 ≥ 0 := by apply sq_nonneg\n    have h_le := by linarith [h_nonneg, h_nonneg']\n    exact pow_eq_zero h_le\n  have hx\' : x = 1 := by linarith\n  have hy\' : y = -2 := by linarith\n  rw [hx\', hy\']\n  norm_num"
+        }] * self.n
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx: int):
+        return self.data[idx]
