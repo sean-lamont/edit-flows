@@ -51,7 +51,7 @@ def collate_batch_goedel(x1s, x0s, pad_token: int, gap_token: int):
     }
 
 # given batch of x1s and coupling distribution, get x0s and alignments zs, pad and add BOS tokens
-def collate_batch(batch: List[torch.Tensor], coupling: Coupling | None = None, bos_token: int, pad_token: int, gap_token: int):
+def collate_batch(batch: List[torch.Tensor],  bos_token: int, pad_token: int, gap_token: int, coupling: Coupling | None = None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     coupling = coupling or EmptyCoupling()
     x1_list = [b.to(device) for b in batch]

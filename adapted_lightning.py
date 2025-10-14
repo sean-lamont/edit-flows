@@ -4,14 +4,15 @@ from utils import *
 from torch.nn import functional as F
 
 class AdaptedLitModule(pl.LightningModule):
-    def __init__(self, model: nn.Module, lr=1e-4, scheduler_cfg=None, anneal_end_step=10000,
-                 base_vocab_size: int = 128, pad_token: int = 129, gap_token: int = 130):
+    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None, anneal_end_step=10000):
         super().__init__()
         self.save_hyperparameters(ignore=['model'])
         self.model = model
         self.kappa = CubicScheduler(**(scheduler_cfg or {'a': 1.0, 'b': 1.0}))
         self.anneal_end_step = anneal_end_step
-        self.full_vocab_size = base_vocab_size + 3  # includes BOS, PAD, GAP
+        self.full_vocab_size = full_vocab_size
+        self.pad_token = pad_token_id
+        self.gap_token = gap_token_id
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.model.parameters(), lr=self.hparams.lr)
@@ -27,7 +28,7 @@ class AdaptedLitModule(pl.LightningModule):
 
         zt = sample_cond_pt(p0, p1, t, self.kappa)
         
-        xt, x_pad, z_gap, z_pad = rm_gap_tokens(zt, self.hparams.pad_token, self.hparams.gap_token)
+        xt, x_pad, z_gap, z_pad = rm_gap_tokens(zt, self.pad_token, self.gap_token)
 
         attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step)
 
@@ -45,7 +46,7 @@ class AdaptedLitModule(pl.LightningModule):
 
         uz_cat = fill_gap_tokens_with_repeats(ux_cat, z_gap, z_pad)
 
-        uz_mask = make_ut_mask_from_z(zt, z1, self.model.vocab_size, self.hparams.pad_token, self.hparams.gap_token)
+        uz_mask = make_ut_mask_from_z(zt, z1, self.full_vocab_size, self.pad_token, self.gap_token)
 
         u_tot = rates.sum(dim=(1, 2))
 

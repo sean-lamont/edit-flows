@@ -34,13 +34,12 @@ class SinusoidDataModule(pl.LightningDataModule):
                           collate_fn=self._collate, num_workers=0)
 
 class AdaptedDataModule(pl.LightningDataModule):
-    def __init__(self, pretrained_model_name: str, batch_size=64, n_train=1000, n_val=100, coupling: Optional[Coupling] = None):
+    def __init__(self, pretrained_model_name: str, batch_size=64, n_train=1000, n_val=100):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name)
         self.batch_size = batch_size
         self.n_train = n_train
         self.n_val = n_val
-        self.coupling = coupling or EmptyCoupling()
 
     def setup(self, stage=None):
         self.ds_train = GoedelDataset(n_samples=self.n_train)
@@ -57,7 +56,8 @@ class AdaptedDataModule(pl.LightningDataModule):
 
         # for initial attempt, x0 is just the context and x1 is the response.
 
-        return collate_batch_goedel(x1s, x0s)
+        # todo get appropriate id for gap_token
+        return collate_batch_goedel(x1s, x0s, pad_token=self.tokenizer.pad_token_id, gap_token=len(self.tokenizer))
         
     def train_dataloader(self):
         return DataLoader(self.ds_train, batch_size=self.batch_size, shuffle=True,
