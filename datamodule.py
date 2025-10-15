@@ -45,19 +45,39 @@ class AdaptedDataModule(pl.LightningDataModule):
         self.ds_train = GoedelDataset(n_samples=self.n_train)
         self.ds_val = GoedelDataset(n_samples=self.n_val)
 
-    # todo for error correction, x0 should be context with old response, x1 should be context with new response
+    # for error correction, x0 context is (goal + error + prev_attempt), for inital attempt just goal, target
     def _collate(self, batch):
-        contexts = [item["context"] for item in batch]
-        responses = [item["response"] for item in batch]
+        x0s = []
+        x1s = []
+        context_lens = []
+        for i in range(len(batch)):
+            context = batch[i]['context']
+            prev_attempt = batch[i].get('prev_attempt', '')
+            target = batch[i]['target']
 
-        # For now, we'll just use the response as x1 and an empty sequence as x0
-        x1s = self.tokenizer(responses, padding='longest', truncation=True, return_tensors='pt')['input_ids']
-        x0s = self.tokenizer(contexts, padding='longest', truncation=True, return_tensors='pt')['input_ids']
+            context_ids = self.tokenizer(context, padding=None, return_tensors='pt').input_ids.to(self.device)
+            context_len = context_ids.shape[0]
 
-        # for initial attempt, x0 is just the context and x1 is the response.
+            prev_ids = self.tokenizer(prev_attempt, padding=None, return_tensors='pt').input_ids.to(self.device)
+            target_ids = self.tokenizer(target, padding=None, return_tensors='pt').input_ids
+
+            # combine context and prev_attempt for x0, context and target for x1:
+            x0 = torch.cat((context_ids.squeeze(0), prev_ids.squeeze(0)[1:]), dim=0)
+            x1 = torch.cat((context_ids.squeeze(0), target_ids.squeeze(0)[1:]), dim=0)
+
+            x0s.append(x0)
+            x1s.append(x1)
+            context_lens.append(context_len)
+
+        # x1s = self.tokenizer(responses, padding='longest', truncation=True, return_tensors='pt')['input_ids']
+        # x0s = self.tokenizer(contexts, padding='longest', truncation=True, return_tensors='pt')['input_ids']
 
         # todo get appropriate id for gap_token
-        return collate_batch_goedel(x1s, x0s, pad_token=self.tokenizer.pad_token_id, gap_token=len(self.tokenizer))
+        # todo below assumes that the alignment will keep context at the start for all examples so we can use context_lens
+        ret =  collate_batch_goedel(x1s, x0s, pad_token=self.tokenizer.pad_token_id, gap_token=len(self.tokenizer))
+        ret['context_lens'] = context_lens
+
+        return ret
         
     def train_dataloader(self):
         return DataLoader(self.ds_train, batch_size=self.batch_size, shuffle=True,

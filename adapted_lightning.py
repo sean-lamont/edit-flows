@@ -21,7 +21,7 @@ class AdaptedLitModule(pl.LightningModule):
         return self.model(tokens, t, pad_mask, attn_mask_ratio)
 
     def _loss(self, batch):
-        x1, x0, z0, z1, t = batch['x1'], batch['x0'], batch['z0'], batch['z1'], batch['t']
+        x1, x0, z0, z1, t, context_lens = batch['x1'], batch['x0'], batch['z0'], batch['z1'], batch['t'], batch['context_lens']
         
         p0 = x2prob(z0, self.full_vocab_size)
         p1 = x2prob(z1, self.full_vocab_size)

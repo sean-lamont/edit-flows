@@ -23,6 +23,8 @@ def get_anneal_attn_mask(seq_len, bsz, dtype, device, attn_mask_ratio):
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 
+
+
 class AdaptedEditFlowsTransformer(nn.Module):
     def __init__(self, pretrained_model_name: str, hidden_dim=512):
         super().__init__()
@@ -48,8 +50,12 @@ class AdaptedEditFlowsTransformer(nn.Module):
     def forward(self, tokens: torch.Tensor, t: torch.Tensor, pad_mask: torch.Tensor, attn_mask_ratio: float = 0.0):
         B, L = tokens.shape
 
-        # todo update annealed mask to use pad_mask
         anneal_mask = get_anneal_attn_mask(L, B, dtype=self.model.dtype, device=tokens.device, attn_mask_ratio=attn_mask_ratio)
+
+
+        # update the 4D anneal mask with pad_mask to account for padding tokens, so nothing attends to pads. Note that pad_mask is True for pad tokens
+        anneal_mask = anneal_mask.masked_fill(pad_mask[:, None, None, :], torch.finfo(self.model.dtype).min)
+
 
         outputs = self.model(input_ids=tokens, attention_mask=anneal_mask, output_hidden_states=True)
         
