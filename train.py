@@ -9,7 +9,7 @@ def main():
 
     dm = AdaptedDataModule(tokenizer=tokenizer, batch_size=2)
 
-    lit_module = AdaptedLitModule(model, tokenizer.vocab_size, tokenizer.pad_token_id, len(tokenizer))
+    lit_module = AdaptedLitModule(model, len(tokenizer), tokenizer.pad_token_id, 151651) #using <|quad_end|>
 
     trainer = pl.Trainer(max_epochs=1, log_every_n_steps=1)
     trainer.fit(lit_module, dm)

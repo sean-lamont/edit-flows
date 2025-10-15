@@ -142,10 +142,11 @@ def qwen_new_forward(
         attentions=all_self_attns,
     )
 
+# todo latest qwen transformer code breaks this.. update to match
 def create_adapted_qwen_model(model_id):
+    transformers.models.qwen3.modeling_qwen3.Qwen3Model.forward = qwen_new_forward
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, trust_remote_code=True)
-    
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, trust_remote_code=True)
     # this is a bit of a hack, but it works for now
-    model.model.forward = qwen_new_forward.__get__(model.model)
+    # model.model.forward = qwen_new_forward
     return model, tokenizer

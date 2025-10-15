@@ -42,7 +42,9 @@ class GoedelDataset(Dataset):
         # Dummy data
         self.data = [{
             "context": "theorem square_equation_solution {x y : ℝ} (h : x^2 + y^2 = 2*x - 4*y - 5) : x + y = -1 := by",
-            "response": "  rw [← sub_eq_zero] at h\n  have h\' : (x - 1)^2 + (y + 2)^2 = 0 := by\n    linarith\n  have hx : x - 1 = 0 := by\n    have h_nonneg : (x - 1)^2 ≥ 0 := by apply sq_nonneg\n    have h_nonneg\' : (y + 2)^2 ≥ 0 := by apply sq_nonneg\n    have h_le := by linarith [h_nonneg, h_nonneg']\n    exact pow_eq_zero h_le\n  have hy : y + 2 = 0 := by\n    have h_nonneg : (x - 1)^2 ≥ 0 := by apply sq_nonneg\n    have h_nonneg\' : (y + 2)^2 ≥ 0 := by apply sq_nonneg\n    have h_le := by linarith [h_nonneg, h_nonneg']\n    exact pow_eq_zero h_le\n  have hx\' : x = 1 := by linarith\n  have hy\' : y = -2 := by linarith\n  rw [hx\', hy\']\n  norm_num"
+            # "target": "  rw [← sub_eq_zero] at h\n  have h\' : (x - 1)^2 + (y + 2)^2 = 0 := by\n    linarith\n  have hx : x - 1 = 0 := by\n    have h_nonneg : (x - 1)^2 ≥ 0 := by apply sq_nonneg\n    have h_nonneg\' : (y + 2)^2 ≥ 0 := by apply sq_nonneg\n    have h_le := by linarith [h_nonneg, h_nonneg']\n    exact pow_eq_zero h_le\n  have hy : y + 2 = 0 := by\n    have h_nonneg : (x - 1)^2 ≥ 0 := by apply sq_nonneg\n    have h_nonneg\' : (y + 2)^2 ≥ 0 := by apply sq_nonneg\n    have h_le := by linarith [h_nonneg, h_nonneg']\n    exact pow_eq_zero h_le\n  have hx\' : x = 1 := by linarith\n  have hy\' : y = -2 := by linarith\n  rw [hx\', hy\']\n  norm_num"
+            "target": "  rw [← sub_eq_zero] at h",
+            "prev_attempt":  "\n  have h\' : (x - 1)^2 + (y + 2)^2 = 0 := by"
         }] * self.n
 
     def __len__(self):
