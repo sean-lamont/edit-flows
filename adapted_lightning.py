@@ -4,7 +4,7 @@ from utils import *
 from torch.nn import functional as F
 
 class AdaptedLitModule(pl.LightningModule):
-    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None, anneal_end_step=10000):
+    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None, anneal_end_step=10):
         super().__init__()
         self.save_hyperparameters(ignore=['model'])
         self.model = model

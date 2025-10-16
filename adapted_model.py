@@ -9,6 +9,9 @@ from torch.nn.attention.flex_attention import create_block_mask, and_masks, or_m
 def causal_mask(b, h, q_idx, kv_idx):
     return q_idx >= kv_idx
 
+# bit of a hack, but can't just return True
+def full_mask(b, h, q_idx, kv_idx):
+    return q_idx >= 0
 
 def create_padding_mask(pads):
     def padding(b, h, q_idx, kv_idx):
@@ -26,24 +29,6 @@ def create_random_mask(attn_ratio, seq_len):
     return random_mask_func
 
 
-#
-# def get_anneal_attn_mask(seq_len, bsz, dtype, device, attn_mask_ratio):
-#     def create_random_mask(b, h, q_idx, kv_idx):
-#         return random_mask[q_idx][kv_idx]
-#
-#     mask = torch.full((seq_len, seq_len), 0, device=device)
-#     mask_cond = torch.arange(mask.size(-1), device=device)
-#     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 1)
-#     causal_mask = mask.to(dtype)
-#
-#     random_mask = torch.bernoulli(torch.full((seq_len, seq_len), 0.0, device=device) + attn_mask_ratio)
-#
-#     anneal_mask = torch.logical_or(causal_mask, random_mask)
-#     expanded_mask = anneal_mask[None, None, :, :].expand(bsz, 1, seq_len, seq_len)
-#     inverted_mask = 1.0 - expanded_mask.to(dtype)
-#
-#     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
-
 
 class AdaptedEditFlowsTransformer(nn.Module):
     def __init__(self, pretrained_model_name: str, hidden_dim=512):
@@ -54,7 +39,7 @@ class AdaptedEditFlowsTransformer(nn.Module):
                                                           trust_remote_code=True,
                                                           _attn_implementation='flex_attention').train()
 
-        # self.model.compile()
+        self.model.compile()
 
         self.vocab_size = self.model.config.vocab_size
         self.time_emb = SinusoidalTimeEmbedding(hidden_dim)
@@ -75,32 +60,24 @@ class AdaptedEditFlowsTransformer(nn.Module):
     def forward(self, tokens: torch.Tensor, t: torch.Tensor, pad_mask: torch.Tensor, attn_mask_ratio: float = 0.0):
         B, L = tokens.shape
 
-        # anneal_mask = get_anneal_attn_mask(L, B, dtype=self.model.dtype, device=tokens.device, attn_mask_ratio=attn_mask_ratio)
-
-        # update the 4D anneal mask with pad_mask to account for padding tokens, so nothing attends to pads. Note that pad_mask is True for pad tokens
-        # anneal_mask = anneal_mask.masked_fill(pad_mask[:, None, None, :], torch.finfo(self.model.dtype).min)
-
+        # todo
         # padding mask to the model might only be needed for inference, since it defaults to 0 gradient and is masked out from the loss
+        # padding_mask = create_padding_mask(pad_mask)
 
-        padding_mask = create_padding_mask(pad_mask)
         if attn_mask_ratio < 1.0:
             #compute block for annealed attention
             random_func = create_random_mask(attn_mask_ratio, L)
             or_mask = or_masks(*[causal_mask, random_func])
-            final_mask = and_masks(*[or_mask, padding_mask])
+            final_mask = or_mask
+            # final_mask = and_masks(*[or_mask, padding_mask])
         else:
-            # only compute padded attention block
-            final_mask = padding_mask
+            # keep full attention
+            # final_mask = padding_mask
+            final_mask = full_mask
 
+        block_mask = create_block_mask(final_mask, None, None, L, L, device='cuda')  # , _compile=True)
 
-        t0 = time.time()
-        # block_mask = create_block_mask(final_mask, B, None,L,L, device='cuda', _compile=True)
-        block_mask = create_block_mask(causal_mask, None, None, L, L, device='cuda')#, _compile=True)
-        print (f'time for block {time.time() - t0}')
-
-        # block_mask = create_mask(causal_mask,None, None,L,L, device='cuda')#, _compile=True)
-
-        print(tokens.shape)
+        # print(tokens.shape)
 
         outputs = self.model.forward(input_ids=tokens, attention_mask=block_mask, output_hidden_states=True,
                                      kernel_options={

@@ -22,3 +22,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# todo
+# - Prep and load data from error correction runs
+# - Add LoRA and quantization
+# - Add/test generation and validation setup

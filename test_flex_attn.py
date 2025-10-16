@@ -65,12 +65,13 @@ def create_random_mask(b,h,q_idx,kv_idx):
 full_mask = or_masks(*[causal_mask, create_random_mask])
 
 
-block_mask = create_block_mask(causal_mask, None, None, len(inputs['input_ids'][0]), len(inputs['input_ids'][0]), device='cuda', _compile=True)
+block_mask = create_block_mask(causal_mask, None, None, len(inputs['input_ids'][0]), len(inputs['input_ids'][0]), device='cuda')#, _compile=True)
+
 
 print (block_mask)
 model.eval()
 model.cuda()
-model.compile()
+# model.compile()
 
 # output_attnetions for flex_attention outputs only logsumexp of (bsize, nheads, q) rather than (bsize, nheads, q, k)..
 # https://github.com/huggingface/transformers/issues/36096
@@ -96,4 +97,5 @@ with torch.no_grad():
 #     "BLOCK_N2": 32,
 #                     })
 
-print(out.attentions[0][0][2][0])
+# print(out.hidden_states[-1].shape)
+print(len(out.hidden_states))
