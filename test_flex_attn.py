@@ -68,7 +68,7 @@ full_mask = or_masks(*[causal_mask, create_random_mask])
 block_mask = create_block_mask(causal_mask, None, None, len(inputs['input_ids'][0]), len(inputs['input_ids'][0]), device='cuda', _compile=True)
 
 print (block_mask)
-
+model.eval()
 model.cuda()
 model.compile()
 
@@ -77,15 +77,15 @@ model.compile()
 
 # error with triton, requires manually setting block sizes:
 # https://github.com/pytorch/pytorch/issues/133254
-out = model.forward(inputs['input_ids'].to('cuda'), attention_mask=block_mask, output_hidden_states=True, output_attentions=True,
-                    kernel_options={
-"BLOCK_M": 64,
-    "BLOCK_N": 64,
-    "BLOCK_M1": 32,
-    "BLOCK_N1": 64,
-    "BLOCK_M2": 64,
-    "BLOCK_N2": 32,
-                    })
+with torch.no_grad():
+    out = model.forward(inputs['input_ids'].to('cuda'), attention_mask=block_mask, output_hidden_states=True, output_attentions=True, kernel_options={
+    "BLOCK_M": 64,
+        "BLOCK_N": 64,
+        "BLOCK_M1": 32,
+        "BLOCK_N1": 64,
+        "BLOCK_M2": 64,
+        "BLOCK_N2": 32,
+                        })
 
 #                     kernel_options={
 # "BLOCK_M": 64,

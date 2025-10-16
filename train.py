@@ -11,12 +11,11 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-
-
     dm = AdaptedDataModule(tokenizer=tokenizer, batch_size=2)
 
     model = AdaptedEditFlowsTransformer(model_id)
-    lit_module = AdaptedLitModule(model, len(tokenizer), tokenizer.pad_token_id, 151651) #using <|quad_end|>
+    # hardcoded for now, since tokenizer length and model embedding matrix dimensions are different..
+    lit_module = AdaptedLitModule(model, 151936, tokenizer.pad_token_id, 151651) #using <|quad_end|>
 
     trainer = pl.Trainer(max_epochs=1, log_every_n_steps=1)
     trainer.fit(lit_module, dm)
