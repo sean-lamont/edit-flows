@@ -3,12 +3,14 @@ from torch.utils.data import Dataset
 import numpy as np
 from typing import Callable
 from utils import *
+import glob
+import json
 
 def make_sinusoidal_sequence(
-    length: int,
-    noise: float,
-    num_cycles_fn: Callable[[], float],
-    x_int_fn: Callable[[], float]
+        length: int,
+        noise: float,
+        num_cycles_fn: Callable[[], float],
+        x_int_fn: Callable[[], float]
 ):
     x = np.linspace(0, 4*np.pi, length)
     B = 2 * np.pi * num_cycles_fn() / (4*np.pi)
@@ -37,18 +39,17 @@ class SinusoidDataset(Dataset):
         return seq
 
 class GoedelDataset(Dataset):
-    def __init__(self, n_samples=1000):
-        self.n = n_samples
-        # Dummy data
-        self.data = [{
-            "context": "theorem square_equation_solution {x y : ℝ} (h : x^2 + y^2 = 2*x - 4*y - 5) : x + y = -1 := by" * 10,
-            # "target": "  rw [← sub_eq_zero] at h\n  have h\' : (x - 1)^2 + (y + 2)^2 = 0 := by\n    linarith\n  have hx : x - 1 = 0 := by\n    have h_nonneg : (x - 1)^2 ≥ 0 := by apply sq_nonneg\n    have h_nonneg\' : (y + 2)^2 ≥ 0 := by apply sq_nonneg\n    have h_le := by linarith [h_nonneg, h_nonneg']\n    exact pow_eq_zero h_le\n  have hy : y + 2 = 0 := by\n    have h_nonneg : (x - 1)^2 ≥ 0 := by apply sq_nonneg\n    have h_nonneg\' : (y + 2)^2 ≥ 0 := by apply sq_nonneg\n    have h_le := by linarith [h_nonneg, h_nonneg']\n    exact pow_eq_zero h_le\n  have hx\' : x = 1 := by linarith\n  have hy\' : y = -2 := by linarith\n  rw [hx\', hy\']\n  norm_num"
-            "target": "  rw [← sub_eq_zero] at h",
-            "prev_attempt":  "\n  have h\' : (x - 1)^2 + (y + 2)^2 = 0 := by"
-        }] * self.n
+    def __init__(self, folder_path='processed_data'):
+        self.files = glob.glob(f'{folder_path}/*.jsonl')
+        self.data = []
+
+        for file_path in self.files:
+            with open(file_path, 'r') as f:
+                for line in f:
+                    self.data.append(json.loads(line))
 
     def __len__(self):
-        return self.n
+        return len(self.data)
 
     def __getitem__(self, idx: int):
         return self.data[idx]

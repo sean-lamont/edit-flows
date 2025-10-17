@@ -1,8 +1,9 @@
 import torch
 import time
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 from utils import SinusoidalTimeEmbedding
 from torch.nn.attention.flex_attention import create_block_mask, and_masks, or_masks, create_mask
 
@@ -34,12 +35,39 @@ class AdaptedEditFlowsTransformer(nn.Module):
     def __init__(self, pretrained_model_name: str, hidden_dim=512):
         super().__init__()
 
+        bnb_conf = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
         # godel_id = "Goedel-LM/Goedel-Prover-V2-8B"
         self.model = AutoModelForCausalLM.from_pretrained(pretrained_model_name, dtype=torch.bfloat16,
-                                                          trust_remote_code=True,
-                                                          _attn_implementation='flex_attention').train()
+                                                          trust_remote_code=True,_attn_implementation='flex_attention'# 'flash_attention_2', # _attn_implementation='flex_attention',
+                                                          # quantization_config=bnb_conf,
+                                                          ).train()
 
-        self.model.compile()
+
+        # self.model = prepare_model_for_kbit_training(self.model)
+
+        # add lora and quantization to model:
+
+        # add LoRa and Quantization
+
+        peft_config = LoraConfig(
+            r=16,
+            lora_alpha=16,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        self.model = get_peft_model(self.model, peft_config)
+        self.model.print_trainable_parameters()
+
+        self.model.gradient_checkpointing_enable()
+
+        # self.model.compile()
 
         self.vocab_size = self.model.config.vocab_size
         self.time_emb = SinusoidalTimeEmbedding(hidden_dim)
@@ -52,7 +80,15 @@ class AdaptedEditFlowsTransformer(nn.Module):
         self._init_heads()
 
     def _init_heads(self):
-        for m in self.modules():
+        for m in self.rate_head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+        for m in self.sub_head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+        for m in self.ins_head.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.1)
                 if m.bias is not None: nn.init.zeros_(m.bias)
@@ -75,10 +111,13 @@ class AdaptedEditFlowsTransformer(nn.Module):
             # final_mask = padding_mask
             final_mask = full_mask
 
+
+        print(tokens.shape)
+
         block_mask = create_block_mask(final_mask, None, None, L, L, device='cuda')  # , _compile=True)
 
-        # print(tokens.shape)
 
+        # outputs = self.model.forward(input_ids=tokens,  output_hidden_states=True,)
         outputs = self.model.forward(input_ids=tokens, attention_mask=block_mask, output_hidden_states=True,
                                      kernel_options={
                                          "BLOCK_M": 32,
