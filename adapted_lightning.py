@@ -41,6 +41,21 @@ class AdaptedLitModule(pl.LightningModule):
 
         # todo adjust to ignore context, update max length in data loader
 
+        # could set rates to rates = rates[i] = rates[i][context_len:] assuming xt has same ids up to context len as x1 (assert)
+        # then can set z's to be from context length
+
+        # todo add logging for loss if it's a error correction or an initial generation (add field to batch)
+
+        # todo add wandb / bait integration
+
+        # todo add minif2f data from hf
+
+        # todo for future data gen runs, filter to be less than certain length to save time
+
+        # todo validation runs
+
+        # todo maybe try just training with error correction only?
+
         lam_ins = rates[:, :, 0]
         lam_sub = rates[:, :, 1]
         lam_del = rates[:, :, 2]
