@@ -1,12 +1,14 @@
 import lightning.pytorch as pl
+from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
+from torch.nn import functional as F
+
 from scheduler import CubicScheduler
 from utils import *
-from torch.nn import functional as F
-import time
-from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
+
 
 class AdaptedLitModule(pl.LightningModule):
-    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None, anneal_end_step=10000):
+    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None,
+                 anneal_end_step=10000):
         super().__init__()
         # self.save_hyperparameters(ignore=['model'])
         self.model = model
@@ -26,7 +28,8 @@ class AdaptedLitModule(pl.LightningModule):
         return self.model(tokens, t, pad_mask, attn_mask_ratio)
 
     def _loss(self, batch):
-        x1, x0, z0, z1, t, context_lens = batch['x1'], batch['x0'], batch['z0'], batch['z1'], batch['t'], batch['context_lens']
+        x1, x0, z0, z1, t, context_lens = batch['x1'], batch['x0'], batch['z0'], batch['z1'], batch['t'], batch[
+            'context_lens']
 
         p0 = x2prob(z0, self.full_vocab_size)
         p1 = x2prob(z1, self.full_vocab_size)
@@ -39,22 +42,25 @@ class AdaptedLitModule(pl.LightningModule):
 
         rates, ins_probs, sub_probs = self(xt, t, x_pad, attn_mask_ratio)
 
-        # todo adjust to ignore context, update max length in data loader
 
-        # could set rates to rates = rates[i] = rates[i][context_len:] assuming xt has same ids up to context len as x1 (assert)
-        # then can set z's to be from context length
+        # todo test:
 
-        # todo add logging for loss if it's a error correction or an initial generation (add field to batch)
+        # check that xt is the same as zt up to the context lengths for each sample:
+        for i in range(len(context_lens)):
+            assert torch.equal(xt[i, :context_lens[i]], x1[i, :context_lens[i]])
+            assert torch.equal(xt[i, :context_lens[i]], zt[i, :context_lens[i]])
 
-        # todo add wandb / bait integration
+        # mask where everything up to context_len is 0 for each element in batch
+        max_len = x1.size(1)
+        mask = torch.arange(max_len, device=self.device).unsqueeze(0) < context_lens.unsqueeze(1)
+        mask = mask.float()  # Convert boolean mask to float (0.0 or 1.0)
 
-        # todo add minif2f data from hf
+        inverse_mask_expanded = (1 - mask).unsqueeze(-1)
 
-        # todo for future data gen runs, filter to be less than certain length to save time
+        rates = rates * inverse_mask_expanded
+        ins_probs = ins_probs * inverse_mask_expanded
+        sub_probs = sub_probs * inverse_mask_expanded
 
-        # todo validation runs
-
-        # todo maybe try just training with error correction only?
 
         lam_ins = rates[:, :, 0]
         lam_sub = rates[:, :, 1]
@@ -98,3 +104,109 @@ class AdaptedLitModule(pl.LightningModule):
         self.log('val/loss', loss, prog_bar=True)
         for k, v in metrics.items():
             self.log(f'val/{k}', v, prog_bar=False)
+
+        # Select a few samples from the batch for generation
+        num_samples_to_log = min(4, batch['x0'].size(0))
+        for i in range(num_samples_to_log):
+            x0_sample = batch['x0'][i].unsqueeze(0)
+            context_len_sample = batch['context_lens'][i].unsqueeze(0)
+
+            # Generate a trajectory
+            trajectory = self.sample(x0_sample, context_len_sample, n_steps=100)
+
+            # Log the initial and final states of the trajectory
+            initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False)
+            final_seq = self.tokenizer.decode(trajectory[-1].squeeze().tolist(), skip_special_tokens=False)
+
+            print(f"Initial Sequence (Sample {i}): {initial_seq}")
+            print(f"Final Sequence (Sample {i}): {final_seq}")
+
+            # self.logger.experiment.log({
+            #     f"val/sample_{i}/initial_sequence": initial_seq,
+            #     f"val/sample_{i}/final_sequence": final_seq,
+            #     f"val/sample_{i}/trajectory_length": len(trajectory)
+            # })
+
+            # # Optionally, log the full trajectory as a list of strings
+            # full_trajectory_decoded = [self.tokenizer.decode(seq.squeeze().tolist(), skip_special_tokens=False) for seq in trajectory]
+            # self.logger.experiment.log({
+            #     f"val/sample_{i}/full_trajectory": wandb.Table(data=[[s] for s in full_trajectory_decoded], columns=["sequence"])
+            # })
+
+    # update sample to account for context (take in context and context length for a batch):
+    @torch.no_grad()
+    def sample(self, x0, context_lens, n_steps=100, t_min=0.0):
+        self.model.eval()
+        device = x0.device
+        t = torch.full((x0.size(0), 1), t_min, device=device)
+        dt = 1 / n_steps
+        pad_mask = (x0 == self.pad_token)
+        xt = x0.clone()
+        traj = [xt.clone()]
+
+        for _ in range(n_steps):
+            # Create a mask for the context tokens
+            max_len = xt.size(1)
+            context_mask = torch.arange(max_len, device=self.device).unsqueeze(0) < context_lens.unsqueeze(1)
+
+            rates, ins_probs, sub_probs = self(xt, t, pad_mask)
+            lam_i, lam_s, lam_d = rates[..., 0], rates[..., 1], rates[..., 2]
+
+            # Apply context mask to rates
+            lam_i = lam_i * (~context_mask)
+            lam_s = lam_s * (~context_mask)
+            lam_d = lam_d * (~context_mask)
+
+            ins_mask = torch.rand_like(lam_i) < 1 - torch.exp(-dt * lam_i)
+            ds_mask = torch.rand_like(lam_s) < 1 - torch.exp(-dt * (lam_s + lam_d))
+
+            prob_del = torch.where(ds_mask, lam_d / (lam_s + lam_d + 1e-8), torch.zeros_like(lam_d))
+
+            del_mask = torch.bernoulli(prob_del).bool()
+            sub_mask = ds_mask & ~del_mask
+            non_pad = ~pad_mask
+
+            ins_tokens = torch.full_like(xt, self.pad_token)
+            sub_tokens = torch.full_like(xt, self.pad_token)
+
+            if non_pad.any():
+                # Ensure we only sample for non-context tokens
+                ins_tokens[non_pad & ~context_mask[non_pad]] = torch.multinomial(
+                    ins_probs[non_pad & ~context_mask[non_pad]], 1).squeeze(-1)
+                sub_tokens[non_pad & ~context_mask[non_pad]] = torch.multinomial(
+                    sub_probs[non_pad & ~context_mask[non_pad]], 1).squeeze(-1)
+
+            # Apply operations only to non-context tokens
+            xt[sub_mask & ~context_mask] = sub_tokens[sub_mask & ~context_mask]
+            xt[del_mask & ~context_mask] = self.pad_token
+
+            for b in range(xt.size(0)):
+                # Only consider insertions for non-context tokens
+                positions = torch.nonzero(ins_mask[b] & ~context_mask[b], as_tuple=True)[0]
+                for p in positions.tolist():
+                    # Find a pad position *outside* the context to insert into
+                    # This is a simplified approach; a more robust solution might involve shifting
+                    # or finding the nearest available non-context pad token.
+                    # For now, we'll try to insert into any pad token, but the ins_mask ensures
+                    # the *decision* to insert came from a non-context token.
+                    pad_pos = (xt[b] == self.pad_token).nonzero(as_tuple=True)[0]
+                    if pad_pos.numel():
+                        # Find the first pad position that is also outside the context
+                        valid_insert_pos = [pos for pos in pad_pos if not context_mask[b, pos]]
+                        if valid_insert_pos:
+                            tgt = valid_insert_pos[0]
+                            xt[b, tgt] = ins_tokens[b, p]
+
+            pad_mask = (xt == self.pad_token)
+            t = t + dt
+            traj.append(xt.clone())
+
+        return traj
+
+
+
+
+        # todo add wandb / bait integration
+        # todo add minif2f data from hf
+        # todo for future data gen runs, filter to be less than certain length to save time
+        # todo maybe try just training with error correction only?

@@ -56,7 +56,7 @@ class AdaptedDataModule(pl.LightningDataModule):
             prev_attempt = batch[i].get('prev_attempt', '')
             target = batch[i]['target']
 
-            context_ids = self.tokenizer(context, return_tensors='pt').input_ids[:self.max_len]
+            context_ids = self.tokenizer(context, return_tensors='pt').input_ids
             context_len = context_ids.shape[1]
 
             prev_ids = self.tokenizer(prev_attempt,  return_tensors='pt').input_ids
@@ -70,7 +70,7 @@ class AdaptedDataModule(pl.LightningDataModule):
             x1s.append(x1.unsqueeze(0))
             context_lens.append(context_len)
 
-        # todo below assumes that the alignment will keep context at the start for all examples so we can use context_lens
+        # assumes that the alignment will keep context at the start for all examples so we can use context_lens
         ret =  collate_batch_goedel(x1s, x0s, pad_token=self.tokenizer.pad_token_id, gap_token=151651)
         ret['context_lens'] = context_lens
 
