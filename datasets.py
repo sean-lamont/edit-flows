@@ -46,7 +46,9 @@ class GoedelDataset(Dataset):
         for file_path in self.files:
             with open(file_path, 'r') as f:
                 for line in f:
-                    self.data.append(json.loads(line))
+                    sample = json.loads(line)
+                    if sample['type'] == 'correction':
+                        self.data.append(json.loads(line))
 
     def __len__(self):
         return len(self.data)
