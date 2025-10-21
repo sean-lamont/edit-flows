@@ -65,7 +65,7 @@ class AdaptedEditFlowsTransformer(nn.Module):
         self.model = get_peft_model(self.model, peft_config)
         self.model.print_trainable_parameters()
 
-        self.model.gradient_checkpointing_enable()
+        # self.model.gradient_checkpointing_enable()
 
         # self.model.compile()
 

@@ -3,7 +3,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from adapted_model import AdaptedEditFlowsTransformer
 from datamodule import AdaptedDataModule
-from adapt_qwen import create_adapted_qwen_model
 from adapted_lightning import  AdaptedLitModule
 from lightning.pytorch.strategies import DeepSpeedStrategy
 

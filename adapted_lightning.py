@@ -1,13 +1,16 @@
 import lightning.pytorch as pl
 from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
 from torch.nn import functional as F
+from torch.optim import Optimizer
+from transformers import AutoTokenizer
 
 from scheduler import CubicScheduler
 from utils import *
+from lightning.pytorch.utilities import grad_norm
 
 
 class AdaptedLitModule(pl.LightningModule):
-    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None,
+    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=1e-5, scheduler_cfg=None,
                  anneal_end_step=10000):
         super().__init__()
         # self.save_hyperparameters(ignore=['model'])
@@ -18,8 +21,17 @@ class AdaptedLitModule(pl.LightningModule):
         self.pad_token = pad_token_id
         self.gap_token = gap_token_id
         self.lr = lr
+        self.tokenizer = AutoTokenizer.from_pretrained("Goedel-LM/Goedel-Prover-V2-8B")
+
+    def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
+        for name,param in self.named_parameters():
+            if param.grad is not None:
+                print(f"Layer: {name}, Gradient Norm: {param.grad.norm().item():.4f}")
+            # else:
+            #     print(f"Layer: {name}, No gradient")
 
     def configure_optimizers(self):
+        print (f'lr: {self.lr}')
         return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, eps=1e-6)
         # return DeepSpeedCPUAdam(self.parameters(), 1e-5, eps=1e-6)
         # return torch.optim.Adam(self.model.parameters(), lr=self.hparams.lr)
@@ -36,30 +48,55 @@ class AdaptedLitModule(pl.LightningModule):
 
         zt = sample_cond_pt(p0, p1, t, self.kappa)
 
+
         xt, x_pad, z_gap, z_pad = rm_gap_tokens(zt, self.pad_token, self.gap_token)
 
         attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step)
 
+
         rates, ins_probs, sub_probs = self(xt, t, x_pad, attn_mask_ratio)
+
+        print (f'rates require_grad: {rates.requires_grad}')
+        print (f'rates require_grad: {rates.grad_fn}')
+
+        loss =  rates.sum(dim=(1,2))
+        metrics = {'rates': rates.sum(dim=(1,2))}
+
+        print (f'loss requires: {loss.requires_grad}')
+        print (f'grad_fn: {loss.grad_fn}')
 
 
         # todo test:
 
         # check that xt is the same as zt up to the context lengths for each sample:
         for i in range(len(context_lens)):
-            assert torch.equal(xt[i, :context_lens[i]], x1[i, :context_lens[i]])
-            assert torch.equal(xt[i, :context_lens[i]], zt[i, :context_lens[i]])
+            # assert torch.equal(xt[i, :context_lens[i]], x1[i, :context_lens[i]])
+            # assert torch.equal(xt[i, :context_lens[i]], zt[i, :context_lens[i]])
+
+
+            # print('x1\n\n')
+            # print (self.tokenizer.batch_decode(x1))
+            # print('xt\n\n')
+            # print (self.tokenizer.batch_decode(xt))
+            # print('\n\nz1\n\n')
+            # print (self.tokenizer.batch_decode(z1))
+            # print('\n\nzt\n\n')
+            # print (self.tokenizer.batch_decode(zt))
+            # print (f'\n\n\n')
+
+            print (torch.equal(xt[i, :context_lens[i]], x1[i, :context_lens[i]]))
+            print (torch.equal(xt[i, :context_lens[i]], zt[i, :context_lens[i]]))
 
         # mask where everything up to context_len is 0 for each element in batch
-        max_len = x1.size(1)
+        max_len = xt.size(1)
         mask = torch.arange(max_len, device=self.device).unsqueeze(0) < context_lens.unsqueeze(1)
         mask = mask.float()  # Convert boolean mask to float (0.0 or 1.0)
 
         inverse_mask_expanded = (1 - mask).unsqueeze(-1)
 
-        rates = rates * inverse_mask_expanded
-        ins_probs = ins_probs * inverse_mask_expanded
-        sub_probs = sub_probs * inverse_mask_expanded
+        # rates = rates * inverse_mask_expanded
+        # ins_probs = ins_probs * inverse_mask_expanded
+        # sub_probs = sub_probs * inverse_mask_expanded
 
 
         lam_ins = rates[:, :, 0]
