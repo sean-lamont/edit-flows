@@ -203,10 +203,6 @@ class AdaptedLitModule(pl.LightningModule):
 
         return traj
 
-
-
-
         # todo add wandb / bait integration
-        # todo add minif2f data from hf
         # todo for future data gen runs, filter to be less than certain length to save time
         # todo maybe try just training with error correction only?
