@@ -136,8 +136,8 @@ class AdaptedLitModule(pl.LightningModule):
         return loss_vec.mean(), {
             'utot': u_tot.mean(),
             'u_tot / N': (u_tot / N).mean(),
-            '-term2': term2.mean(),
-            '-term2 / N': (term2 / N).mean(),
+            '-term2': -term2.mean(),
+            '-term2 / N': -(term2 / N).mean(),
             'u_ins': lam_ins.sum(1).mean(),
             'u_sub': lam_sub.sum(1).mean(),
             'u_del': lam_del.sum(1).mean(),
