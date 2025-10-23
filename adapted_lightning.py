@@ -33,19 +33,22 @@ class AdaptedLitModule(pl.LightningModule):
             #     print(f"Layer: {name}, No gradient")
 
         # print last lr from scheduler
-        print (f'scheduler lr: {self.lr_schedulers().get_last_lr()}')
+        # print (f'scheduler lr: {self.lr_schedulers().get_last_lr()}')
 
     def configure_optimizers(self):
         print (f'lr: {self.lr}')
         # return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, eps=1e-6)
         # return DeepSpeedCPUAdam(self.parameters(), 1e-5, eps=1e-6)
-        opt = torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
 
-        steps = 500000 # change based on total steps
+        return torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
 
-        scheduler = get_cosine_schedule_with_warmup(opt, num_warmup_steps=2000, num_training_steps=steps)
-
-        return {'optimizer': opt, 'lr_scheduler': {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}}
+        # opt = torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
+        #
+        # steps = 500000 # change based on total steps
+        #
+        # scheduler = get_cosine_schedule_with_warmup(opt, num_warmup_steps=2000, num_training_steps=steps)
+        #
+        # return {'optimizer': opt, 'lr_scheduler': {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}}
 
 
     def forward(self, tokens, t, pad_mask, attn_mask_ratio):

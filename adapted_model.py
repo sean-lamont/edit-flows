@@ -44,8 +44,8 @@ class AdaptedEditFlowsTransformer(nn.Module):
         # godel_id = "Goedel-LM/Goedel-Prover-V2-8B"
         self.model = AutoModelForCausalLM.from_pretrained(pretrained_model_name, dtype=torch.bfloat16,
                                                           trust_remote_code=True,
-                                                          # _attn_implementation='flex_attention',
-                                                       _attn_implementation='flash_attention_2', # _attn_implementation='flex_attention',
+                                                          _attn_implementation='flex_attention',
+                                                       # _attn_implementation='flash_attention_2', # _attn_implementation='flex_attention',
                                                           # quantization_config=bnb_conf,
                                                           ).train()
 
@@ -119,17 +119,17 @@ class AdaptedEditFlowsTransformer(nn.Module):
         block_mask = create_block_mask(final_mask, None, None, L, L, device='cuda')  # , _compile=True)
 
 
-        outputs = self.model.forward(input_ids=tokens,  output_hidden_states=True,)
+        # outputs = self.model.forward(input_ids=tokens,  output_hidden_states=True,)
 
-        # outputs = self.model.forward(input_ids=tokens, attention_mask=block_mask, output_hidden_states=True,
-        #                              kernel_options={
-        #                                  "BLOCK_M": 32,
-        #                                  "BLOCK_N": 32,
-        #                                  "BLOCK_M1": 32,
-        #                                  "BLOCK_N1": 32,
-        #                                  "BLOCK_M2": 32,
-        #                                  "BLOCK_N2": 32,
-        #                              })
+        outputs = self.model.forward(input_ids=tokens, attention_mask=block_mask, output_hidden_states=True,
+                                     kernel_options={
+                                         "BLOCK_M": 32,
+                                         "BLOCK_N": 32,
+                                         "BLOCK_M1": 32,
+                                         "BLOCK_N1": 32,
+                                         "BLOCK_M2": 32,
+                                         "BLOCK_N2": 32,
+                                     })
 
         hidden_states = outputs.hidden_states[-1]
 
