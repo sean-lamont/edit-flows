@@ -23,9 +23,10 @@ def main():
     wandb_logger.watch(lit_module, log_freq=10)
 
     trainer = pl.Trainer(max_epochs=2, log_every_n_steps=1,
-                         # strategy='deepspeed_stage_2_offload',
+                         strategy='deepspeed_stage_2_offload',
                          precision='bf16-mixed',
                          logger=wandb_logger,
+                         accumulate_grad_batches=8,
                          gradient_clip_val=100.0,
                          num_sanity_val_steps=0,
                          )

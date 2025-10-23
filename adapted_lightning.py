@@ -12,7 +12,7 @@ import torchviz
 
 
 class AdaptedLitModule(pl.LightningModule):
-    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=3e-4, scheduler_cfg=None,
+    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=5e-5, scheduler_cfg=None,
                  anneal_end_step=10000):
         super().__init__()
         # self.save_hyperparameters(ignore=['model'])
@@ -24,6 +24,7 @@ class AdaptedLitModule(pl.LightningModule):
         self.gap_token = gap_token_id
         self.lr = lr
         self.tokenizer = AutoTokenizer.from_pretrained("Goedel-LM/Goedel-Prover-V2-8B")
+        self._oom_in_backward = False
 
     # def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
         # for name,param in self.named_parameters():
@@ -37,7 +38,7 @@ class AdaptedLitModule(pl.LightningModule):
 
     def configure_optimizers(self):
         # print (f'lr: {self.lr}')
-        # return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, eps=1e-6)
+        return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
         # return DeepSpeedCPUAdam(self.parameters(), 1e-5, eps=1e-6)
 
         return torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
@@ -145,11 +146,64 @@ class AdaptedLitModule(pl.LightningModule):
         }
 
     def training_step(self, batch, batch_idx):
-        loss, metrics = self._loss(batch)
-        self.log('train/loss', loss, prog_bar=True)
-        for k, v in metrics.items():
-            self.log(f'train/{k}', v, prog_bar=False)
-        return loss
+        try:
+            loss, metrics = self._loss(batch)
+            self.log('train/loss', loss, prog_bar=True)
+            for k, v in metrics.items():
+                self.log(f'train/{k}', v, prog_bar=False)
+            return loss
+        except Exception as e:
+            print (f'Exception: {e}')
+            torch.cuda.empty_cache()
+            return None
+
+    def backward(self, loss, *args, **kwargs):
+        """
+        This hook is called by Lightning after training_step.
+        """
+        # Ensure the flag is reset at the start of every backward call
+        self._oom_in_backward = False
+
+        try:
+            # 2. Backward pass
+            loss.backward()
+
+        except torch.cuda.OutOfMemoryError:
+            print(f"CUDA OOM in BACKWARD pass. Clearing gradients and skipping optimizer step.")
+            # Set the flag to true
+            self._oom_in_backward = True
+            torch.cuda.empty_cache()
+
+            # We must clear gradients here, otherwise they might be stale
+            # for the next successful batch
+            self.zero_grad(set_to_none=True)
+
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                print(
+                    f"CUDA OOM (RuntimeError) in BACKWARD pass. Clearing gradients and skipping optimizer step.")
+                self._oom_in_backward = True
+                torch.cuda.empty_cache()
+                self.zero_grad(set_to_none=True)
+            else:
+                raise e
+
+    def optimizer_step(self, epoch, batch_idx, optimizer, *args, **kwargs):
+        """
+        This hook is called by Lightning after backward().
+        """
+        # 3. Optimizer step
+
+        # Check the flag from the backward pass
+        if self._oom_in_backward:
+            print(f"Skipping optimizer step for batch {batch_idx} due to OOM in backward.")
+            # Reset flag and skip step
+            self._oom_in_backward = False
+            return
+
+            # If no OOM, proceed with the optimizer step
+        super().optimizer_step(epoch, batch_idx, optimizer, *args, **kwargs)
+
 
     def validation_step(self, batch, batch_idx):
         loss, metrics = self._loss(batch)
