@@ -124,7 +124,6 @@ class AdaptedLitModule(pl.LightningModule):
         term2  = (log_uz_cat * uz_mask * sched_coeff.unsqueeze(-1)).sum(dim=(1, 2))
 
         loss_vec = u_tot - term2
-        # loss_vec = u_tot - (log_uz_cat * uz_mask * sched_coeff.unsqueeze(-1)).mean(dim=(1, 2))
 
         # normalise by aligned sequence length
         N = torch.sum(~z_pad, dim=1).float()
@@ -257,8 +256,8 @@ class AdaptedLitModule(pl.LightningModule):
         return traj
 
         # todo validation testing
-        # todo ensure all samples keep context assertions
-        # todo fix context masking/adjustments
+        # todo ensure all samples keep context assertions, fix + test context masking
+        # todo log edit distance
 
         # todo add wandb / bait integration
         # todo for future data gen runs, filter to be less than certain length to save time
