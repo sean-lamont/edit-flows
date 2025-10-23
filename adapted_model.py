@@ -69,7 +69,7 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         self.model.gradient_checkpointing_enable()
 
-        # self.model.compile()
+        self.model.compile()
 
         self.vocab_size = self.model.config.vocab_size
         self.time_emb = SinusoidalTimeEmbedding(hidden_dim)
@@ -114,7 +114,7 @@ class AdaptedEditFlowsTransformer(nn.Module):
             final_mask = full_mask
 
 
-        print(tokens.shape)
+        # print(tokens.shape)
 
         block_mask = create_block_mask(final_mask, None, None, L, L, device='cuda')  # , _compile=True)
 

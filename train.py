@@ -1,4 +1,5 @@
 import lightning.pytorch as pl
+from lightning.pytorch.loggers import WandbLogger
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from adapted_model import AdaptedEditFlowsTransformer
@@ -17,11 +18,17 @@ def main():
     # hardcoded for now, since tokenizer length and model embedding matrix dimensions are different..
     lit_module = AdaptedLitModule(model, 151936, tokenizer.pad_token_id, 151651) #using <|quad_end|>
 
-    trainer = pl.Trainer(max_epochs=1, log_every_n_steps=1,
+
+    wandb_logger = WandbLogger(project="edit-flows", name="test_1",  )
+    wandb_logger.watch(lit_module, log_freq=10)
+
+    trainer = pl.Trainer(max_epochs=2, log_every_n_steps=1,
                          # strategy='deepspeed_stage_2_offload',
                          precision='bf16-mixed',
+                         logger=wandb_logger,
                          gradient_clip_val=100.0,
-                         num_sanity_val_steps=0)
+                         num_sanity_val_steps=0,
+                         )
     trainer.fit(lit_module, dm)
 
 if __name__ == "__main__":

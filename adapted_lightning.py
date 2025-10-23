@@ -25,10 +25,10 @@ class AdaptedLitModule(pl.LightningModule):
         self.lr = lr
         self.tokenizer = AutoTokenizer.from_pretrained("Goedel-LM/Goedel-Prover-V2-8B")
 
-    def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
-        for name,param in self.named_parameters():
-            if param.grad is not None:
-                print(f"Layer: {name}, Gradient Norm: {param.grad.norm().item():.4f}")
+    # def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
+        # for name,param in self.named_parameters():
+        #     if param.grad is not None:
+        #         print(f"Layer: {name}, Gradient Norm: {param.grad.norm().item():.4f}")
             # else:
             #     print(f"Layer: {name}, No gradient")
 
@@ -36,7 +36,7 @@ class AdaptedLitModule(pl.LightningModule):
         # print (f'scheduler lr: {self.lr_schedulers().get_last_lr()}')
 
     def configure_optimizers(self):
-        print (f'lr: {self.lr}')
+        # print (f'lr: {self.lr}')
         # return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, eps=1e-6)
         # return DeepSpeedCPUAdam(self.parameters(), 1e-5, eps=1e-6)
 
@@ -121,8 +121,9 @@ class AdaptedLitModule(pl.LightningModule):
 
         log_uz_cat = torch.clamp(uz_cat.log(), min=-20)
 
+        term2  = (log_uz_cat * uz_mask * sched_coeff.unsqueeze(-1)).sum(dim=(1, 2))
 
-        loss_vec = u_tot - (log_uz_cat * uz_mask * sched_coeff.unsqueeze(-1)).sum(dim=(1, 2))
+        loss_vec = u_tot - term2
         # loss_vec = u_tot - (log_uz_cat * uz_mask * sched_coeff.unsqueeze(-1)).mean(dim=(1, 2))
 
         # normalise by aligned sequence length
@@ -133,7 +134,10 @@ class AdaptedLitModule(pl.LightningModule):
         loss_vec = loss_vec / N
 
         return loss_vec.mean(), {
-            'u_tot': u_tot.mean(),
+            'utot': u_tot.mean(),
+            'u_tot / N': (u_tot / N).mean(),
+            'term2': term2.mean(),
+            'term2 / N': (term2 / N).mean(),
             'u_ins': lam_ins.sum(1).mean(),
             'u_sub': lam_sub.sum(1).mean(),
             'u_del': lam_del.sum(1).mean(),
@@ -154,33 +158,33 @@ class AdaptedLitModule(pl.LightningModule):
         for k, v in metrics.items():
             self.log(f'val/{k}', v, prog_bar=False)
 
-        # Select a few samples from the batch for generation
-        num_samples_to_log = min(4, batch['x0'].size(0))
-        for i in range(num_samples_to_log):
-            x0_sample = batch['x0'][i].unsqueeze(0)
-            context_len_sample = batch['context_lens'][i].unsqueeze(0)
-
-            # Generate a trajectory
-            trajectory = self.sample(x0_sample, context_len_sample, n_steps=100)
-
-            # Log the initial and final states of the trajectory
-            initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False)
-            final_seq = self.tokenizer.decode(trajectory[-1].squeeze().tolist(), skip_special_tokens=False)
-
-            print(f"Initial Sequence (Sample {i}): {initial_seq}")
-            print(f"Final Sequence (Sample {i}): {final_seq}")
-
-            # self.logger.experiment.log({
-            #     f"val/sample_{i}/initial_sequence": initial_seq,
-            #     f"val/sample_{i}/final_sequence": final_seq,
-            #     f"val/sample_{i}/trajectory_length": len(trajectory)
-            # })
-
-            # # Optionally, log the full trajectory as a list of strings
-            # full_trajectory_decoded = [self.tokenizer.decode(seq.squeeze().tolist(), skip_special_tokens=False) for seq in trajectory]
-            # self.logger.experiment.log({
-            #     f"val/sample_{i}/full_trajectory": wandb.Table(data=[[s] for s in full_trajectory_decoded], columns=["sequence"])
-            # })
+        # # Select a few samples from the batch for generation
+        # num_samples_to_log = min(4, batch['x0'].size(0))
+        # for i in range(num_samples_to_log):
+        #     x0_sample = batch['x0'][i].unsqueeze(0)
+        #     context_len_sample = batch['context_lens'][i].unsqueeze(0)
+        #
+        #     # Generate a trajectory
+        #     trajectory = self.sample(x0_sample, context_len_sample, n_steps=100)
+        #
+        #     # Log the initial and final states of the trajectory
+        #     initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False)
+        #     final_seq = self.tokenizer.decode(trajectory[-1].squeeze().tolist(), skip_special_tokens=False)
+        #
+        #     print(f"Initial Sequence (Sample {i}): {initial_seq}")
+        #     print(f"Final Sequence (Sample {i}): {final_seq}")
+        #
+        #     # self.logger.experiment.log({
+        #     #     f"val/sample_{i}/initial_sequence": initial_seq,
+        #     #     f"val/sample_{i}/final_sequence": final_seq,
+        #     #     f"val/sample_{i}/trajectory_length": len(trajectory)
+        #     # })
+        #
+        #     # # Optionally, log the full trajectory as a list of strings
+        #     # full_trajectory_decoded = [self.tokenizer.decode(seq.squeeze().tolist(), skip_special_tokens=False) for seq in trajectory]
+        #     # self.logger.experiment.log({
+        #     #     f"val/sample_{i}/full_trajectory": wandb.Table(data=[[s] for s in full_trajectory_decoded], columns=["sequence"])
+        #     # })
 
     # update sample to account for context (take in context and context length for a batch):
     @torch.no_grad()
