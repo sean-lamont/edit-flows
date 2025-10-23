@@ -18,9 +18,9 @@ def main():
     lit_module = AdaptedLitModule(model, 151936, tokenizer.pad_token_id, 151651) #using <|quad_end|>
 
     trainer = pl.Trainer(max_epochs=1, log_every_n_steps=1,
-                         strategy='deepspeed_stage_3_offload',
+                         # strategy='deepspeed_stage_2_offload',
                          precision='bf16-mixed',
-                         gradient_clip_val=1.0,
+                         gradient_clip_val=100.0,
                          num_sanity_val_steps=0)
     trainer.fit(lit_module, dm)
 

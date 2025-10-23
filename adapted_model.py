@@ -43,7 +43,9 @@ class AdaptedEditFlowsTransformer(nn.Module):
         )
         # godel_id = "Goedel-LM/Goedel-Prover-V2-8B"
         self.model = AutoModelForCausalLM.from_pretrained(pretrained_model_name, dtype=torch.bfloat16,
-                                                          trust_remote_code=True,_attn_implementation='flex_attention'# 'flash_attention_2', # _attn_implementation='flex_attention',
+                                                          trust_remote_code=True,
+                                                          # _attn_implementation='flex_attention',
+                                                       _attn_implementation='flash_attention_2', # _attn_implementation='flex_attention',
                                                           # quantization_config=bnb_conf,
                                                           ).train()
 
@@ -65,7 +67,7 @@ class AdaptedEditFlowsTransformer(nn.Module):
         self.model = get_peft_model(self.model, peft_config)
         self.model.print_trainable_parameters()
 
-        # self.model.gradient_checkpointing_enable()
+        self.model.gradient_checkpointing_enable()
 
         # self.model.compile()
 
@@ -77,21 +79,21 @@ class AdaptedEditFlowsTransformer(nn.Module):
                                       nn.Linear(hidden_dim, self.vocab_size))
         self.sub_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, hidden_dim), nn.SiLU(),
                                       nn.Linear(hidden_dim, self.vocab_size))
-        self._init_heads()
+        # self._init_heads()
 
-    def _init_heads(self):
-        for m in self.rate_head.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
-                if m.bias is not None: nn.init.zeros_(m.bias)
-        for m in self.sub_head.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
-                if m.bias is not None: nn.init.zeros_(m.bias)
-        for m in self.ins_head.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
-                if m.bias is not None: nn.init.zeros_(m.bias)
+    # def _init_heads(self):
+    #     for m in self.rate_head.modules():
+    #         if isinstance(m, nn.Linear):
+    #             nn.init.xavier_uniform_(m.weight, gain=0.1)
+    #             if m.bias is not None: nn.init.zeros_(m.bias)
+    #     for m in self.sub_head.modules():
+    #         if isinstance(m, nn.Linear):
+    #             nn.init.xavier_uniform_(m.weight, gain=0.1)
+    #             if m.bias is not None: nn.init.zeros_(m.bias)
+    #     for m in self.ins_head.modules():
+    #         if isinstance(m, nn.Linear):
+    #             nn.init.xavier_uniform_(m.weight, gain=0.1)
+    #             if m.bias is not None: nn.init.zeros_(m.bias)
 
     def forward(self, tokens: torch.Tensor, t: torch.Tensor, pad_mask: torch.Tensor, attn_mask_ratio: float = 0.0):
         B, L = tokens.shape
@@ -117,16 +119,17 @@ class AdaptedEditFlowsTransformer(nn.Module):
         block_mask = create_block_mask(final_mask, None, None, L, L, device='cuda')  # , _compile=True)
 
 
-        # outputs = self.model.forward(input_ids=tokens,  output_hidden_states=True,)
-        outputs = self.model.forward(input_ids=tokens, attention_mask=block_mask, output_hidden_states=True,
-                                     kernel_options={
-                                         "BLOCK_M": 32,
-                                         "BLOCK_N": 32,
-                                         "BLOCK_M1": 32,
-                                         "BLOCK_N1": 32,
-                                         "BLOCK_M2": 32,
-                                         "BLOCK_N2": 32,
-                                     })
+        outputs = self.model.forward(input_ids=tokens,  output_hidden_states=True,)
+
+        # outputs = self.model.forward(input_ids=tokens, attention_mask=block_mask, output_hidden_states=True,
+        #                              kernel_options={
+        #                                  "BLOCK_M": 32,
+        #                                  "BLOCK_N": 32,
+        #                                  "BLOCK_M1": 32,
+        #                                  "BLOCK_N1": 32,
+        #                                  "BLOCK_M2": 32,
+        #                                  "BLOCK_N2": 32,
+        #                              })
 
         hidden_states = outputs.hidden_states[-1]
 

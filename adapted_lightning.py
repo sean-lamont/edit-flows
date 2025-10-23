@@ -2,15 +2,17 @@ import lightning.pytorch as pl
 from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
 from torch.nn import functional as F
 from torch.optim import Optimizer
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from scheduler import CubicScheduler
 from utils import *
 from lightning.pytorch.utilities import grad_norm
+import torchviz
+
 
 
 class AdaptedLitModule(pl.LightningModule):
-    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=1e-5, scheduler_cfg=None,
+    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=3e-4, scheduler_cfg=None,
                  anneal_end_step=10000):
         super().__init__()
         # self.save_hyperparameters(ignore=['model'])
@@ -30,11 +32,21 @@ class AdaptedLitModule(pl.LightningModule):
             # else:
             #     print(f"Layer: {name}, No gradient")
 
+        # print last lr from scheduler
+        print (f'scheduler lr: {self.lr_schedulers().get_last_lr()}')
+
     def configure_optimizers(self):
         print (f'lr: {self.lr}')
-        return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, eps=1e-6)
+        # return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, eps=1e-6)
         # return DeepSpeedCPUAdam(self.parameters(), 1e-5, eps=1e-6)
-        # return torch.optim.Adam(self.model.parameters(), lr=self.hparams.lr)
+        opt = torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
+
+        steps = 500000 # change based on total steps
+
+        scheduler = get_cosine_schedule_with_warmup(opt, num_warmup_steps=2000, num_training_steps=steps)
+
+        return {'optimizer': opt, 'lr_scheduler': {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}}
+
 
     def forward(self, tokens, t, pad_mask, attn_mask_ratio):
         return self.model(tokens, t, pad_mask, attn_mask_ratio)
@@ -48,28 +60,14 @@ class AdaptedLitModule(pl.LightningModule):
 
         zt = sample_cond_pt(p0, p1, t, self.kappa)
 
-
         xt, x_pad, z_gap, z_pad = rm_gap_tokens(zt, self.pad_token, self.gap_token)
 
         attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step)
 
-
         rates, ins_probs, sub_probs = self(xt, t, x_pad, attn_mask_ratio)
 
-        print (f'rates require_grad: {rates.requires_grad}')
-        print (f'rates require_grad: {rates.grad_fn}')
-
-        loss =  rates.sum(dim=(1,2))
-        metrics = {'rates': rates.sum(dim=(1,2))}
-
-        print (f'loss requires: {loss.requires_grad}')
-        print (f'grad_fn: {loss.grad_fn}')
-
-
-        # todo test:
-
         # check that xt is the same as zt up to the context lengths for each sample:
-        for i in range(len(context_lens)):
+        # for i in range(len(context_lens)):
             # assert torch.equal(xt[i, :context_lens[i]], x1[i, :context_lens[i]])
             # assert torch.equal(xt[i, :context_lens[i]], zt[i, :context_lens[i]])
 
@@ -84,8 +82,8 @@ class AdaptedLitModule(pl.LightningModule):
             # print (self.tokenizer.batch_decode(zt))
             # print (f'\n\n\n')
 
-            print (torch.equal(xt[i, :context_lens[i]], x1[i, :context_lens[i]]))
-            print (torch.equal(xt[i, :context_lens[i]], zt[i, :context_lens[i]]))
+            # print (torch.equal(xt[i, :context_lens[i]], x1[i, :context_lens[i]]))
+            # print (torch.equal(xt[i, :context_lens[i]], zt[i, :context_lens[i]]))
 
         # mask where everything up to context_len is 0 for each element in batch
         max_len = xt.size(1)
@@ -114,12 +112,22 @@ class AdaptedLitModule(pl.LightningModule):
         uz_mask = make_ut_mask_from_z(zt, z1, self.full_vocab_size, self.pad_token, self.gap_token)
 
         u_tot = rates.sum(dim=(1, 2))
+        # u_tot = rates.mean(dim=(1, 2))
 
         sched_coeff = (self.kappa.derivative(t) / (1 - self.kappa(t))).to(self.device)
 
         log_uz_cat = torch.clamp(uz_cat.log(), min=-20)
 
+
         loss_vec = u_tot - (log_uz_cat * uz_mask * sched_coeff.unsqueeze(-1)).sum(dim=(1, 2))
+        # loss_vec = u_tot - (log_uz_cat * uz_mask * sched_coeff.unsqueeze(-1)).mean(dim=(1, 2))
+
+        # normalise by aligned sequence length
+        N = torch.sum(~z_pad, dim=1).float()
+
+        N = torch.clamp(N, min=1.0)
+
+        loss_vec = loss_vec / N
 
         return loss_vec.mean(), {
             'u_tot': u_tot.mean(),
@@ -127,6 +135,7 @@ class AdaptedLitModule(pl.LightningModule):
             'u_sub': lam_sub.sum(1).mean(),
             'u_del': lam_del.sum(1).mean(),
             'attn_mask_ratio': attn_mask_ratio,
+            'N': N
         }
 
     def training_step(self, batch, batch_idx):
@@ -239,6 +248,10 @@ class AdaptedLitModule(pl.LightningModule):
             traj.append(xt.clone())
 
         return traj
+
+        # todo validation testing
+        # todo ensure all samples keep context assertions
+        # todo fix context masking/adjustments
 
         # todo add wandb / bait integration
         # todo for future data gen runs, filter to be less than certain length to save time
