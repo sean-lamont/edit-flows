@@ -31,7 +31,7 @@ class AdaptedDataModule(pl.LightningDataModule):
             prev_attempt = batch[i].get('prev_attempt', '')
             target = batch[i]['target']
 
-            context_ids = self.tokenizer(context, return_tensors='pt').input_ids
+            context_ids = self.tokenizer(context, return_tensors='pt').input_ids[:self.max_len]
             context_len = context_ids.shape[1]
 
             prev_ids = self.tokenizer(prev_attempt,  return_tensors='pt').input_ids[:self.max_len - context_len]

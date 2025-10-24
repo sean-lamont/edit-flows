@@ -37,12 +37,12 @@ class AdaptedEditFlowsTransformer(nn.Module):
     def __init__(self, pretrained_model_name: str, hidden_dim=512):
         super().__init__()
 
-        bnb_conf = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
+        # bnb_conf = BitsAndBytesConfig(
+        #     load_in_4bit=True,
+        #     bnb_4bit_quant_type="nf4",
+        #     bnb_4bit_use_double_quant=True,
+        #     bnb_4bit_compute_dtype=torch.bfloat16,
+        # )
         # godel_id = "Goedel-LM/Goedel-Prover-V2-8B"
         self.model = AutoModelForCausalLM.from_pretrained(pretrained_model_name, dtype=torch.bfloat16,
                                                           trust_remote_code=True,
@@ -50,7 +50,7 @@ class AdaptedEditFlowsTransformer(nn.Module):
                                                           # _attn_implementation='flash_attention_2', # _attn_implementation='flex_attention',
                                                           # quantization_config=bnb_conf,
                                                           ).train()
-
+        #
         # self.model = prepare_model_for_kbit_training(self.model)
 
         # add lora and quantization to model:
@@ -80,6 +80,9 @@ class AdaptedEditFlowsTransformer(nn.Module):
                                       nn.Linear(hidden_dim, self.vocab_size))
         self.sub_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, hidden_dim), nn.SiLU(),
                                       nn.Linear(hidden_dim, self.vocab_size))
+
+        # todo some way to integrate lm_head? e.g. take output from lm_head for ins_head, lm_head - 1 for sub_head,
+        # do some weighted combination of this and above layers? Should leverage pre-trained lm_head is good
         # self._init_heads()
 
     # def _init_heads(self):
@@ -101,13 +104,13 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         # x0 = torch.cat((context_ids.squeeze(0), prev_ids.squeeze(0)[1:]), dim=0)[:self.max_len]
 
-        context_lens = [c.shape[1] for c in context_tokens]
+        context_lens = [c.shape[0] for c in context_tokens]
         pad_len = tokens.shape[1] + max(context_lens)
 
         combined_tokens = torch.stack([
             F.pad(
-                torch.cat([tokens[i], context_tokens[i]], dim=0),
-                (0, pad_len - (tokens.shape[1] + context_tokens.shape[1])), value=pad_token)
+                torch.cat([context_tokens[i], tokens[i]], dim=0),
+                (0, pad_len - (tokens.shape[1] + context_lens[i])), value=pad_token)
             for i in range(tokens.shape[0])], dim=0).long()
 
         B, L = combined_tokens.shape
@@ -129,7 +132,7 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         # print(tokens.shape)
 
-        block_mask = create_block_mask(final_mask, None, None, L, L, device=self.device)  # , _compile=True)
+        block_mask = create_block_mask(final_mask, None, None, L, L, device=tokens.device)  # , _compile=True)
 
         # outputs = self.model.forward(input_ids=tokens,  output_hidden_states=True,)
 
@@ -148,10 +151,12 @@ class AdaptedEditFlowsTransformer(nn.Module):
         # only take hidden states from context_lens onwards
 
         hidden_states = torch.stack([
-            hidden_states[context_lens[i]:context_lens[i] + tokens.shape[1]]  # same length (original padded non-context tokens, taken from respective context )
-            for i in range(hidden_states.shape[0])], dim=0)
+            hidden_states[i, context_lens[i]:context_lens[i] + tokens.shape[1]]  # same length (original padded non-context tokens, taken from respective context )
+            for i in range(hidden_states.shape[0])], dim=0 )
 
-        time_ = self.time_emb(t).unsqueeze(1).expand(-1, L, -1)
+
+        time_ = self.time_emb(t).unsqueeze(1).expand(-1, hidden_states.shape[1], -1)
+
 
         x = torch.cat([hidden_states, time_], dim=-1)
 

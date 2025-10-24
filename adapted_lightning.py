@@ -4,6 +4,7 @@ from torch.nn import functional as F
 from torch.optim import Optimizer
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 import torch
+import deepspeed
 
 from scheduler import CubicScheduler
 from utils import *
@@ -28,6 +29,7 @@ class AdaptedLitModule(pl.LightningModule):
         # big hack: use a dummy model with small mem footprint to recover from OOM  mid training
         # clear cache if OOM in forward, run dummy model as new loss,
         self.dummy_model = torch.nn.Linear(1, 1, dtype=torch.bfloat16)
+        self._step_was_skipped = False
 
     # def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
         # for name,param in self.named_parameters():
@@ -54,6 +56,63 @@ class AdaptedLitModule(pl.LightningModule):
         #
         # return {'optimizer': opt, 'lr_scheduler': {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}}
 
+    def on_before_optimizer_step(self, optimizer):
+        """
+                With DeepSpeed, this hook is called on EVERY micro-batch.
+                We must manually check if this is the last accumulation batch.
+                """
+
+        # 1. Check if this is an optimizer step
+        is_optimizer_step = (self.trainer.fit_loop.batch_idx + 1) % self.trainer.accumulate_grad_batches == 0
+
+        # 3. Only run the check if it's an actual optimizer step OR the last batch
+        if not is_optimizer_step:
+            return  # This is just an accumulation batch, do nothing
+
+
+
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                # Use DeepSpeed's utility to get the full, unpartitioned gradient
+                grad = deepspeed.utils.safe_get_full_grad(param)
+                # print (f'grad: {grad.norm().item()}, layer: {name}')
+
+                if grad is not None and (torch.isnan(grad).any() or torch.isinf(grad).any()):
+                    # Log the warning and the parameter name
+                    print(f"Skipping optimizer step at global_step {self.trainer.global_step} "
+                                f"due to NaNs or Infs in gradients of parameter.")
+
+                    # Set the flag
+                    self._step_was_skipped = True
+
+                    # Zero out all gradients to prevent optimizer.step()
+                    # from applying the corrupt gradients
+                    self.zero_grad()
+
+                    # We found a NaN, no need to check other params
+                    return
+
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
+        """
+        Override optimizer_step to prevent DeepSpeed/Lightning from
+        logging a "gradient norm" value if the step was skipped.
+        """
+        if self._step_was_skipped:
+            # If we skipped, just call the closure to clear flags
+            # but don't actually step the optimizer.
+            optimizer_closure()
+            return
+
+        # Default behavior: step the optimizer
+        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
+
+
+
+
+
+
+
+
 
     def forward(self, tokens, t, pad_mask, contexts,  attn_mask_ratio):
         return self.model(tokens, t, pad_mask, contexts, self.pad_token, attn_mask_ratio)
@@ -73,35 +132,6 @@ class AdaptedLitModule(pl.LightningModule):
 
         rates, ins_probs, sub_probs = self.forward(xt, t, x_pad, contexts, attn_mask_ratio, )
 
-        # check that xt is the same as zt up to the context lengths for each sample:
-        # for i in range(len(context_lens)):
-            # assert torch.equal(xt[i, :context_lens[i]], x1[i, :context_lens[i]])
-            # assert torch.equal(xt[i, :context_lens[i]], zt[i, :context_lens[i]])
-
-
-            # print('x1\n\n')
-            # print (self.tokenizer.batch_decode(x1))
-            # print('xt\n\n')
-            # print (self.tokenizer.batch_decode(xt))
-            # print('\n\nz1\n\n')
-            # print (self.tokenizer.batch_decode(z1))
-            # print('\n\nzt\n\n')
-            # print (self.tokenizer.batch_decode(zt))
-            # print (f'\n\n\n')
-
-            # print (torch.equal(xt[i, :context_lens[i]], x1[i, :context_lens[i]]))
-            # print (torch.equal(xt[i, :context_lens[i]], zt[i, :context_lens[i]]))
-
-        # mask where everything up to context_len is 0 for each element in batch
-        # max_len = xt.size(1)
-        # mask = torch.arange(max_len, device=self.device).unsqueeze(0) < context_lens.unsqueeze(1)
-        # mask = mask.float()  # Convert boolean mask to float (0.0 or 1.0)
-        # inverse_mask_expanded = (1 - mask).unsqueeze(-1)
-        # rates = rates * inverse_mask_expanded
-        # ins_probs = ins_probs * inverse_mask_expanded
-        # sub_probs = sub_probs * inverse_mask_expanded
-
-
         lam_ins = rates[:, :, 0]
         lam_sub = rates[:, :, 1]
         lam_del = rates[:, :, 2]
@@ -117,7 +147,6 @@ class AdaptedLitModule(pl.LightningModule):
         uz_mask = make_ut_mask_from_z(zt, z1, self.full_vocab_size, self.pad_token, self.gap_token)
 
         u_tot = rates.sum(dim=(1, 2))
-        # u_tot = rates.mean(dim=(1, 2))
 
         sched_coeff = (self.kappa.derivative(t) / (1 - self.kappa(t))).to(self.device)
 
@@ -148,6 +177,7 @@ class AdaptedLitModule(pl.LightningModule):
         }
 
     def training_step(self, batch, batch_idx):
+        self._step_was_skipped = False
         try:
             loss, metrics = self._loss(batch)
             self.log('train/loss', loss, prog_bar=True)
@@ -155,7 +185,7 @@ class AdaptedLitModule(pl.LightningModule):
                 self.log(f'train/{k}', v, prog_bar=False)
             return loss
         except Exception as e:
-            print (f'Exception in forward')
+            print (f'Exception in forward: {e}')
             torch.cuda.empty_cache()
             return torch.sum(self.dummy_model(torch.ones(batch['x0'].shape[0], device=self.device, dtype=torch.bfloat16)), dim=-1)
 
