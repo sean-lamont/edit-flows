@@ -8,10 +8,10 @@ from utils import opt_align_xs_to_zs
 
 
 # for proof data, x0 and  x1 are given
-def collate_batch_goedel(x1s, x0s, pad_token: int, gap_token: int):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    x1_list = [b.to(device) for b in x1s]
-    x0_list = [b.to(device) for b in x0s]
+def collate_batch_goedel(x1_list, x0_list, pad_token: int, gap_token: int):
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # x1_list = [b.to(device) for b in x1s]
+    # x0_list = [b.to(device) for b in x0s]
 
     assert len(x0_list) == len(x1_list)
 
@@ -35,7 +35,7 @@ def collate_batch_goedel(x1s, x0s, pad_token: int, gap_token: int):
     if z_0:
         assert z_max_len == max(len(z) for z in z_0), "z_1 and z_0 must have the same max length"
 
-    # Add <PAD> token at end of each sequence to make them equal length
+    # add <pad> token at end of each sequence to make them equal length
     x_1 = torch.stack([F.pad(x, (0, x1_max_len - x.shape[0]), value=pad_token) for x in x_1], dim=0).long()
     x_0 = torch.stack([F.pad(x, (0, x0_max_len - x.shape[0]), value=pad_token) for x in x_0], dim=0).long()
     z_1 = torch.stack([F.pad(x, (0, z_max_len - x.shape[0]), value=pad_token) for x in z_1], dim=0).long()

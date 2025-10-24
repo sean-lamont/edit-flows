@@ -3,6 +3,7 @@ from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
 from torch.nn import functional as F
 from torch.optim import Optimizer
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+import torch
 
 from scheduler import CubicScheduler
 from utils import *
@@ -12,7 +13,7 @@ import torchviz
 
 
 class AdaptedLitModule(pl.LightningModule):
-    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=5e-5, scheduler_cfg=None,
+    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=1e-5, scheduler_cfg=None,
                  anneal_end_step=10000):
         super().__init__()
         # self.save_hyperparameters(ignore=['model'])
@@ -24,7 +25,9 @@ class AdaptedLitModule(pl.LightningModule):
         self.gap_token = gap_token_id
         self.lr = lr
         self.tokenizer = AutoTokenizer.from_pretrained("Goedel-LM/Goedel-Prover-V2-8B")
-        self._oom_in_backward = False
+        # big hack: use a dummy model with small mem footprint to recover from OOM  mid training
+        # clear cache if OOM in forward, run dummy model as new loss,
+        self.dummy_model = torch.nn.Linear(1, 1, dtype=torch.bfloat16)
 
     # def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
         # for name,param in self.named_parameters():
@@ -52,12 +55,12 @@ class AdaptedLitModule(pl.LightningModule):
         # return {'optimizer': opt, 'lr_scheduler': {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}}
 
 
-    def forward(self, tokens, t, pad_mask, attn_mask_ratio):
-        return self.model(tokens, t, pad_mask, attn_mask_ratio)
+    def forward(self, tokens, t, pad_mask, contexts,  attn_mask_ratio):
+        return self.model(tokens, t, pad_mask, contexts, self.pad_token, attn_mask_ratio)
 
     def _loss(self, batch):
-        x1, x0, z0, z1, t, context_lens = batch['x1'], batch['x0'], batch['z0'], batch['z1'], batch['t'], batch[
-            'context_lens']
+        x1, x0, z0, z1, t, context_lens, contexts = batch['x1'], batch['x0'], batch['z0'], batch['z1'], batch['t'], batch[
+            'context_lens'], batch['contexts']
 
         p0 = x2prob(z0, self.full_vocab_size)
         p1 = x2prob(z1, self.full_vocab_size)
@@ -68,7 +71,7 @@ class AdaptedLitModule(pl.LightningModule):
 
         attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step)
 
-        rates, ins_probs, sub_probs = self(xt, t, x_pad, attn_mask_ratio)
+        rates, ins_probs, sub_probs = self.forward(xt, t, x_pad, contexts, attn_mask_ratio, )
 
         # check that xt is the same as zt up to the context lengths for each sample:
         # for i in range(len(context_lens)):
@@ -90,12 +93,10 @@ class AdaptedLitModule(pl.LightningModule):
             # print (torch.equal(xt[i, :context_lens[i]], zt[i, :context_lens[i]]))
 
         # mask where everything up to context_len is 0 for each element in batch
-        max_len = xt.size(1)
-        mask = torch.arange(max_len, device=self.device).unsqueeze(0) < context_lens.unsqueeze(1)
-        mask = mask.float()  # Convert boolean mask to float (0.0 or 1.0)
-
-        inverse_mask_expanded = (1 - mask).unsqueeze(-1)
-
+        # max_len = xt.size(1)
+        # mask = torch.arange(max_len, device=self.device).unsqueeze(0) < context_lens.unsqueeze(1)
+        # mask = mask.float()  # Convert boolean mask to float (0.0 or 1.0)
+        # inverse_mask_expanded = (1 - mask).unsqueeze(-1)
         # rates = rates * inverse_mask_expanded
         # ins_probs = ins_probs * inverse_mask_expanded
         # sub_probs = sub_probs * inverse_mask_expanded
@@ -142,7 +143,8 @@ class AdaptedLitModule(pl.LightningModule):
             'u_sub': lam_sub.sum(1).mean(),
             'u_del': lam_del.sum(1).mean(),
             'attn_mask_ratio': attn_mask_ratio,
-            'N': N
+            'N': N,
+            't': t
         }
 
     def training_step(self, batch, batch_idx):
@@ -153,57 +155,9 @@ class AdaptedLitModule(pl.LightningModule):
                 self.log(f'train/{k}', v, prog_bar=False)
             return loss
         except Exception as e:
-            print (f'Exception: {e}')
+            print (f'Exception in forward')
             torch.cuda.empty_cache()
-            return None
-
-    def backward(self, loss, *args, **kwargs):
-        """
-        This hook is called by Lightning after training_step.
-        """
-        # Ensure the flag is reset at the start of every backward call
-        self._oom_in_backward = False
-
-        try:
-            # 2. Backward pass
-            loss.backward()
-
-        except torch.cuda.OutOfMemoryError:
-            print(f"CUDA OOM in BACKWARD pass. Clearing gradients and skipping optimizer step.")
-            # Set the flag to true
-            self._oom_in_backward = True
-            torch.cuda.empty_cache()
-
-            # We must clear gradients here, otherwise they might be stale
-            # for the next successful batch
-            self.zero_grad(set_to_none=True)
-
-        except RuntimeError as e:
-            if "CUDA out of memory" in str(e):
-                print(
-                    f"CUDA OOM (RuntimeError) in BACKWARD pass. Clearing gradients and skipping optimizer step.")
-                self._oom_in_backward = True
-                torch.cuda.empty_cache()
-                self.zero_grad(set_to_none=True)
-            else:
-                raise e
-
-    def optimizer_step(self, epoch, batch_idx, optimizer, *args, **kwargs):
-        """
-        This hook is called by Lightning after backward().
-        """
-        # 3. Optimizer step
-
-        # Check the flag from the backward pass
-        if self._oom_in_backward:
-            print(f"Skipping optimizer step for batch {batch_idx} due to OOM in backward.")
-            # Reset flag and skip step
-            self._oom_in_backward = False
-            return
-
-            # If no OOM, proceed with the optimizer step
-        super().optimizer_step(epoch, batch_idx, optimizer, *args, **kwargs)
-
+            return torch.sum(self.dummy_model(torch.ones(batch['x0'].shape[0], device=self.device, dtype=torch.bfloat16)), dim=-1)
 
     def validation_step(self, batch, batch_idx):
         loss, metrics = self._loss(batch)

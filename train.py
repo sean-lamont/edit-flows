@@ -27,7 +27,7 @@ def main():
                          precision='bf16-mixed',
                          logger=wandb_logger,
                          accumulate_grad_batches=8,
-                         gradient_clip_val=100.0,
+                         gradient_clip_val=5,
                          num_sanity_val_steps=0,
                          )
     trainer.fit(lit_module, dm)

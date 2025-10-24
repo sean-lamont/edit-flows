@@ -25,6 +25,7 @@ class AdaptedDataModule(pl.LightningDataModule):
         x0s = []
         x1s = []
         context_lens = []
+        contexts = []
         for i in range(len(batch)):
             context = batch[i]['context']
             prev_attempt = batch[i].get('prev_attempt', '')
@@ -33,20 +34,23 @@ class AdaptedDataModule(pl.LightningDataModule):
             context_ids = self.tokenizer(context, return_tensors='pt').input_ids
             context_len = context_ids.shape[1]
 
-            prev_ids = self.tokenizer(prev_attempt,  return_tensors='pt').input_ids
-            target_ids = self.tokenizer(target,  return_tensors='pt').input_ids
+            prev_ids = self.tokenizer(prev_attempt,  return_tensors='pt').input_ids[:self.max_len - context_len]
+            target_ids = self.tokenizer(target,  return_tensors='pt').input_ids[:self.max_len - context_len]
 
             # combine context and prev_attempt for x0, context and target for x1:
-            x0 = torch.cat((context_ids.squeeze(0), prev_ids.squeeze(0)[1:]), dim=0)[:self.max_len]
-            x1 = torch.cat((context_ids.squeeze(0), target_ids.squeeze(0)[1:]), dim=0)[:self.max_len]
+            # x0 = torch.cat((context_ids.squeeze(0), prev_ids.squeeze(0)[1:]), dim=0)[:self.max_len]
+            # x1 = torch.cat((context_ids.squeeze(0), target_ids.squeeze(0)[1:]), dim=0)[:self.max_len]
 
-            x0s.append(x0.unsqueeze(0))
-            x1s.append(x1.unsqueeze(0))
+            x0s.append(prev_ids)
+            x1s.append(target_ids)
             context_lens.append(context_len)
+            contexts.append(context_ids.squeeze(0))
 
         # assumes that the alignment will keep context at the start for all examples so we can use context_lens
+        # todo collate batch only with x1s, x0s after context, add context to batch instead
         ret =  collate_batch_goedel(x1s, x0s, pad_token=self.tokenizer.pad_token_id, gap_token=151651)
-        ret['context_lens'] = torch.tensor(context_lens)
+        ret['context_lens'] = context_lens
+        ret['contexts'] = contexts
 
         return ret
 
