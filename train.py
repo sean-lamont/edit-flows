@@ -22,13 +22,23 @@ def main():
     wandb_logger = WandbLogger(project="edit-flows", name="test_1",  )
     # wandb_logger.watch(lit_module, log_freq=10)
 
+    strategy = DeepSpeedStrategy(
+    stage=2,
+    offload_optimizer=True,
+    offload_optimizer_device="cpu",
+    # Other DeepSpeed parameters will use defaults unless specified
+    exclude_frozen_parameters=True
+    )
+
     trainer = pl.Trainer(max_epochs=2, log_every_n_steps=1,
-                         strategy='deepspeed_stage_2_offload',
+                         # strategy='deepspeed_stage_2_offload',
+                         strategy=strategy,
                          precision='bf16-mixed',
                          logger=wandb_logger,
                          # accumulate_grad_batches=8,
-                         gradient_clip_val=1,
-                         num_sanity_val_steps=1,
+                         # gradient_clip_val=1,
+                         num_sanity_val_steps=0,
+                         val_check_interval=0.01,
                          )
     trainer.fit(lit_module, dm)
 

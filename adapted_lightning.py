@@ -16,7 +16,7 @@ from lightning.pytorch.utilities import grad_norm
 
 
 class AdaptedLitModule(pl.LightningModule):
-    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=1e-5, scheduler_cfg=None,
+    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None,
                  anneal_end_step=10000):
         super().__init__()
         # self.save_hyperparameters(ignore=['model'])
@@ -34,6 +34,7 @@ class AdaptedLitModule(pl.LightningModule):
         self._step_was_skipped = False
         self.val_sample_count = 10
         self.max_seq_len = 7000
+        self.oom_count = 0
 
     def configure_optimizers(self):
         return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
@@ -45,10 +46,6 @@ class AdaptedLitModule(pl.LightningModule):
         # return {'optimizer': opt, 'lr_scheduler': {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}}
 
     def on_validation_start(self):
-        """
-        Called at the beginning of training.
-        This is the ideal place to initialize our incremental table.
-        """
         self.val_outputs = wandb.Table(
             columns=["global_step", "epoch", "Initial Seq", "Final Seq" ],
             log_mode="INCREMENTAL"
@@ -146,9 +143,15 @@ class AdaptedLitModule(pl.LightningModule):
                 self.log(f'train/{k}', v, prog_bar=False)
             return loss
         except Exception as e:
-            print (f'Exception in forward: {e}')
-            torch.cuda.empty_cache()
-            return torch.sum(self.dummy_model(torch.ones(batch['x0'].shape[0], device=self.device, dtype=torch.bfloat16)), dim=-1)
+            # print (f'Exception in forward: {e}')
+            if 'CUDA out of memory' in str(e):
+                self.oom_count = self.oom_count + 1
+                self.log(f'train/oom_count', self.oom_count, prog_bar=False)
+                torch.cuda.empty_cache()
+                return torch.sum(self.dummy_model(torch.ones(batch['x0'].shape[0], device=self.device, dtype=torch.bfloat16)), dim=-1)
+            else:
+                print (f'non OOM error: {e}')
+                raise e
 
     def validation_step(self, batch, batch_idx):
         loss, metrics = self._loss(batch)
@@ -297,3 +300,6 @@ def get_adaptive_h(h: float, t: torch.Tensor, scheduler):
     return h_adapt
 
 # todo validation testing
+# todo save lora weights and extra layers for checkpointing
+# todo log parameter/gradient norms over time
+# todo oom count

@@ -41,11 +41,8 @@ def collate_batch_goedel(x1_list, x0_list, pad_token: int, gap_token: int):
     z_1 = torch.stack([F.pad(x, (0, z_max_len - x.shape[0]), value=pad_token) for x in z_1], dim=0).long()
     z_0 = torch.stack([F.pad(x, (0, z_max_len - x.shape[0]), value=pad_token) for x in z_0], dim=0).long()
 
-    t = torch.rand(len(x1_list), 1) # subtract eps to account for occasional 1's
-
-    if torch.any(t == 1.0):
-        print ('time=1' + '!' * 50)
-        t = torch.clamp(t - 1e-2, min=0.0)
+    t = torch.rand(len(x1_list), 1)
+    t = torch.clamp(t - 1e-2, min=0.0) # subtract eps to account for occasional 1's
 
     padding_mask = (x_1 == pad_token)
 

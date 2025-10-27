@@ -1,5 +1,5 @@
 from typing import Optional
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 import lightning.pytorch as pl
 from collate import collate_batch, collate_batch_goedel
 from couplings import Coupling, EmptyCoupling
@@ -17,8 +17,26 @@ class AdaptedDataModule(pl.LightningDataModule):
         self.max_len = max_len
 
     def setup(self, stage=None):
-        self.ds_train = GoedelDataset()
-        self.ds_val = GoedelDataset()
+        if stage == "fit" or stage is None:
+            # 1. Load your full dataset
+            self.full_dataset = GoedelDataset()
+
+            # 2. Calculate split lengths
+            dataset_size = len(self.full_dataset)
+            train_size = int(dataset_size * 0.95)
+            val_size = dataset_size - train_size  # Ensure it sums up correctly
+
+            # 3. Perform the random split
+            # Use a generator for reproducibility
+            generator = torch.Generator().manual_seed(42)
+            self.ds_train, self.ds_val = random_split(
+                self.full_dataset,
+                [train_size, val_size],
+                generator=generator
+            )
+
+        # self.ds_train = GoedelDataset()
+        # self.ds_val = GoedelDataset()
 
     # for error correction, x0 context is (goal + error + prev_attempt), for inital attempt just goal, target
     def _collate(self, batch):
@@ -61,4 +79,4 @@ class AdaptedDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(self.ds_val, batch_size=self.batch_size,
-                          collate_fn=self._collate, num_workers=0)
+                          collate_fn=self._collate, num_workers=0, shuffle=False)
