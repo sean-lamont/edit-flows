@@ -38,7 +38,7 @@ def main():
                          # accumulate_grad_batches=8,
                          # gradient_clip_val=1,
                          num_sanity_val_steps=0,
-                         val_check_interval=0.01,
+                         val_check_interval=0.25,
                          )
     trainer.fit(lit_module, dm)
 

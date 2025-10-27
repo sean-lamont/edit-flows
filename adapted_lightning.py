@@ -32,7 +32,7 @@ class AdaptedLitModule(pl.LightningModule):
         # clear cache if OOM in forward, run dummy model as new loss,
         self.dummy_model = torch.nn.Linear(1, 1, dtype=torch.bfloat16)
         self._step_was_skipped = False
-        self.val_sample_count = 10
+        self.val_sample_count = 5
         self.max_seq_len = 7000
         self.oom_count = 0
 
@@ -181,7 +181,7 @@ class AdaptedLitModule(pl.LightningModule):
 
             self.logger.experiment.log(
                 {"val_outputs": self.val_outputs},
-                step=min(1, self.global_step)
+                step=self.global_step
             )
 
             # # Optionally, log the full trajectory as a list of strings
@@ -303,3 +303,4 @@ def get_adaptive_h(h: float, t: torch.Tensor, scheduler):
 # todo save lora weights and extra layers for checkpointing
 # todo log parameter/gradient norms over time
 # todo oom count
+# todo add bleu score and checkpointing based on that
