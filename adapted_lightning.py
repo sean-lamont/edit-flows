@@ -5,6 +5,7 @@ from torch.optim import Optimizer
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 import torch
 import deepspeed
+import tqdm
 
 from scheduler import CubicScheduler
 from utils import *
@@ -30,6 +31,7 @@ class AdaptedLitModule(pl.LightningModule):
         # clear cache if OOM in forward, run dummy model as new loss,
         self.dummy_model = torch.nn.Linear(1, 1, dtype=torch.bfloat16)
         self._step_was_skipped = False
+        self.val_sample_count = 10
 
     # def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
         # for name,param in self.named_parameters():
@@ -55,7 +57,6 @@ class AdaptedLitModule(pl.LightningModule):
         # scheduler = get_cosine_schedule_with_warmup(opt, num_warmup_steps=2000, num_training_steps=steps)
         #
         # return {'optimizer': opt, 'lr_scheduler': {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}}
-
     def on_before_optimizer_step(self, optimizer):
         """
                 With DeepSpeed, this hook is called on EVERY micro-batch.
@@ -107,13 +108,6 @@ class AdaptedLitModule(pl.LightningModule):
         super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
 
 
-
-
-
-
-
-
-
     def forward(self, tokens, t, pad_mask, contexts,  attn_mask_ratio):
         return self.model(tokens, t, pad_mask, contexts, self.pad_token, attn_mask_ratio)
 
@@ -144,6 +138,7 @@ class AdaptedLitModule(pl.LightningModule):
 
         uz_cat = fill_gap_tokens_with_repeats(ux_cat, z_gap, z_pad)
 
+        # which operations move closer to z_1 from z_t
         uz_mask = make_ut_mask_from_z(zt, z1, self.full_vocab_size, self.pad_token, self.gap_token)
 
         u_tot = rates.sum(dim=(1, 2))
@@ -195,37 +190,38 @@ class AdaptedLitModule(pl.LightningModule):
         for k, v in metrics.items():
             self.log(f'val/{k}', v, prog_bar=False)
 
-        # # Select a few samples from the batch for generation
-        # num_samples_to_log = min(4, batch['x0'].size(0))
-        # for i in range(num_samples_to_log):
-        #     x0_sample = batch['x0'][i].unsqueeze(0)
-        #     context_len_sample = batch['context_lens'][i].unsqueeze(0)
-        #
-        #     # Generate a trajectory
-        #     trajectory = self.sample(x0_sample, context_len_sample, n_steps=100)
-        #
-        #     # Log the initial and final states of the trajectory
-        #     initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False)
-        #     final_seq = self.tokenizer.decode(trajectory[-1].squeeze().tolist(), skip_special_tokens=False)
-        #
-        #     print(f"Initial Sequence (Sample {i}): {initial_seq}")
-        #     print(f"Final Sequence (Sample {i}): {final_seq}")
-        #
-        #     # self.logger.experiment.log({
-        #     #     f"val/sample_{i}/initial_sequence": initial_seq,
-        #     #     f"val/sample_{i}/final_sequence": final_seq,
-        #     #     f"val/sample_{i}/trajectory_length": len(trajectory)
-        #     # })
-        #
-        #     # # Optionally, log the full trajectory as a list of strings
-        #     # full_trajectory_decoded = [self.tokenizer.decode(seq.squeeze().tolist(), skip_special_tokens=False) for seq in trajectory]
-        #     # self.logger.experiment.log({
-        #     #     f"val/sample_{i}/full_trajectory": wandb.Table(data=[[s] for s in full_trajectory_decoded], columns=["sequence"])
-        #     # })
+        # sample first group of batches, rather than random, for better comparisons over training
+        # only take first element in batch
+        if batch_idx < self.val_sample_count:
+            x0_sample = batch['x0'][1].unsqueeze(0)
+            context_len_sample = batch['context_lens'][1].unsqueeze(0)
+            context = batch['contexts'][0]
+
+            # Generate a trajectory
+            trajectory = self.sample(x0_sample, context, n_steps=100)
+
+            # Log the initial and final states of the trajectory
+            initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False)
+            final_seq = self.tokenizer.decode(trajectory[-1].squeeze().tolist(), skip_special_tokens=False)
+
+            print(f"Initial Sequence (Sample {i}): {initial_seq}")
+            print(f"Final Sequence (Sample {i}): {final_seq}")
+
+            self.logger.experiment.log({
+                f"val/sample_{i}/initial_sequence": initial_seq,
+                f"val/sample_{i}/final_sequence": final_seq,
+                f"val/sample_{i}/trajectory_length": len(trajectory)
+            })
+
+            # # Optionally, log the full trajectory as a list of strings
+            # full_trajectory_decoded = [self.tokenizer.decode(seq.squeeze().tolist(), skip_special_tokens=False) for seq in trajectory]
+            # self.logger.experiment.log({
+            #     f"val/sample_{i}/full_trajectory": wandb.Table(data=[[s] for s in full_trajectory_decoded], columns=["sequence"])
+            # })
 
     # update sample to account for context (take in context and context length for a batch):
     @torch.no_grad()
-    def sample(self, x0, context_lens, n_steps=100, t_min=0.0):
+    def sample(self, x0, context, n_steps=100, t_min=0.0):
         self.model.eval()
         device = x0.device
         t = torch.full((x0.size(0), 1), t_min, device=device)
@@ -234,69 +230,108 @@ class AdaptedLitModule(pl.LightningModule):
         xt = x0.clone()
         traj = [xt.clone()]
 
-        for _ in range(n_steps):
-            # Create a mask for the context tokens
-            max_len = xt.size(1)
-            context_mask = torch.arange(max_len, device=self.device).unsqueeze(0) < context_lens.unsqueeze(1)
+        with tqdm(desc="Euler Sampling") as pbar:
+            while t.max() <= 1 - dt:
+                attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step)
 
-            rates, ins_probs, sub_probs = self(xt, t, pad_mask)
-            lam_i, lam_s, lam_d = rates[..., 0], rates[..., 1], rates[..., 2]
+                # adapt_h = get_adaptive_h(dt, t, self.kappa)
+                adapt_h = dt
 
-            # Apply context mask to rates
-            lam_i = lam_i * (~context_mask)
-            lam_s = lam_s * (~context_mask)
-            lam_d = lam_d * (~context_mask)
+                rates, ins_probs, sub_probs = self.forward(xt, t, pad_mask, context, attn_mask_ratio)
+                lam_i, lam_s, lam_d = rates[..., 0], rates[..., 1], rates[..., 2]
 
-            ins_mask = torch.rand_like(lam_i) < 1 - torch.exp(-dt * lam_i)
-            ds_mask = torch.rand_like(lam_s) < 1 - torch.exp(-dt * (lam_s + lam_d))
+                ins_mask = torch.rand_like(lam_i) < 1 - torch.exp(-adapt_h * lam_i)
+                ds_mask = torch.rand_like(lam_s) < 1 - torch.exp(-adapt_h * (lam_s + lam_d))
 
-            prob_del = torch.where(ds_mask, lam_d / (lam_s + lam_d + 1e-8), torch.zeros_like(lam_d))
+                prob_del = torch.where(ds_mask, lam_d / (lam_s + lam_d + 1e-8), torch.zeros_like(lam_d))
 
-            del_mask = torch.bernoulli(prob_del).bool()
-            sub_mask = ds_mask & ~del_mask
-            non_pad = ~pad_mask
+                del_mask = torch.bernoulli(prob_del).bool()
+                sub_mask = ds_mask & ~del_mask
+                non_pad = ~pad_mask
 
-            ins_tokens = torch.full_like(xt, self.pad_token)
-            sub_tokens = torch.full_like(xt, self.pad_token)
+                ins_tokens = torch.full_like(xt, self.pad_token)
+                sub_tokens = torch.full_like(xt, self.pad_token)
 
-            if non_pad.any():
-                # Ensure we only sample for non-context tokens
-                ins_tokens[non_pad & ~context_mask[non_pad]] = torch.multinomial(
-                    ins_probs[non_pad & ~context_mask[non_pad]], 1).squeeze(-1)
-                sub_tokens[non_pad & ~context_mask[non_pad]] = torch.multinomial(
-                    sub_probs[non_pad & ~context_mask[non_pad]], 1).squeeze(-1)
+                if non_pad.any():
+                    ins_tokens[non_pad] = torch.multinomial(ins_probs[non_pad], 1).squeeze(-1)
+                    sub_tokens[non_pad] = torch.multinomial(sub_probs[non_pad], 1).squeeze(-1)
 
-            # Apply operations only to non-context tokens
-            xt[sub_mask & ~context_mask] = sub_tokens[sub_mask & ~context_mask]
-            xt[del_mask & ~context_mask] = self.pad_token
+                xt[sub_mask] = sub_tokens[sub_mask]
 
-            for b in range(xt.size(0)):
-                # Only consider insertions for non-context tokens
-                positions = torch.nonzero(ins_mask[b] & ~context_mask[b], as_tuple=True)[0]
-                for p in positions.tolist():
-                    # Find a pad position *outside* the context to insert into
-                    # This is a simplified approach; a more robust solution might involve shifting
-                    # or finding the nearest available non-context pad token.
-                    # For now, we'll try to insert into any pad token, but the ins_mask ensures
-                    # the *decision* to insert came from a non-context token.
-                    pad_pos = (xt[b] == self.pad_token).nonzero(as_tuple=True)[0]
-                    if pad_pos.numel():
-                        # Find the first pad position that is also outside the context
-                        valid_insert_pos = [pos for pos in pad_pos if not context_mask[b, pos]]
-                        if valid_insert_pos:
-                            tgt = valid_insert_pos[0]
-                            xt[b, tgt] = ins_tokens[b, p]
+                xt = apply_ins_del(xt, ins_mask, del_mask, ins_tokens, max_seq_len=self.max_seq_len, pad_token=self.pad_token)
 
-            pad_mask = (xt == self.pad_token)
-            t = t + dt
-            traj.append(xt.clone())
+                pad_mask = (xt == self.pad_token)
+                t = t + adapt_h
+                traj.append(xt.clone())
+                pbar.update(1)
 
         return traj
 
-        # todo validation testing
-        # todo ensure all samples keep context assertions, fix + test context masking
-        # todo log edit distance
 
-        # todo add wandb / bait integration
-        # todo for future data gen runs, filter to be less than certain length to save time
-        # todo maybe try just training with error correction only?
+def apply_ins_del(xt, ins_mask, del_mask, ins_tokens, max_seq_len, pad_token):
+        """
+        Apply insertion and deletion operations to a sequence x_t based on the provided masks.
+        """
+        batch_size, seq_len = xt.shape
+        device = xt.device
+
+        # Handle simultaneous ins+del as substitutions
+        replace_mask = ins_mask & del_mask
+        x_t_modified = xt.clone()
+        x_t_modified[replace_mask] = ins_tokens[replace_mask]
+
+        # Update ins/del masks after handling replacements
+        eff_ins_mask = ins_mask & ~replace_mask
+        eff_del_mask = del_mask & ~replace_mask
+
+        # Compute new lengths after applying ins/del operations
+        xt_pad_mask = (xt == pad_token)  # (batch_size, seq_len)
+        xt_seq_lens = (~xt_pad_mask).sum(dim=1)  # (batch_size,)
+        new_lengths = xt_seq_lens + eff_ins_mask.sum(dim=1) - eff_del_mask.sum(dim=1)
+        max_new_len = int(new_lengths.max().item())
+
+        if max_new_len <= 0:
+            print(f"Unexpected max_new_len <= 0: {max_new_len}, did we delete everything?")
+            return torch.full((batch_size, 1), pad_token, dtype=xt.dtype, device=device),
+
+        # Pre-allocate result
+        x_new = torch.full((batch_size, max_new_len), pad_token, dtype=xt.dtype, device=device)
+
+        # Compute positions
+        batch_idx = torch.arange(batch_size, device=device).unsqueeze(1)  # (batch_size, 1)
+        pos_idx = torch.arange(seq_len, device=device).unsqueeze(0)  # (1, seq_len)
+        cum_del = torch.cumsum(eff_del_mask.float(), dim=1)  # num del up to & incl. current pos
+        cum_ins = torch.cumsum(eff_ins_mask.float(), dim=1)  # num ins up to & incl. current pos
+        cum_ins_before = F.pad(cum_ins[:, :-1], (1, 0), value=0)  # num ins before current pos
+
+        # Place non-deleted tokens
+        new_pos = pos_idx + cum_ins_before - cum_del  # new pos of tokens shifted by ins/del
+        keep_mask = ~eff_del_mask & (new_pos >= 0) & (new_pos < max_new_len)  # tokens to keep (non-deleted)
+        if keep_mask.any():
+            x_new[batch_idx.expand(-1, seq_len)[keep_mask], new_pos[keep_mask].long()] = x_t_modified[keep_mask]
+
+        # Place insertions
+        if eff_ins_mask.any():
+            ins_pos = new_pos + 1  # insertions go 1 after new shifted pos
+            ins_valid = eff_ins_mask & (ins_pos >= 0) & (ins_pos < max_new_len)  # tokens to insert
+            if ins_valid.any():
+                x_new[batch_idx.expand(-1, seq_len)[ins_valid], ins_pos[ins_valid].long()] = ins_tokens[ins_valid]
+
+        if max_new_len > max_seq_len:
+            print(f"Warning: max_new_len {max_new_len} exceeds max_seq_len {max_seq_len}, truncating.")
+            max_new_len = max_seq_len
+
+        return x_new[:, :max_new_len],
+
+def get_adaptive_h(h: float, t: torch.Tensor, scheduler):
+    coeff = (1 - scheduler(t)) / scheduler.derivative(t)
+    _h = h * torch.ones_like(t, device=t.device)
+    h_adapt = torch.minimum(_h, coeff)
+    return h_adapt
+
+# todo validation testing
+# todo log edit distance
+
+# todo add wandb / bait integration
+# todo for future data gen runs, filter to be less than certain length to save time
+# todo maybe try just training with error correction only?
