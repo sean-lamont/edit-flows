@@ -26,9 +26,9 @@ def main():
                          strategy='deepspeed_stage_2_offload',
                          precision='bf16-mixed',
                          logger=wandb_logger,
-                         accumulate_grad_batches=4,
+                         # accumulate_grad_batches=8,
                          gradient_clip_val=1,
-                         num_sanity_val_steps=0,
+                         num_sanity_val_steps=1,
                          )
     trainer.fit(lit_module, dm)
 

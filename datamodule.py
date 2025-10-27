@@ -51,6 +51,7 @@ class AdaptedDataModule(pl.LightningDataModule):
         ret =  collate_batch_goedel(x1s, x0s, pad_token=self.tokenizer.pad_token_id, gap_token=151651)
         ret['context_lens'] = context_lens
         ret['contexts'] = contexts
+        ret['idx'] = [b['idx'] for b in batch]
 
         return ret
 

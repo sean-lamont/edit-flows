@@ -1,5 +1,6 @@
 name: goedelv2
 channels:
+  - defaults
   - nvidia
   - conda-forge
 dependencies:

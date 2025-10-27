@@ -6,11 +6,12 @@ from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 import torch
 import deepspeed
 import tqdm
+import wandb
 
 from scheduler import CubicScheduler
 from utils import *
 from lightning.pytorch.utilities import grad_norm
-import torchviz
+# import torchviz
 
 
 
@@ -32,81 +33,26 @@ class AdaptedLitModule(pl.LightningModule):
         self.dummy_model = torch.nn.Linear(1, 1, dtype=torch.bfloat16)
         self._step_was_skipped = False
         self.val_sample_count = 10
-
-    # def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
-        # for name,param in self.named_parameters():
-        #     if param.grad is not None:
-        #         print(f"Layer: {name}, Gradient Norm: {param.grad.norm().item():.4f}")
-            # else:
-            #     print(f"Layer: {name}, No gradient")
-
-        # print last lr from scheduler
-        # print (f'scheduler lr: {self.lr_schedulers().get_last_lr()}')
+        self.max_seq_len = 7000
 
     def configure_optimizers(self):
-        # print (f'lr: {self.lr}')
         return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
         # return DeepSpeedCPUAdam(self.parameters(), 1e-5, eps=1e-6)
-
         return torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
-
         # opt = torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
-        #
         # steps = 500000 # change based on total steps
-        #
         # scheduler = get_cosine_schedule_with_warmup(opt, num_warmup_steps=2000, num_training_steps=steps)
-        #
         # return {'optimizer': opt, 'lr_scheduler': {'scheduler': scheduler, 'interval': 'step', 'frequency': 1}}
-    def on_before_optimizer_step(self, optimizer):
+
+    def on_validation_start(self):
         """
-                With DeepSpeed, this hook is called on EVERY micro-batch.
-                We must manually check if this is the last accumulation batch.
-                """
-
-        # 1. Check if this is an optimizer step
-        is_optimizer_step = (self.trainer.fit_loop.batch_idx + 1) % self.trainer.accumulate_grad_batches == 0
-
-        # 3. Only run the check if it's an actual optimizer step OR the last batch
-        if not is_optimizer_step:
-            return  # This is just an accumulation batch, do nothing
-
-
-
-        for name, param in self.named_parameters():
-            if param.requires_grad:
-                # Use DeepSpeed's utility to get the full, unpartitioned gradient
-                grad = deepspeed.utils.safe_get_full_grad(param)
-                # print (f'grad: {grad.norm().item()}, layer: {name}')
-
-                if grad is not None and (torch.isnan(grad).any() or torch.isinf(grad).any()):
-                    # Log the warning and the parameter name
-                    print(f"Skipping optimizer step at global_step {self.trainer.global_step} "
-                                f"due to NaNs or Infs in gradients of parameter.")
-
-                    # Set the flag
-                    self._step_was_skipped = True
-
-                    # Zero out all gradients to prevent optimizer.step()
-                    # from applying the corrupt gradients
-                    self.zero_grad()
-
-                    # We found a NaN, no need to check other params
-                    return
-
-    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
+        Called at the beginning of training.
+        This is the ideal place to initialize our incremental table.
         """
-        Override optimizer_step to prevent DeepSpeed/Lightning from
-        logging a "gradient norm" value if the step was skipped.
-        """
-        if self._step_was_skipped:
-            # If we skipped, just call the closure to clear flags
-            # but don't actually step the optimizer.
-            optimizer_closure()
-            return
-
-        # Default behavior: step the optimizer
-        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
-
+        self.val_outputs = wandb.Table(
+            columns=["global_step", "epoch", "Initial Seq", "Final Seq" ],
+            log_mode="INCREMENTAL"
+        )
 
     def forward(self, tokens, t, pad_mask, contexts,  attn_mask_ratio):
         return self.model(tokens, t, pad_mask, contexts, self.pad_token, attn_mask_ratio)
@@ -139,7 +85,9 @@ class AdaptedLitModule(pl.LightningModule):
         uz_cat = fill_gap_tokens_with_repeats(ux_cat, z_gap, z_pad)
 
         # which operations move closer to z_1 from z_t
+        # (batch_size, z_seq_len, 2 * vocab_size)
         uz_mask = make_ut_mask_from_z(zt, z1, self.full_vocab_size, self.pad_token, self.gap_token)
+
 
         u_tot = rates.sum(dim=(1, 2))
 
@@ -157,6 +105,22 @@ class AdaptedLitModule(pl.LightningModule):
         N = torch.clamp(N, min=1.0)
 
         loss_vec = loss_vec / N
+        
+        # self.training_step_outputs.add_data(
+        #     self.global_step,
+        #     self.current_epoch,
+        #     self.tokenizer.batch_decode(x1),
+        #     self.tokenizer.batch_decode(xt),
+        #     self.tokenizer.batch_decode(z1),
+        #     self.tokenizer.batch_decode(xt),
+        # )
+
+        # self.logger.experiment.log(
+        #     {"training_step_outputs": self.training_step_outputs},
+        #     step=self.global_step
+        # )
+
+        # todo could do nan check here and run dummy model
 
         return loss_vec.mean(), {
             'utot': u_tot.mean(),
@@ -168,7 +132,9 @@ class AdaptedLitModule(pl.LightningModule):
             'u_del': lam_del.sum(1).mean(),
             'attn_mask_ratio': attn_mask_ratio,
             'N': N,
-            't': t
+            't': t,
+            'idx': batch['idx'][0],
+            'edit_dist': uz_mask.sum().float()
         }
 
     def training_step(self, batch, batch_idx):
@@ -193,9 +159,8 @@ class AdaptedLitModule(pl.LightningModule):
         # sample first group of batches, rather than random, for better comparisons over training
         # only take first element in batch
         if batch_idx < self.val_sample_count:
-            x0_sample = batch['x0'][1].unsqueeze(0)
-            context_len_sample = batch['context_lens'][1].unsqueeze(0)
-            context = batch['contexts'][0]
+            x0_sample = batch['x0'][0].unsqueeze(0)
+            context = [batch['contexts'][0]]
 
             # Generate a trajectory
             trajectory = self.sample(x0_sample, context, n_steps=100)
@@ -204,14 +169,17 @@ class AdaptedLitModule(pl.LightningModule):
             initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False)
             final_seq = self.tokenizer.decode(trajectory[-1].squeeze().tolist(), skip_special_tokens=False)
 
-            print(f"Initial Sequence (Sample {i}): {initial_seq}")
-            print(f"Final Sequence (Sample {i}): {final_seq}")
+            self.val_outputs.add_data(
+                self.global_step,
+                self.current_epoch,
+                initial_seq,
+                final_seq
+            )
 
-            self.logger.experiment.log({
-                f"val/sample_{i}/initial_sequence": initial_seq,
-                f"val/sample_{i}/final_sequence": final_seq,
-                f"val/sample_{i}/trajectory_length": len(trajectory)
-            })
+            self.logger.experiment.log(
+                {"val_outputs": self.val_outputs},
+                step=min(1, self.global_step)
+            )
 
             # # Optionally, log the full trajectory as a list of strings
             # full_trajectory_decoded = [self.tokenizer.decode(seq.squeeze().tolist(), skip_special_tokens=False) for seq in trajectory]
@@ -224,46 +192,45 @@ class AdaptedLitModule(pl.LightningModule):
     def sample(self, x0, context, n_steps=100, t_min=0.0):
         self.model.eval()
         device = x0.device
-        t = torch.full((x0.size(0), 1), t_min, device=device)
+        t = torch.full((x0.size(0), 1), t_min, device=device, dtype=torch.bfloat16)
         dt = 1 / n_steps
         pad_mask = (x0 == self.pad_token)
         xt = x0.clone()
         traj = [xt.clone()]
 
-        with tqdm(desc="Euler Sampling") as pbar:
-            while t.max() <= 1 - dt:
-                attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step)
+        for _ in range(n_steps):
+            attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step)
 
-                # adapt_h = get_adaptive_h(dt, t, self.kappa)
-                adapt_h = dt
+            # adapt_h = get_adaptive_h(dt, t, self.kappa)
+            adapt_h = dt
 
-                rates, ins_probs, sub_probs = self.forward(xt, t, pad_mask, context, attn_mask_ratio)
-                lam_i, lam_s, lam_d = rates[..., 0], rates[..., 1], rates[..., 2]
+            # print (f'dtype: {xt.dtype, t.dtype, pad_mask.dtype}')
+            rates, ins_probs, sub_probs = self.forward(xt, t, pad_mask, context, attn_mask_ratio)
+            lam_i, lam_s, lam_d = rates[..., 0], rates[..., 1], rates[..., 2]
 
-                ins_mask = torch.rand_like(lam_i) < 1 - torch.exp(-adapt_h * lam_i)
-                ds_mask = torch.rand_like(lam_s) < 1 - torch.exp(-adapt_h * (lam_s + lam_d))
+            ins_mask = torch.rand_like(lam_i) < 1 - torch.exp(-adapt_h * lam_i)
+            ds_mask = torch.rand_like(lam_s) < 1 - torch.exp(-adapt_h * (lam_s + lam_d))
 
-                prob_del = torch.where(ds_mask, lam_d / (lam_s + lam_d + 1e-8), torch.zeros_like(lam_d))
+            prob_del = torch.where(ds_mask, lam_d / (lam_s + lam_d + 1e-8), torch.zeros_like(lam_d))
 
-                del_mask = torch.bernoulli(prob_del).bool()
-                sub_mask = ds_mask & ~del_mask
-                non_pad = ~pad_mask
+            del_mask = torch.bernoulli(prob_del).bool()
+            sub_mask = ds_mask & ~del_mask
+            non_pad = ~pad_mask
 
-                ins_tokens = torch.full_like(xt, self.pad_token)
-                sub_tokens = torch.full_like(xt, self.pad_token)
+            ins_tokens = torch.full_like(xt, self.pad_token)
+            sub_tokens = torch.full_like(xt, self.pad_token)
 
-                if non_pad.any():
-                    ins_tokens[non_pad] = torch.multinomial(ins_probs[non_pad], 1).squeeze(-1)
-                    sub_tokens[non_pad] = torch.multinomial(sub_probs[non_pad], 1).squeeze(-1)
+            if non_pad.any():
+                ins_tokens[non_pad] = torch.multinomial(ins_probs[non_pad], 1).squeeze(-1)
+                sub_tokens[non_pad] = torch.multinomial(sub_probs[non_pad], 1).squeeze(-1)
 
-                xt[sub_mask] = sub_tokens[sub_mask]
+            xt[sub_mask] = sub_tokens[sub_mask]
 
-                xt = apply_ins_del(xt, ins_mask, del_mask, ins_tokens, max_seq_len=self.max_seq_len, pad_token=self.pad_token)
+            xt = apply_ins_del(xt, ins_mask, del_mask, ins_tokens, max_seq_len=self.max_seq_len, pad_token=self.pad_token)
 
-                pad_mask = (xt == self.pad_token)
-                t = t + adapt_h
-                traj.append(xt.clone())
-                pbar.update(1)
+            pad_mask = (xt == self.pad_token)
+            t = t + adapt_h
+            traj.append(xt.clone())
 
         return traj
 
@@ -321,7 +288,7 @@ def apply_ins_del(xt, ins_mask, del_mask, ins_tokens, max_seq_len, pad_token):
             print(f"Warning: max_new_len {max_new_len} exceeds max_seq_len {max_seq_len}, truncating.")
             max_new_len = max_seq_len
 
-        return x_new[:, :max_new_len],
+        return x_new[:, :max_new_len]
 
 def get_adaptive_h(h: float, t: torch.Tensor, scheduler):
     coeff = (1 - scheduler(t)) / scheduler.derivative(t)
@@ -330,8 +297,3 @@ def get_adaptive_h(h: float, t: torch.Tensor, scheduler):
     return h_adapt
 
 # todo validation testing
-# todo log edit distance
-
-# todo add wandb / bait integration
-# todo for future data gen runs, filter to be less than certain length to save time
-# todo maybe try just training with error correction only?

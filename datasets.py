@@ -2,12 +2,11 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 from typing import Callable
-from utils import *
 import glob
 import json
 
 class GoedelDataset(Dataset):
-    def __init__(self, folder_path='processed_data'):
+    def __init__(self, folder_path='processed_data_code_only'):
         self.files = glob.glob(f'{folder_path}/*.jsonl')
         self.data = []
 
@@ -22,4 +21,6 @@ class GoedelDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx: int):
-        return self.data[idx]
+        ret = self.data[idx]
+        ret['idx'] = idx
+        return ret
