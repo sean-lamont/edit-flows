@@ -191,9 +191,9 @@ class AdaptedLitModule(pl.LightningModule):
             batch['t'] = self.val_t
 
             loss, metrics = self._loss(batch)
-            self.log('val/loss', loss, prog_bar=True)
+            self.log('val/loss', loss, prog_bar=True, sync_dist=True)
             for k, v in metrics.items():
-                self.log(f'val/{k}', v, prog_bar=False)
+                self.log(f'val/{k}', v, prog_bar=False, sync_dist=True)
 
             # sample first group of batches, rather than random, for better comparisons over training
             # only take first element in batch
@@ -215,7 +215,7 @@ class AdaptedLitModule(pl.LightningModule):
                 # assuming target_seq is a string and final_seq is a string
                 # you might need to tokenize them into lists of words for sacrebleu
                 score = self.bleu.corpus_score([final_seq], [[target_seq]]).score
-                self.log('val/bleu_score', score, prog_bar=true)
+                self.log('val/bleu_score', score, prog_bar=True, sync_dist=True)
 
 
             self.val_outputs.add_data(
