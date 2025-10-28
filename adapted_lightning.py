@@ -47,40 +47,26 @@ class AdaptedLitModule(pl.LightningModule):
         # This hook is called AFTER .backward() and BEFORE .step(),
         # which is the exact window where safe_get_full_grad must be used.
 
+        log_data = {}
+
         # Use self.named_parameters() to get the layer names
         for name, param in self.named_parameters():
 
             # --- Log Gradient Norm ---
             # Get the full, unsharded gradient, regardless of ZeRO stage
-            if param.grad is not None:
-                full_grad = deepspeed.utils.safe_get_full_grad(param)
+            full_grad = deepspeed.utils.safe_get_full_grad(param)
 
-                if full_grad is not None:
-                    grad_norm = full_grad.data.norm(2)
-                    self.log(
-                        f"gradients/{name}_norm",
-                        grad_norm,
-                        self.global_step,
-                        on_step=True,
-                        on_epoch=False,
-                        rank_zero_only=True
-                    )
-                else:
-                    # This can happen for non-trainable parameters
-                    pass
+            if full_grad is not None:
+                safe_name = name.replace('.', '_')
 
-            # --- Log Parameter Norm ---
-            # NOTE: This will still log the SHARD norm for ZeRO-3 params.
-            # To get the full param norm, you'd need safe_get_full_fp32_param
-            param_norm = param.data.norm(2)
-            self.log(
-                f"parameters/{name}_norm",
-                param_norm,
-                self.global_step,
-                on_step = True,
-                on_epoch = False,
-                rank_zero_only = True
-            )
+                grad_norm = full_grad.data.norm(2)
+                log_data[f"gradients/{safe_name}_grad_norm"] = grad_norm
+
+                param_norm = param.data.norm(2)
+                log_data[f"parameters/{safe_name}_param_norm"] = param_norm
+
+        if log_data:
+            self.logger.experiment.log(log_data, step=self.trainer.global_step)
 
     def configure_optimizers(self):
         return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
@@ -107,8 +93,12 @@ class AdaptedLitModule(pl.LightningModule):
 
         p0 = x2prob(z0, self.full_vocab_size)
         p1 = x2prob(z1, self.full_vocab_size)
+        # x0
+        # shape: torch.Size([1, 0]), x1, prev_attempt = ''
+        # torch.Size([1, 1868]), z1: torch.Size([1, 1868]), zt: torch.Size([1, 1868])
 
         zt = sample_cond_pt(p0, p1, t, self.kappa)
+        # print (f'x0 shape: {x0.shape}, x1 {x1.shape}, z1: {z1.shape}, zt: {zt.shape}')
 
         xt, x_pad, z_gap, z_pad = rm_gap_tokens(zt, self.pad_token, self.gap_token)
 
@@ -153,23 +143,6 @@ class AdaptedLitModule(pl.LightningModule):
         if torch.isnan(loss_vec).any():
             print (f'nan loss')
             return self.dummy_loss(batch)
-
-        
-        # self.training_step_outputs.add_data(
-        #     self.global_step,
-        #     self.current_epoch,
-        #     self.tokenizer.batch_decode(x1),
-        #     self.tokenizer.batch_decode(xt),
-        #     self.tokenizer.batch_decode(z1),
-        #     self.tokenizer.batch_decode(xt),
-        # )
-
-        # self.logger.experiment.log(
-        #     {"training_step_outputs": self.training_step_outputs},
-        #     step=self.global_step
-        # )
-
-        # todo could do nan check here and run dummy model
 
         return loss_vec.mean(), {
             'utot': u_tot.mean(),
@@ -228,40 +201,41 @@ class AdaptedLitModule(pl.LightningModule):
                 x0_sample = batch['x0'][0].unsqueeze(0)
                 context = [batch['contexts'][0]]
 
-                # Generate a trajectory
-                trajectory = self.sample(x0_sample, context, n_steps=100)
+                # generate a trajectory
+            trajectory = self.sample(x0_sample, context, n_steps=100)
 
-                # Log the initial and final states of the trajectory
-                initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False)
-                final_seq = self.tokenizer.decode(trajectory[-1].squeeze().tolist(), skip_special_tokens=False)
+            # log the initial and final states of the trajectory
+            initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False)
+            final_seq = self.tokenizer.decode(trajectory[-1].squeeze().tolist(), skip_special_tokens=False)
 
-                # add bleu score comparison between final_seq and target
-                # Calculate BLEU score if a target sequence is available in the batch
-                if 'target_seq' in batch:
-                    target_seq = self.tokenizer.decode(batch['target_seq'][0].squeeze().tolist(), skip_special_tokens=False)
-                    # Assuming target_seq is a string and final_seq is a string
-                    # You might need to tokenize them into lists of words for sacrebleu
-                    score = self.bleu.corpus_score([final_seq], [[target_seq]]).score
-                    self.log('val/bleu_score', score, prog_bar=True)
+            # add bleu score comparison between final_seq and target
+            # calculate bleu score if a target sequence is available in the batch
+            if 'target_seq' in batch:
+                target_seq = self.tokenizer.decode(batch['target_seq'][0].squeeze().tolist(), skip_special_tokens=False)
+                # assuming target_seq is a string and final_seq is a string
+                # you might need to tokenize them into lists of words for sacrebleu
+                score = self.bleu.corpus_score([final_seq], [[target_seq]]).score
+                self.log('val/bleu_score', score, prog_bar=true)
 
 
-                self.val_outputs.add_data(
-                    self.global_step,
-                    self.current_epoch,
-                    initial_seq,
-                    final_seq
-                )
+            self.val_outputs.add_data(
+                self.global_step,
+                self.current_epoch,
+                initial_seq,
+                final_seq
+            )
 
-                self.logger.experiment.log(
-                    {"val_outputs": self.val_outputs},
-                    step=self.global_step
-                )
+            self.logger.experiment.log(
+                {"val_outputs": self.val_outputs},
+                step=self.global_step
+            )
 
-                # # Optionally, log the full trajectory as a list of strings
-                # full_trajectory_decoded = [self.tokenizer.decode(seq.squeeze().tolist(), skip_special_tokens=False) for seq in trajectory]
-                # self.logger.experiment.log({
+            # # optionally, log the full trajectory as a list of strings
+            # full_trajectory_decoded = [self.tokenizer.decode(seq.squeeze().tolist(), skip_special_tokens=false) for seq in trajectory]
+            # self.logger.experiment.log({
+            #     f"val/sample_{i}/full_trajectory": wandb.t     # self.logger.experiment.log({
                 #     f"val/sample_{i}/full_trajectory": wandb.Table(data=[[s] for s in full_trajectory_decoded], columns=["sequence"])
-                # })
+            # })
 
         except Exception as e:
             if 'CUDA out of memory' in str(e):

@@ -15,7 +15,9 @@ class GoedelDataset(Dataset):
                 for line in f:
                     sample = json.loads(line)
                     # if sample['type'] == 'correction':
-                    if len(sample['target']) > 1:
+                    if len(sample['target']) > 10:
+                        if len(sample['prev_attempt']) < 2:
+                            sample['prev_attempt'] = 'Initial Attempt'
                         self.data.append(sample)
 
     def __len__(self):

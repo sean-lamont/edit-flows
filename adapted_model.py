@@ -68,8 +68,9 @@ class AdaptedEditFlowsTransformer(nn.Module):
         self.model = get_peft_model(self.model, peft_config)
         self.model.print_trainable_parameters()
 
-        self.model.gradient_checkpointing_enable()
+        # self.model.gradient_checkpointing_enable()
 
+        self.model.config.use_cache = False
         self.model.compile()
 
         self.vocab_size = self.model.config.vocab_size
@@ -163,16 +164,18 @@ class AdaptedEditFlowsTransformer(nn.Module):
         # (b, seq, vocab)
         lm_output = self.model.lm_head(hidden_states)
 
-        # print (lm_output.shape)
+
+        # if lm_output.shape[1] == 0:
+        #     print (tokens.shape)
+        #     print (combined_tokens.shape)
+        #     print (context_lens)
 
         # add zero vector for first entry
         lm_output = torch.cat([torch.zeros_like(lm_output[:, 0], device=x.device, dtype=torch.bfloat16).unsqueeze(1), lm_output], dim=1)
 
-        # add lm output for insert (usual objective from pretrained model)
+        # add lm output for insert (usual objective from pretrained model), previous token as substitute, scaled by learned weighting params
         ins = F.softmax(self.ins_head(x) + rates[:, :, -1].unsqueeze(-1) * lm_output[:, 1:], dim=-1)
-
         sub = F.softmax(self.sub_head(x) + rates[:, :, -2].unsqueeze(-1) * lm_output[:, :-1], dim=-1)
-
         mask = (~pad_mask).unsqueeze(-1).float()
 
         return (rates[:, :, :3] * mask, ins * mask, sub * mask)

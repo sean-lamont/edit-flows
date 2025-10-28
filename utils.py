@@ -87,7 +87,7 @@ def rm_gap_tokens(z: torch.Tensor, pad_token: int, gap_token: int):
         row = z[b]
         row = row[row != gap_token]
         filtered.append(row[row != pad_token])
-    max_len = max(len(r) for r in filtered) if filtered else 0
+    max_len = max(len(r) for r in filtered) if filtered else 0 # need at least one element in xt
     x = torch.full((batch, max_len), pad_token, dtype=z.dtype, device=z.device)
     for b, r in enumerate(filtered):
         x[b, :len(r)] = r

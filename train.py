@@ -47,7 +47,7 @@ def main():
                          logger=wandb_logger,
                          accumulate_grad_batches=8,
                          gradient_clip_val=5,
-                         num_sanity_val_steps=1,
+                         # num_sanity_val_steps=1,
                          val_check_interval=0.25,
                          callbacks=[checkpoint_callback],
                          )

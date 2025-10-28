@@ -35,10 +35,6 @@ class AdaptedDataModule(pl.LightningDataModule):
                 generator=generator
             )
 
-        # self.ds_train = GoedelDataset()
-        # self.ds_val = GoedelDataset()
-
-    # for error correction, x0 context is (goal + error + prev_attempt), for inital attempt just goal, target
     def _collate(self, batch):
         x0s = []
         x1s = []
@@ -46,8 +42,10 @@ class AdaptedDataModule(pl.LightningDataModule):
         contexts = []
         for i in range(len(batch)):
             context = batch[i]['context']
-            prev_attempt = batch[i].get('prev_attempt', '\n') # set to newline for now
+            prev_attempt = batch[i].get('prev_attempt', 'INITIAL ATTEMPT') # set to nonzero beginning
             target = batch[i]['target']
+
+            # print (f'context: {context}\n prev: {prev_attempt} \n target: {target}')
 
             context_ids = self.tokenizer(context, return_tensors='pt').input_ids[:self.max_len]
             context_len = context_ids.shape[1]
@@ -55,17 +53,11 @@ class AdaptedDataModule(pl.LightningDataModule):
             prev_ids = self.tokenizer(prev_attempt,  return_tensors='pt').input_ids[:self.max_len - context_len]
             target_ids = self.tokenizer(target,  return_tensors='pt').input_ids[:self.max_len - context_len]
 
-            # combine context and prev_attempt for x0, context and target for x1:
-            # x0 = torch.cat((context_ids.squeeze(0), prev_ids.squeeze(0)[1:]), dim=0)[:self.max_len]
-            # x1 = torch.cat((context_ids.squeeze(0), target_ids.squeeze(0)[1:]), dim=0)[:self.max_len]
-
             x0s.append(prev_ids)
             x1s.append(target_ids)
             context_lens.append(context_len)
             contexts.append(context_ids.squeeze(0))
 
-        # assumes that the alignment will keep context at the start for all examples so we can use context_lens
-        # todo collate batch only with x1s, x0s after context, add context to batch instead
         ret =  collate_batch_goedel(x1s, x0s, pad_token=self.tokenizer.pad_token_id, gap_token=151651)
         ret['context_lens'] = context_lens
         ret['contexts'] = contexts
