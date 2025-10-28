@@ -1,4 +1,5 @@
 import lightning.pytorch as pl
+from sacrebleu.metrics import BLEU
 from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
 from torch.nn import functional as F
 from torch.optim import Optimizer
@@ -21,7 +22,9 @@ class AdaptedLitModule(pl.LightningModule):
         super().__init__()
         # self.save_hyperparameters(ignore=['model'])
         self.model = model
-        self.kappa = CubicScheduler(**(scheduler_cfg or {'a': 1.0, 'b': 1.0}))
+        # self.kappa = CubicScheduler(**(scheduler_cfg or {'a': 1.0, 'b': 1.0}))
+        # self.kappa = CubicScheduler(**(scheduler_cfg or {'a': 1.0, 'b': 1.0}))
+        self.kappa = CubicScheduler(**(scheduler_cfg or {'a': 0.0, 'b': 2.0})) # from discrete flow matching paper, =t^2
         self.anneal_end_step = anneal_end_step
         self.full_vocab_size = full_vocab_size
         self.pad_token = pad_token_id
@@ -35,6 +38,9 @@ class AdaptedLitModule(pl.LightningModule):
         self.val_sample_count = 5
         self.max_seq_len = 7000
         self.oom_count = 0
+        self.bleu = BLEU()
+
+
 
     def configure_optimizers(self):
         return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
@@ -50,6 +56,7 @@ class AdaptedLitModule(pl.LightningModule):
             columns=["global_step", "epoch", "Initial Seq", "Final Seq" ],
             log_mode="INCREMENTAL"
         )
+
 
     def forward(self, tokens, t, pad_mask, contexts,  attn_mask_ratio):
         return self.model(tokens, t, pad_mask, contexts, self.pad_token, attn_mask_ratio)
@@ -154,6 +161,13 @@ class AdaptedLitModule(pl.LightningModule):
                 raise e
 
     def validation_step(self, batch, batch_idx):
+        # use fixed t for more consistent results
+        if not self.val_t:
+            self.val_t = torch.rand(batch['t'].shape[0], 1)
+            self.val_t = torch.clamp(self.val_t - 1e-2, min=0.0) # subtract eps to account for occasional 1's
+
+        batch['t'] = self.val_t
+
         loss, metrics = self._loss(batch)
         self.log('val/loss', loss, prog_bar=True)
         for k, v in metrics.items():
@@ -171,6 +185,16 @@ class AdaptedLitModule(pl.LightningModule):
             # Log the initial and final states of the trajectory
             initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False)
             final_seq = self.tokenizer.decode(trajectory[-1].squeeze().tolist(), skip_special_tokens=False)
+
+            # add bleu score comparison between final_seq and target
+            # Calculate BLEU score if a target sequence is available in the batch
+            if 'target_seq' in batch:
+                target_seq = self.tokenizer.decode(batch['target_seq'][0].squeeze().tolist(), skip_special_tokens=False)
+                # Assuming target_seq is a string and final_seq is a string
+                # You might need to tokenize them into lists of words for sacrebleu
+                score = self.bleu.corpus_score([final_seq], [[target_seq]]).score
+                self.log('val/bleu_score', score, prog_bar=True)
+
 
             self.val_outputs.add_data(
                 self.global_step,
@@ -204,8 +228,8 @@ class AdaptedLitModule(pl.LightningModule):
         for _ in range(n_steps):
             attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step)
 
-            # adapt_h = get_adaptive_h(dt, t, self.kappa)
-            adapt_h = dt
+            adapt_h = get_adaptive_h(dt, t, self.kappa)
+            # adapt_h = dt
 
             # print (f'dtype: {xt.dtype, t.dtype, pad_mask.dtype}')
             rates, ins_probs, sub_probs = self.forward(xt, t, pad_mask, context, attn_mask_ratio)
@@ -300,7 +324,5 @@ def get_adaptive_h(h: float, t: torch.Tensor, scheduler):
     return h_adapt
 
 # todo validation testing
-# todo save lora weights and extra layers for checkpointing
 # todo log parameter/gradient norms over time
-# todo oom count
 # todo add bleu score and checkpointing based on that

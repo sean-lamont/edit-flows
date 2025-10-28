@@ -24,8 +24,8 @@ def create_padding_mask(pads):
     return padding
 
 
-def create_random_mask(attn_ratio, seq_len):
-    random_mask = (torch.rand(seq_len, seq_len) < attn_ratio).to('cuda')
+def create_random_mask(attn_ratio, seq_len, device='cuda'):
+    random_mask = (torch.rand(seq_len, seq_len) < attn_ratio).to(device)
 
     def random_mask_func(b, h, q_idx, kv_idx):
         return random_mask[q_idx][kv_idx]
@@ -62,7 +62,7 @@ class AdaptedEditFlowsTransformer(nn.Module):
             lora_alpha=16,
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head"],
             lora_dropout=0.05,
-            bias="none",
+            # bias="none",
             task_type="CAUSAL_LM"
         )
         self.model = get_peft_model(self.model, peft_config)
@@ -74,12 +74,15 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         self.vocab_size = self.model.config.vocab_size
         self.time_emb = SinusoidalTimeEmbedding(hidden_dim)
-        self.rate_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, hidden_dim), nn.SiLU(),
-                                       nn.Linear(hidden_dim, 3))
-        self.ins_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, hidden_dim), nn.SiLU(),
-                                      nn.Linear(hidden_dim, self.vocab_size))
-        self.sub_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, hidden_dim), nn.SiLU(),
-                                      nn.Linear(hidden_dim, self.vocab_size))
+
+        self.rate_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, hidden_dim * 2), nn.SiLU(),
+                                       nn.Linear(hidden_dim * 2, 5)) # 3 for ins,sub,del, extra 2 for weighting lm_head
+
+        self.ins_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, self.model.config.hidden_size), nn.SiLU(),
+                                      nn.Linear(self.model.config.hidden_size, self.vocab_size))
+
+        self.sub_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, self.model.config.hidden_size), nn.SiLU(),
+                                      nn.Linear(self.model.config.hidden_size, self.vocab_size))
 
         # todo some way to integrate lm_head? e.g. take output from lm_head for ins_head, lm_head - 1 for sub_head,
         # do some weighted combination of this and above layers? Should leverage pre-trained lm_head is good
@@ -115,24 +118,24 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         B, L = combined_tokens.shape
 
-        # todo
-        # padding mask to the model might only be needed for inference, since it defaults to 0 gradient and is masked out from the loss
-        # padding_mask = create_padding_mask(pad_mask)
+        # todo padding mask to the model might only be needed for inference, since it defaults to 0 gradient and is masked out from the loss
+        padding_mask = create_padding_mask(combined_tokens == pad_token)
 
         if attn_mask_ratio < 1.0:
             # compute block for annealed attention
-            random_func = create_random_mask(attn_mask_ratio, L)
+            random_func = create_random_mask(attn_mask_ratio, L, device=tokens.device)
             or_mask = or_masks(*[causal_mask, random_func])
-            final_mask = or_mask
-            # final_mask = and_masks(*[or_mask, padding_mask])
+            # final_mask = or_mask
+            final_mask = and_masks(*[or_mask, padding_mask])
         else:
             # keep full attention
-            # final_mask = padding_mask
-            final_mask = full_mask
+            final_mask = padding_mask
+            # final_mask = full_mask
 
         # print(tokens.shape)
 
-        block_mask = create_block_mask(final_mask, None, None, L, L, device=tokens.device)  # , _compile=True)
+        block_mask = create_block_mask(final_mask, B, None, L, L, device=tokens.device)  # , _compile=True)
+        # block_mask = create_block_mask(final_mask, None, None, L, L, device=tokens.device)  # , _compile=True)
 
         # outputs = self.model.forward(input_ids=tokens,  output_hidden_states=True,)
 
@@ -148,22 +151,30 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         # (b, seq_len, dim)
         hidden_states = outputs.hidden_states[-1]
-        # only take hidden states from context_lens onwards
 
+        # only take hidden states from context_lens onwards
         hidden_states = torch.stack([
             hidden_states[i, context_lens[i]:context_lens[i] + tokens.shape[1]]  # same length (original padded non-context tokens, taken from respective context )
             for i in range(hidden_states.shape[0])], dim=0 )
 
-
         time_ = self.time_emb(t).unsqueeze(1).expand(-1, hidden_states.shape[1], -1)
-
 
         x = torch.cat([hidden_states, time_], dim=-1)
 
+        # (b, seq, 5)
         rates = F.softplus(self.rate_head(x))
-        ins = F.softmax(self.ins_head(x), dim=-1)
-        sub = F.softmax(self.sub_head(x), dim=-1)
+
+        # (b, seq, vocab)
+        lm_output = self.model.lm_head(hidden_states)
+
+        # add zero vector for first entry
+        lm_output = torch.cat([torch.zeros_like(lm_output[:, 0], device=self.device, dtype=torch.bfloat16), lm_output])
+
+        # add lm output for insert (usual objective from pretrained model)
+        ins = F.softmax(self.ins_head(x) + rates[:, -1].unsqueeze(-1) * lm_output[:, 1:], dim=-1)
+
+        sub = F.softmax(self.sub_head(x) + rates[:, -2].unsqueeze(-1) * lm_output[:, :-1], dim=-1)
 
         mask = (~pad_mask).unsqueeze(-1).float()
 
-        return (rates * mask, ins * mask, sub * mask)
+        return (rates[:, :3] * mask, ins * mask, sub * mask)

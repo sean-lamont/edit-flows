@@ -30,6 +30,16 @@ def main():
     exclude_frozen_parameters=True
     )
 
+    # update to checkpoint based on bleu score
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        monitor="val_bleu_score",
+        mode="max",
+        # dirpath="checkpoints",
+        filename="best-checkpoint-{epoch:02d}-{val_bleu_score:.2f}",
+        save_top_k=1,
+        save_last=True
+    )
+
     trainer = pl.Trainer(max_epochs=2, log_every_n_steps=1,
                          # strategy='deepspeed_stage_2_offload',
                          strategy=strategy,
@@ -39,6 +49,7 @@ def main():
                          # gradient_clip_val=1,
                          num_sanity_val_steps=0,
                          val_check_interval=0.25,
+                         callbacks=[checkpoint_callback],
                          )
     trainer.fit(lit_module, dm)
 

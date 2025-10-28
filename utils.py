@@ -120,8 +120,12 @@ def make_ut_mask_from_z(z_t: torch.Tensor, z_1: torch.Tensor, vocab_size: int, p
     mask[ins, z_1[ins]] = True
     mask[sub, z_1[sub] + vocab_size] = True
     mask[:, :, -1][dele] = True
-    assert diff.sum() == mask.sum()
+
+    assert diff.sum() == (ins | dele | sub).sum(), "Mismatch in number of edits"
+    assert diff.sum() == mask.sum(), 'Mismatch in mask edits'
+
     return mask
+
 
 def fill_gap_tokens_with_repeats(ux: torch.Tensor, z_gap: torch.Tensor, z_pad: torch.Tensor):
     b, zL = z_gap.shape
@@ -130,6 +134,7 @@ def fill_gap_tokens_with_repeats(ux: torch.Tensor, z_gap: torch.Tensor, z_pad: t
     idx = non_gap.cumsum(dim=1) - 1
     idx = idx.clamp(min=0, max=xL-1)
     batch_idx = torch.arange(b, device=ux.device).unsqueeze(1)
+    # out will be of length zt, each entry oi giving the relevant (ins, sub, del) scores for zi
     out = ux[batch_idx, idx]
     out[z_pad] = 0
     return out
