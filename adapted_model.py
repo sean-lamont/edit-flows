@@ -84,8 +84,6 @@ class AdaptedEditFlowsTransformer(nn.Module):
         self.sub_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, self.model.config.hidden_size), nn.SiLU(),
                                       nn.Linear(self.model.config.hidden_size, self.vocab_size))
 
-        # todo some way to integrate lm_head? e.g. take output from lm_head for ins_head, lm_head - 1 for sub_head,
-        # do some weighted combination of this and above layers? Should leverage pre-trained lm_head is good
         # self._init_heads()
 
     # def _init_heads(self):
@@ -118,7 +116,6 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         B, L = combined_tokens.shape
 
-        # todo padding mask to the model might only be needed for inference, since it defaults to 0 gradient and is masked out from the loss
         padding_mask = create_padding_mask(combined_tokens == pad_token)
 
         if attn_mask_ratio < 1.0:
@@ -132,11 +129,10 @@ class AdaptedEditFlowsTransformer(nn.Module):
             final_mask = padding_mask
             # final_mask = full_mask
 
-        # print(tokens.shape)
 
         block_mask = create_block_mask(final_mask, B, None, L, L, device=tokens.device)  # , _compile=True)
-        # block_mask = create_block_mask(final_mask, None, None, L, L, device=tokens.device)  # , _compile=True)
 
+        # block_mask = create_block_mask(final_mask, None, None, L, L, device=tokens.device)  # , _compile=True)
         # outputs = self.model.forward(input_ids=tokens,  output_hidden_states=True,)
 
         outputs = self.model.forward(input_ids=combined_tokens, attention_mask=block_mask, output_hidden_states=True,
@@ -167,14 +163,16 @@ class AdaptedEditFlowsTransformer(nn.Module):
         # (b, seq, vocab)
         lm_output = self.model.lm_head(hidden_states)
 
+        # print (lm_output.shape)
+
         # add zero vector for first entry
-        lm_output = torch.cat([torch.zeros_like(lm_output[:, 0], device=self.device, dtype=torch.bfloat16), lm_output])
+        lm_output = torch.cat([torch.zeros_like(lm_output[:, 0], device=x.device, dtype=torch.bfloat16).unsqueeze(1), lm_output], dim=1)
 
         # add lm output for insert (usual objective from pretrained model)
-        ins = F.softmax(self.ins_head(x) + rates[:, -1].unsqueeze(-1) * lm_output[:, 1:], dim=-1)
+        ins = F.softmax(self.ins_head(x) + rates[:, :, -1].unsqueeze(-1) * lm_output[:, 1:], dim=-1)
 
-        sub = F.softmax(self.sub_head(x) + rates[:, -2].unsqueeze(-1) * lm_output[:, :-1], dim=-1)
+        sub = F.softmax(self.sub_head(x) + rates[:, :, -2].unsqueeze(-1) * lm_output[:, :-1], dim=-1)
 
         mask = (~pad_mask).unsqueeze(-1).float()
 
-        return (rates[:, :3] * mask, ins * mask, sub * mask)
+        return (rates[:, :, :3] * mask, ins * mask, sub * mask)

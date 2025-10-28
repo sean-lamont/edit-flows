@@ -46,7 +46,7 @@ class AdaptedDataModule(pl.LightningDataModule):
         contexts = []
         for i in range(len(batch)):
             context = batch[i]['context']
-            prev_attempt = batch[i].get('prev_attempt', '')
+            prev_attempt = batch[i].get('prev_attempt', '\n') # set to newline for now
             target = batch[i]['target']
 
             context_ids = self.tokenizer(context, return_tensors='pt').input_ids[:self.max_len]
@@ -70,6 +70,7 @@ class AdaptedDataModule(pl.LightningDataModule):
         ret['context_lens'] = context_lens
         ret['contexts'] = contexts
         ret['idx'] = [b['idx'] for b in batch]
+        ret['type'] = [b['type'] for b in batch]
 
         return ret
 

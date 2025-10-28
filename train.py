@@ -40,14 +40,14 @@ def main():
         save_last=True
     )
 
-    trainer = pl.Trainer(max_epochs=2, log_every_n_steps=1,
+    trainer = pl.Trainer(log_every_n_steps=1,
                          # strategy='deepspeed_stage_2_offload',
                          strategy=strategy,
                          precision='bf16-mixed',
                          logger=wandb_logger,
                          # accumulate_grad_batches=8,
-                         # gradient_clip_val=1,
-                         num_sanity_val_steps=0,
+                         gradient_clip_val=5,
+                         num_sanity_val_steps=1,
                          val_check_interval=0.25,
                          callbacks=[checkpoint_callback],
                          )
