@@ -38,7 +38,49 @@ class AdaptedLitModule(pl.LightningModule):
         self.bleu = BLEU()
         self.val_t = None
 
+    def on_before_optimizer_step(self, optimizer):
+        # 1. --- Only log on global rank 0 ---
+        if not self.trainer.is_global_zero:
+            return
 
+        # 2. --- Loop and Log Norms ---
+        # This hook is called AFTER .backward() and BEFORE .step(),
+        # which is the exact window where safe_get_full_grad must be used.
+
+        # Use self.named_parameters() to get the layer names
+        for name, param in self.named_parameters():
+
+            # --- Log Gradient Norm ---
+            # Get the full, unsharded gradient, regardless of ZeRO stage
+            if param.grad is not None:
+                full_grad = deepspeed.utils.safe_get_full_grad(param)
+
+                if full_grad is not None:
+                    grad_norm = full_grad.data.norm(2)
+                    self.log(
+                        f"gradients/{name}_norm",
+                        grad_norm,
+                        self.global_step,
+                        on_step=True,
+                        on_epoch=False,
+                        rank_zero_only=True
+                    )
+                else:
+                    # This can happen for non-trainable parameters
+                    pass
+
+            # --- Log Parameter Norm ---
+            # NOTE: This will still log the SHARD norm for ZeRO-3 params.
+            # To get the full param norm, you'd need safe_get_full_fp32_param
+            param_norm = param.data.norm(2)
+            self.log(
+                f"parameters/{name}_norm",
+                param_norm,
+                self.global_step,
+                on_step = True,
+                on_epoch = False,
+                rank_zero_only = True
+            )
 
     def configure_optimizers(self):
         return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
@@ -170,7 +212,7 @@ class AdaptedLitModule(pl.LightningModule):
         try:
             # use fixed t for more consistent results
             if not self.val_t:
-                self.val_t = torch.rand(batch['t'].shape[0], 1, device=batch['t'].device)
+                self.val_t = torch.rand(batch['t'].shape[0], 1, device=batch['t'].device, dtype=torch.bfloat16)
                 self.val_t = torch.clamp(self.val_t - 1e-2, min=0.0) # subtract eps to account for occasional 1's
 
             batch['t'] = self.val_t
@@ -231,6 +273,7 @@ class AdaptedLitModule(pl.LightningModule):
             else:
                 print(f'Non OOM error in val: {e}')
                 torch.cuda.empty_cache()
+                # raise e
                 return
 
     @torch.no_grad()
