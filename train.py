@@ -50,6 +50,7 @@ def main():
                          # num_sanity_val_steps=1,
                          val_check_interval=0.25,
                          callbacks=[checkpoint_callback],
+                         detect_anomaly=True
                          )
     trainer.fit(lit_module, dm)
 

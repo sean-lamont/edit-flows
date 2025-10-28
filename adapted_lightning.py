@@ -138,7 +138,7 @@ class AdaptedLitModule(pl.LightningModule):
 
         N = torch.clamp(N, min=1.0)
 
-        loss_vec = loss_vec / N
+        loss_vec = loss_vec #/ N
 
         if torch.isnan(loss_vec).any():
             print (f'nan loss')
@@ -357,3 +357,6 @@ def get_adaptive_h(h: float, t: torch.Tensor, scheduler):
     _h = h * torch.ones_like(t, device=t.device)
     h_adapt = torch.minimum(_h, coeff)
     return h_adapt
+
+# todo log backward 0 nan values in 0th output (check lm_output with torch zeros?)
+# todo params not changing even with high gradient norms..
