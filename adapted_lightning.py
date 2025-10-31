@@ -1,3 +1,5 @@
+import traceback
+
 import lightning.pytorch as pl
 from sacrebleu.metrics import BLEU
 from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
@@ -40,58 +42,58 @@ class AdaptedLitModule(pl.LightningModule):
         self.grad_clip_val = grad_clip_val
         self.acc_grad_batches = acc_grad_batches
 
-    def on_before_optimizer_step(self, optimizer):
-        try:
-            # 1. --- Only log on global rank 0 ---
-            if not self.trainer.is_global_zero:
-                return
-
-            # 2. --- Loop and Log Norms ---
-            # This hook is called AFTER .backward() and BEFORE .step(),
-            # which is the exact window where safe_get_full_grad must be used.
-
-            log_data = {}
-
-            total_grad_norm = 0.0
-            total_param_norm = 0.0
-            # Use self.named_parameters() to get the layer names
-            for name, param in self.named_parameters():
-
-                # --- Log Gradient Norm ---
-                # Get the full, unsharded gradient, regardless of ZeRO stage
-                full_grad = deepspeed.utils.safe_get_full_grad(param)
-
-                if full_grad is not None:
-                    safe_name = name.replace('.', '_')
-
-                    grad_norm = full_grad.data.norm(2)
-                    total_grad_norm += grad_norm
-
-                    param_norm = param.data.norm(2)
-                    log_data[f"parameters/{safe_name}_param_norm"] = param_norm
-                    total_param_norm += param_norm
-
-            if log_data:
-                log_data['total_grad_norm'] = total_grad_norm ** 0.5
-                log_data['total_param_norm'] = total_param_norm ** 0.5
-                # self.logger.experiment.log(log_data, step=self.global_step)
-                self.log_dict(log_data)#, step=self.global_step)
-
-        except Exception as e:
-            if 'CUDA out of memory' in str(e):
-                self.oom_count = self.oom_count + 1
-                self.log(f'train/oom_count', self.oom_count, prog_bar=False)
-                del e
-                gc.collect()
-                torch.cuda.empty_cache()
-            else:
-                print(f'non OOM error: {e}')
-                del e
-                gc.collect()
-                torch.cuda.empty_cache()
+    # def on_before_optimizer_step(self, optimizer):
+    #     try:
+    #         # 1. --- Only log on global rank 0 ---
+    #         if not self.trainer.is_global_zero:
+    #             return
+    #
+    #         # 2. --- Loop and Log Norms ---
+    #         # This hook is called AFTER .backward() and BEFORE .step(),
+    #         # which is the exact window where safe_get_full_grad must be used.
+    #
+    #         log_data = {}
+    #
+    #         total_grad_norm = 0.0
+    #         total_param_norm = 0.0
+    #         # Use self.named_parameters() to get the layer names
+    #         for name, param in self.named_parameters():
+    #
+    #             # --- Log Gradient Norm ---
+    #             # Get the full, unsharded gradient, regardless of ZeRO stage
+    #             full_grad = deepspeed.utils.safe_get_full_grad(param)
+    #
+    #             if full_grad is not None:
+    #                 safe_name = name.replace('.', '_')
+    #
+    #                 grad_norm = full_grad.data.norm(2)
+    #                 total_grad_norm += grad_norm
+    #
+    #                 param_norm = param.data.norm(2)
+    #                 log_data[f"parameters/{safe_name}_param_norm"] = param_norm
+    #                 total_param_norm += param_norm
+    #
+    #         if log_data:
+    #             log_data['total_grad_norm'] = total_grad_norm ** 0.5
+    #             log_data['total_param_norm'] = total_param_norm ** 0.5
+    #             # self.logger.experiment.log(log_data, step=self.global_step)
+    #             self.log_dict(log_data)#, step=self.global_step)
+    #
+    #     except Exception as e:
+    #         if 'CUDA out of memory' in str(e):
+    #             self.oom_count = self.oom_count + 1
+    #             self.log(f'train/oom_count', self.oom_count, prog_bar=False)
+    #             del e
+    #             gc.collect()
+    #             torch.cuda.empty_cache()
+    #         else:
+    #             print(f'non OOM error: {e}')
+    #             del e
+    #             gc.collect()
+    #             torch.cuda.empty_cache()
 
     def configure_optimizers(self):
-        return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
+        # return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
         # return DeepSpeedCPUAdam(self.parameters(), 1e-5, eps=1e-6)
         return torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
         # opt = torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
@@ -209,6 +211,8 @@ class AdaptedLitModule(pl.LightningModule):
                 return
             else:
                 print (f'non OOM error: {e}')
+                traceback.print_exception(e)
+                del e
                 gc.collect()
                 torch.cuda.empty_cache()
                 return

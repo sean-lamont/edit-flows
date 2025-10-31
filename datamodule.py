@@ -74,4 +74,4 @@ class AdaptedDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(self.ds_val, batch_size=self.batch_size,
-                          collate_fn=self._collate, num_workers=0, shuffle=True)
+                          collate_fn=self._collate, num_workers=0, shuffle=False)

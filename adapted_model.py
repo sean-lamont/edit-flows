@@ -1,41 +1,17 @@
 import torch
+import matplotlib.pyplot as plt
 import time
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 from utils import SinusoidalTimeEmbedding
-from torch.nn.attention.flex_attention import create_block_mask, and_masks, or_masks, create_mask
-
-
-def causal_mask(b, h, q_idx, kv_idx):
-    return q_idx >= kv_idx
-
-
-# bit of a hack, but can't just return True
-def full_mask(b, h, q_idx, kv_idx):
-    return q_idx >= 0
-
-
-def create_padding_mask(pads):
-    def padding(b, h, q_idx, kv_idx):
-        return ~pads[b, q_idx] & ~pads[b, kv_idx]
-
-    return padding
-
-
-def create_random_mask(attn_ratio, seq_len, device='cuda'):
-    random_mask = (torch.rand(seq_len, seq_len) < attn_ratio).to(device)
-
-    def random_mask_func(b, h, q_idx, kv_idx):
-        return random_mask[q_idx][kv_idx]
-
-    return random_mask_func
-
 
 class AdaptedEditFlowsTransformer(nn.Module):
-    def __init__(self, pretrained_model_name: str, hidden_dim=512):
+    def __init__(self, pretrained_model_name: str, hidden_dim=512, debug_attn=False):
         super().__init__()
+
+        self.debug_attn = debug_attn
 
         # bnb_conf = BitsAndBytesConfig(
         #     load_in_4bit=True,
@@ -46,11 +22,13 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         self.model = AutoModelForCausalLM.from_pretrained(pretrained_model_name, dtype=torch.bfloat16,
                                                           trust_remote_code=True,
-                                                          _attn_implementation='flex_attention',
-                                                          # _attn_implementation='flash_attention_2', # _attn_implementation='flex_attention',
+                                                          # _attn_implementation='flex_attention',
+                                                          # _attn_implementation='flash_attention_2',
+                                                          # _attn_implementation='eager'
                                                           # quantization_config=bnb_conf,
+                                                          output_attentions=True,
                                                           ).train()
-        #
+
         # self.model = prepare_model_for_kbit_training(self.model)
 
         # add LoRa and Quantization
@@ -69,7 +47,7 @@ class AdaptedEditFlowsTransformer(nn.Module):
         # self.model.gradient_checkpointing_enable()
         # self.model.config.use_cache = False
 
-        self.model.compile()
+        # self.model.compile()
 
         self.vocab_size = self.model.config.vocab_size
         self.time_emb = SinusoidalTimeEmbedding(hidden_dim)
@@ -90,6 +68,9 @@ class AdaptedEditFlowsTransformer(nn.Module):
         context_lens = [c.shape[0] for c in context_tokens]
         pad_len = tokens.shape[1] + max(context_lens)
 
+        active_target_lens = (~pad_mask).sum(dim=1)
+
+
         combined_tokens = torch.stack([
             F.pad(
                 torch.cat([context_tokens[i], tokens[i]], dim=0),
@@ -98,34 +79,83 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         B, L = combined_tokens.shape
 
-        padding_mask = create_padding_mask(combined_tokens == pad_token)
+        # Create the base causal mask (True = keep)
+        # This is [L, L], which will be broadcast to [B, 1, L, L]
+        causal_bool = torch.tril(torch.ones((L, L), device=tokens.device, dtype=torch.bool))
 
-        if attn_mask_ratio < 1.0:
-            # compute block for annealed attention
-            random_func = create_random_mask(attn_mask_ratio, L, device=tokens.device)
-            or_mask = or_masks(*[causal_mask, random_func])
-            # final_mask = or_mask
-            final_mask = and_masks(*[or_mask, padding_mask])
-        else:
-            # keep full attention
-            final_mask = padding_mask
-            # final_mask = full_mask
+        # Create the annealed random mask (True = keep)
+        # This is [B, 1, L, L] for a different mask per batch item
+        # random_bool = torch.rand(B, 1, L, L, device=tokens.device) < attn_mask_ratio
+        random_bool = torch.rand(B, 1, L, L, device=tokens.device) < 0.1
 
+        # pad_locations is [B, L], True where there is a pad
+        pad_locations = (combined_tokens == pad_token)
 
-        block_mask = create_block_mask(final_mask, B, None, L, L, device=tokens.device)  # , _compile=True)
+        # We want to mask out any position where
+        # the query (row) or the key (column) is a pad token.
+        # [B, L] -> [B, 1, L, 1] (for queries)
+        # [B, L] -> [B, 1, 1, L] (for keys)
+        # OR broadcasts to [B, 1, L, L]
+        # will be True where either q or k is pad
+        padding_mask_bool = pad_locations.view(B, 1, L, 1) | pad_locations.view(B, 1, 1, L)
+        padding_bool = ~padding_mask_bool
 
-        # block_mask = create_block_mask(final_mask, None, None, L, L, device=tokens.device)  # , _compile=True)
-        # outputs = self.model.forward(input_ids=tokens,  output_hidden_states=True,)
+        # We want to keep positions that are:
+        # (Causal OR Random) AND (Not Padding)
+        final_mask_bool = (causal_bool | random_bool) & padding_bool
 
-        outputs = self.model.forward(input_ids=combined_tokens, attention_mask=block_mask, output_hidden_states=True,
-                                     kernel_options={
-                                         "BLOCK_M": 32,
-                                         "BLOCK_N": 32,
-                                         "BLOCK_M1": 32,
-                                         "BLOCK_N1": 32,
-                                         "BLOCK_M2": 32,
-                                         "BLOCK_N2": 32,
-                                     })
+        # attention_mask = ~final_mask_bool
+
+        # 5. Convert boolean mask to a float mask for the model
+        # The model's forward pass expects 0.0 for "keep" and -inf for "mask out"
+        attention_mask = torch.zeros(B, 1, L, L, device=tokens.device, dtype=torch.bfloat16)
+
+        attention_mask.masked_fill_(~final_mask_bool, -torch.inf)
+
+        outputs = self.model.forward(input_ids=combined_tokens,
+                                     attention_mask=attention_mask,  # <-- Pass the dense mask here
+                                     output_hidden_states=True,
+                                     output_attentions=True)
+
+        if self.debug_attn:
+            # We'll just plot for the first item in the batch (B=0)
+            context_len_b0 = context_lens[0]
+            active_target_len_b0 = active_target_lens[0].item()
+
+            last_layer_attn = outputs.attentions[-1]
+            L_combined = last_layer_attn.shape[-1]
+
+            # Get attention for Batch 0, Head 0
+            attn_map = last_layer_attn[0, 0].detach().cpu().float().numpy()
+
+            plt.figure(figsize=(12, 10))
+            plt.imshow(attn_map, vmin=0)
+            plt.title(f"[Debug Plot] Attn Map (B=0, H=0) | Ratio: {attn_mask_ratio}")
+            plt.xlabel("Key Position (Attending To)")
+            plt.ylabel("Query Position (Attending From)")
+            plt.colorbar(label="Attention Weight")
+
+            # Line 1: End of Context
+            context_end_line = context_len_b0 - 0.5
+            plt.axvline(x=context_end_line, color='cyan', linestyle='--', label='Context / Target Boundary')
+            plt.axhline(y=context_end_line, color='cyan', linestyle='--')
+
+            # Line 2: End of Active Target (Start of Padding)
+            active_target_end_line = (context_len_b0 + active_target_len_b0) - 0.5
+            plt.axvline(x=active_target_end_line, color='r', linestyle='--', label='Target / Padding Boundary')
+            plt.axhline(y=active_target_end_line, color='r', linestyle='--')
+
+            plt.xlim(-0.5, L_combined - 0.5)
+            plt.ylim(L_combined - 0.5, -0.5)
+            plt.legend()
+
+            print("\n--- [Debug Plot] ---")
+            print(f"Plotting attention for B=0, H=0 (Shape: {L_combined}x{L_combined})")
+            print(f"  Context len: {context_len_b0}")
+            print(f"  Active Target len: {active_target_len_b0}")
+            print("--- Pausing script. Close plot window to continue. ---")
+
+            plt.savefig("attention_plot_causal.png", dpi=300, bbox_inches='tight')
 
         # (b, seq_len, dim)
         hidden_states = outputs.hidden_states[-1]
