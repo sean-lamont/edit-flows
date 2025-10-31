@@ -8,12 +8,13 @@ from datasets import GoedelDataset
 import torch
 
 class AdaptedDataModule(pl.LightningDataModule):
-    def __init__(self, tokenizer, batch_size=64, n_train=1000, n_val=100, max_len=7000):
+    def __init__(self, tokenizer, batch_size=64, n_train=1000, n_val=100, max_context_len=2000, max_len=4000):
         super().__init__()
         self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.n_train = n_train
         self.n_val = n_val
+        self.max_context_len = max_context_len
         self.max_len = max_len
 
     def setup(self, stage=None):
@@ -35,6 +36,9 @@ class AdaptedDataModule(pl.LightningDataModule):
                 generator=generator
             )
 
+            # test with same ds
+            self.ds_val = self.ds_train
+
     def _collate(self, batch):
         x0s = []
         x1s = []
@@ -47,11 +51,11 @@ class AdaptedDataModule(pl.LightningDataModule):
 
             # print (f'context: {context}\n prev: {prev_attempt} \n target: {target}')
 
-            context_ids = self.tokenizer(context, return_tensors='pt').input_ids[:self.max_len]
+            context_ids = self.tokenizer(context, return_tensors='pt').input_ids[:self.max_context_len]
             context_len = context_ids.shape[1]
 
-            prev_ids = self.tokenizer(prev_attempt,  return_tensors='pt').input_ids[:self.max_len - context_len]
-            target_ids = self.tokenizer(target,  return_tensors='pt').input_ids[:self.max_len - context_len]
+            prev_ids = self.tokenizer(prev_attempt,  return_tensors='pt').input_ids[:self.max_len]
+            target_ids = self.tokenizer(target,  return_tensors='pt').input_ids[:self.max_len]
 
             x0s.append(prev_ids)
             x1s.append(target_ids)
@@ -67,7 +71,8 @@ class AdaptedDataModule(pl.LightningDataModule):
         return ret
 
     def train_dataloader(self):
-        return DataLoader(self.ds_train, batch_size=self.batch_size, shuffle=True,
+        return DataLoader(self.ds_train, batch_size=self.batch_size,
+                          shuffle=False,
                           collate_fn=self._collate, num_workers=0)
 
     def val_dataloader(self):
