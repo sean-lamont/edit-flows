@@ -50,7 +50,7 @@ def main():
                          # accumulate_grad_batches=8,
                          # gradient_clip_val=5,
                          num_sanity_val_steps=0,
-                         val_check_interval=0.25,
+                         val_check_interval=0.1,
                          callbacks=[checkpoint_callback],
                          # detect_anomaly=True
                          )

@@ -2,6 +2,7 @@ import lightning.pytorch as pl
 from sacrebleu.metrics import BLEU
 from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
 from torch.nn import functional as F
+import gc
 from torch.optim import Optimizer
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 import torch
@@ -64,7 +65,6 @@ class AdaptedLitModule(pl.LightningModule):
                     safe_name = name.replace('.', '_')
 
                     grad_norm = full_grad.data.norm(2)
-                    log_data[f"gradients/{safe_name}_grad_norm"] = grad_norm
                     total_grad_norm += grad_norm
 
                     param_norm = param.data.norm(2)
@@ -81,9 +81,13 @@ class AdaptedLitModule(pl.LightningModule):
             if 'CUDA out of memory' in str(e):
                 self.oom_count = self.oom_count + 1
                 self.log(f'train/oom_count', self.oom_count, prog_bar=False)
+                del e
+                gc.collect()
                 torch.cuda.empty_cache()
             else:
                 print(f'non OOM error: {e}')
+                del e
+                gc.collect()
                 torch.cuda.empty_cache()
 
     def configure_optimizers(self):
@@ -177,13 +181,10 @@ class AdaptedLitModule(pl.LightningModule):
             'edit_dist': uz_mask.sum().float()
         }
 
-    def dummy_loss(self, batch):
-        return torch.sum(self.dummy_model(torch.ones(batch['x0'].shape[0], device=self.device, dtype=torch.bfloat16)),
-                         dim=-1)
-
     def training_step(self, batch, batch_idx):
         opt = self.optimizers()
         accum_batches = self.acc_grad_batches
+        loss = None
 
         try:
             loss, metrics = self._loss(batch)
@@ -198,11 +199,19 @@ class AdaptedLitModule(pl.LightningModule):
             if 'out of memory' in str(e).lower():
                 self.oom_count = self.oom_count + 1
                 self.log(f'train/oom_count', self.oom_count, prog_bar=False)
+
+                if loss is not None:
+                    del loss
+                del e
+                gc.collect()
                 torch.cuda.empty_cache()
+
                 return
             else:
                 print (f'non OOM error: {e}')
-                raise e
+                gc.collect()
+                torch.cuda.empty_cache()
+                return
                 # torch.cuda.empty_cache()
                 # return self.dummy_loss(batch)
 
@@ -211,10 +220,7 @@ class AdaptedLitModule(pl.LightningModule):
         is_accum_step = (batch_idx + 1) % accum_batches == 0
 
         if is_accum_step or is_last_batch:
-            # We can also wrap step() in case the optimizer itself OOMs
             try:
-                # Optional: Gradient clipping
-                # self.clip_gradients(opt, ...)
                 self.clip_gradients(opt, self.grad_clip_val)
 
                 opt.step()
@@ -223,8 +229,11 @@ class AdaptedLitModule(pl.LightningModule):
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     print(f"WARNING: OOM during optimizer.step(). Skipping step.")
-                    torch.cuda.empty_cache()
                     opt.zero_grad()  # Must clear grads if step failed
+
+                    del e
+                    gc.collect()
+                    torch.cuda.empty_cache()
                 else:
                     raise e
 
@@ -278,11 +287,15 @@ class AdaptedLitModule(pl.LightningModule):
             if 'CUDA out of memory' in str(e):
                 self.oom_count = self.oom_count + 1
                 self.log(f'val/oom_count', self.oom_count, prog_bar=False)
+                del e
+                gc.collect()
                 torch.cuda.empty_cache()
                 return
 
             else:
                 print(f'Non OOM error in val: {e}')
+                del e
+                gc.collect()
                 torch.cuda.empty_cache()
                 # raise e
                 return
@@ -410,6 +423,3 @@ def get_adaptive_h(h: float, t: torch.Tensor, scheduler):
     _h = h * torch.ones_like(t, device=t.device)
     h_adapt = torch.minimum(_h, coeff)
     return h_adapt
-
-# todo log backward 0 nan values in 0th output (check lm_output with torch zeros?)
-# todo params not changing even with high gradient norms..

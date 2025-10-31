@@ -36,9 +36,6 @@ class AdaptedDataModule(pl.LightningDataModule):
                 generator=generator
             )
 
-            # test with same ds
-            self.ds_val = self.ds_train
-
     def _collate(self, batch):
         x0s = []
         x1s = []
@@ -77,4 +74,4 @@ class AdaptedDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(self.ds_val, batch_size=self.batch_size,
-                          collate_fn=self._collate, num_workers=0, shuffle=False)
+                          collate_fn=self._collate, num_workers=0, shuffle=True)
