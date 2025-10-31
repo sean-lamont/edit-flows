@@ -14,6 +14,7 @@ import wandb
 
 from scheduler import CubicScheduler
 from utils import *
+import bitsandbytes.optim as bnb_optim
 from lightning.pytorch.utilities import grad_norm
 # import torchviz
 
@@ -21,7 +22,7 @@ from lightning.pytorch.utilities import grad_norm
 
 class AdaptedLitModule(pl.LightningModule):
     def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=3e-4, scheduler_cfg=None,
-                 anneal_end_step=10000, grad_clip_val=5, acc_grad_batches=8):
+                 anneal_end_step=10000) :
         super().__init__()
         # self.save_hyperparameters(ignore=['model'])
         self.model = model
@@ -37,65 +38,12 @@ class AdaptedLitModule(pl.LightningModule):
         self.oom_count = 0
         self.bleu = BLEU()
         self.val_t = None
-        # to allow handling of OOM and continue training
-        self.automatic_optimization = False
-        self.grad_clip_val = grad_clip_val
-        self.acc_grad_batches = acc_grad_batches
-
-    # def on_before_optimizer_step(self, optimizer):
-    #     try:
-    #         # 1. --- Only log on global rank 0 ---
-    #         if not self.trainer.is_global_zero:
-    #             return
-    #
-    #         # 2. --- Loop and Log Norms ---
-    #         # This hook is called AFTER .backward() and BEFORE .step(),
-    #         # which is the exact window where safe_get_full_grad must be used.
-    #
-    #         log_data = {}
-    #
-    #         total_grad_norm = 0.0
-    #         total_param_norm = 0.0
-    #         # Use self.named_parameters() to get the layer names
-    #         for name, param in self.named_parameters():
-    #
-    #             # --- Log Gradient Norm ---
-    #             # Get the full, unsharded gradient, regardless of ZeRO stage
-    #             full_grad = deepspeed.utils.safe_get_full_grad(param)
-    #
-    #             if full_grad is not None:
-    #                 safe_name = name.replace('.', '_')
-    #
-    #                 grad_norm = full_grad.data.norm(2)
-    #                 total_grad_norm += grad_norm
-    #
-    #                 param_norm = param.data.norm(2)
-    #                 log_data[f"parameters/{safe_name}_param_norm"] = param_norm
-    #                 total_param_norm += param_norm
-    #
-    #         if log_data:
-    #             log_data['total_grad_norm'] = total_grad_norm ** 0.5
-    #             log_data['total_param_norm'] = total_param_norm ** 0.5
-    #             # self.logger.experiment.log(log_data, step=self.global_step)
-    #             self.log_dict(log_data)#, step=self.global_step)
-    #
-    #     except Exception as e:
-    #         if 'CUDA out of memory' in str(e):
-    #             self.oom_count = self.oom_count + 1
-    #             self.log(f'train/oom_count', self.oom_count, prog_bar=False)
-    #             del e
-    #             gc.collect()
-    #             torch.cuda.empty_cache()
-    #         else:
-    #             print(f'non OOM error: {e}')
-    #             del e
-    #             gc.collect()
-    #             torch.cuda.empty_cache()
 
     def configure_optimizers(self):
         # return DeepSpeedCPUAdam(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
         # return DeepSpeedCPUAdam(self.parameters(), 1e-5, eps=1e-6)
-        return torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
+        # return torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
+        return bnb_optim.AdamW8bit(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
         # opt = torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
         # steps = 500000 # change based on total steps
         # scheduler = get_cosine_schedule_with_warmup(opt, num_warmup_steps=2000, num_training_steps=steps)
@@ -117,12 +65,8 @@ class AdaptedLitModule(pl.LightningModule):
 
         p0 = x2prob(z0, self.full_vocab_size)
         p1 = x2prob(z1, self.full_vocab_size)
-        # x0
-        # shape: torch.Size([1, 0]), x1, prev_attempt = ''
-        # torch.Size([1, 1868]), z1: torch.Size([1, 1868]), zt: torch.Size([1, 1868])
 
         zt = sample_cond_pt(p0, p1, t, self.kappa)
-        # print (f'x0 shape: {x0.shape}, x1 {x1.shape}, z1: {z1.shape}, zt: {zt.shape}')
 
         xt, x_pad, z_gap, z_pad = rm_gap_tokens(zt, self.pad_token, self.gap_token)
 
@@ -143,7 +87,6 @@ class AdaptedLitModule(pl.LightningModule):
         uz_cat = fill_gap_tokens_with_repeats(ux_cat, z_gap, z_pad)
 
         # which operations move closer to z_1 from z_t
-        # (batch_size, z_seq_len, 2 * vocab_size)
         uz_mask = make_ut_mask_from_z(zt, z1, self.full_vocab_size, self.pad_token, self.gap_token)
 
 
@@ -164,10 +107,6 @@ class AdaptedLitModule(pl.LightningModule):
 
         loss_vec = loss_vec #/ N
 
-        if torch.isnan(loss_vec).any():
-            print (f'nan loss')
-            return None
-
         return loss_vec.mean(), {
             'utot': u_tot.mean(),
             'u_tot / N': (u_tot / N).mean(),
@@ -184,140 +123,62 @@ class AdaptedLitModule(pl.LightningModule):
         }
 
     def training_step(self, batch, batch_idx):
-        opt = self.optimizers()
-        accum_batches = self.acc_grad_batches
-        loss = None
+        loss, metrics = self._loss(batch)
+        self.log('train/loss', loss, prog_bar=True)
+        for k, v in metrics.items():
+            self.log(f'train/{k}', v, prog_bar=False)
+        return loss
 
-        try:
-            loss, metrics = self._loss(batch)
-            if loss:
-                loss = loss / accum_batches
-                self.manual_backward(loss)
-                self.log('train/loss', loss * accum_batches, prog_bar=True)
-                for k, v in metrics.items():
-                    self.log(f'train/{k}', v, prog_bar=False)
-            # return loss
-        except Exception as e:
-            if 'out of memory' in str(e).lower():
-                self.oom_count = self.oom_count + 1
-                self.log(f'train/oom_count', self.oom_count, prog_bar=False)
-
-                if loss is not None:
-                    del loss
-                del e
-                gc.collect()
-                torch.cuda.empty_cache()
-
-                return
-            else:
-                print (f'non OOM error: {e}')
-                traceback.print_exception(e)
-                del e
-                gc.collect()
-                torch.cuda.empty_cache()
-                return
-                # torch.cuda.empty_cache()
-                # return self.dummy_loss(batch)
-
-        # Check if we should step and zero_grad
-        is_last_batch = (batch_idx + 1) == self.trainer.num_training_batches
-        is_accum_step = (batch_idx + 1) % accum_batches == 0
-
-        if is_accum_step or is_last_batch:
-            try:
-                self.clip_gradients(opt, self.grad_clip_val)
-
-                opt.step()
-                opt.zero_grad()
-
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    print(f"WARNING: OOM during optimizer.step(). Skipping step.")
-                    opt.zero_grad()  # Must clear grads if step failed
-
-                    del e
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                else:
-                    raise e
 
 
     def validation_step(self, batch, batch_idx):
-        try:
-            # use fixed t for more consistent results
-            if not self.val_t:
-                self.val_t = torch.rand(batch['t'].shape[0], 1, device=batch['t'].device, dtype=torch.bfloat16)
-                self.val_t = torch.clamp(self.val_t - 1e-2, min=0.0) # subtract eps to account for occasional 1's
+        # use fixed t for more consistent results
+        if not self.val_t:
+            self.val_t = torch.rand(batch['t'].shape[0], 1, device=batch['t'].device, dtype=torch.bfloat16)
+            self.val_t = torch.clamp(self.val_t - 1e-2, min=0.0) # subtract eps to account for occasional 1's
 
-            batch['t'] = self.val_t
+        batch['t'] = self.val_t
 
-            loss, metrics = self._loss(batch)
-            self.log('val/loss', loss, prog_bar=True, sync_dist=True)
-            for k, v in metrics.items():
-                self.log(f'val/{k}', v, prog_bar=False, sync_dist=True)
+        loss, metrics = self._loss(batch)
+        self.log('val/loss', loss, prog_bar=True, sync_dist=True)
+        for k, v in metrics.items():
+            self.log(f'val/{k}', v, prog_bar=False, sync_dist=True)
 
-            # sample first group of batches, rather than random, for better comparisons over training
-            # only take first element in batch
-            if batch_idx < self.val_sample_count:
-                x0_sample = batch['x0'][0].unsqueeze(0)
-                context = [batch['contexts'][0]]
+        # sample first group of batches, rather than random, for better comparisons over training
+        # only take first element in batch
+        if batch_idx < self.val_sample_count:
+            x0_sample = batch['x0'][0].unsqueeze(0)
+            context = [batch['contexts'][0]]
 
-                # generate a trajectory
-                trajectory = self.sample(x0_sample, context, n_steps=100)
+            # generate a trajectory
+            trajectory = self.sample(x0_sample, context, n_steps=100)
 
-                # log the initial and final states of the trajectory
-                initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False)
-                final_seq = self.tokenizer.decode(trajectory[-1].squeeze().tolist(), skip_special_tokens=False)
+            # log the initial and final states of the trajectory
+            initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False)
+            final_seq = self.tokenizer.decode(trajectory[-1].squeeze().tolist(), skip_special_tokens=False)
 
-                # add bleu score comparison between final_seq and target
-                # calculate bleu score if a target sequence is available in the batch
-                target_seq = self.tokenizer.decode(batch['x1'][0].squeeze().tolist(), skip_special_tokens=False)
+            # add bleu score comparison between final_seq and target
+            # calculate bleu score if a target sequence is available in the batch
+            target_seq = self.tokenizer.decode(batch['x1'][0].squeeze().tolist(), skip_special_tokens=False)
 
-                # assuming target_seq is a string and final_seq is a string
-                # you might need to tokenize them into lists of words for sacrebleu
-                score = self.bleu.corpus_score([final_seq], [[target_seq]]).score
-                self.log('val/bleu_score', score, prog_bar=True, sync_dist=True)
+            # assuming target_seq is a string and final_seq is a string
+            # you might need to tokenize them into lists of words for sacrebleu
+            score = self.bleu.corpus_score([final_seq], [[target_seq]]).score
+            self.log('val/bleu_score', score, prog_bar=True, sync_dist=True)
 
 
-                self.val_outputs.add_data(
-                    self.global_step,
-                    self.current_epoch,
-                    initial_seq,
-                    final_seq,
-                    target_seq
-                )
-
-        except Exception as e:
-            if 'CUDA out of memory' in str(e):
-                self.oom_count = self.oom_count + 1
-                self.log(f'val/oom_count', self.oom_count, prog_bar=False)
-                del e
-                gc.collect()
-                torch.cuda.empty_cache()
-                return
-
-            else:
-                print(f'Non OOM error in val: {e}')
-                del e
-                gc.collect()
-                torch.cuda.empty_cache()
-                # raise e
-                return
+            self.val_outputs.add_data(
+                self.global_step,
+                self.current_epoch,
+                initial_seq,
+                final_seq,
+                target_seq
+            )
 
     def on_validation_epoch_end(self) -> None:
-        try:
-            self.logger.experiment.log(
-                {"val_outputs": self.val_outputs}
-            )
-        except Exception as e:
-            print (f'Error in logging table: {e}')
-
-            # # optionally, log the full trajectory as a list of strings
-            # full_trajectory_decoded = [self.tokenizer.decode(seq.squeeze().tolist(), skip_special_tokens=false) for seq in trajectory]
-            # self.logger.experiment.log({
-            #     f"val/sample_{i}/full_trajectory": wandb.t     # self.logger.experiment.log({
-                #     f"val/sample_{i}/full_trajectory": wandb.Table(data=[[s] for s in full_trajectory_decoded], columns=["sequence"])
-            # })
+        self.logger.experiment.log(
+            {"val_outputs": self.val_outputs}
+        )
 
 
     @torch.no_grad()

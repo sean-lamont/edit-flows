@@ -13,23 +13,23 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         self.debug_attn = debug_attn
 
-        # bnb_conf = BitsAndBytesConfig(
-        #     load_in_4bit=True,
-        #     bnb_4bit_quant_type="nf4",
-        #     bnb_4bit_use_double_quant=True,
-        #     bnb_4bit_compute_dtype=torch.bfloat16,
-        # )
+        bnb_conf = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
 
         self.model = AutoModelForCausalLM.from_pretrained(pretrained_model_name, dtype=torch.bfloat16,
                                                           trust_remote_code=True,
                                                           # _attn_implementation='flex_attention',
                                                           # _attn_implementation='flash_attention_2',
                                                           # _attn_implementation='eager'
-                                                          # quantization_config=bnb_conf,
-                                                          output_attentions=True,
+                                                          quantization_config=bnb_conf,
+                                                          # output_attentions=True,
                                                           ).train()
 
-        # self.model = prepare_model_for_kbit_training(self.model)
+        self.model = prepare_model_for_kbit_training(self.model)
 
         # add LoRa and Quantization
 
@@ -44,10 +44,10 @@ class AdaptedEditFlowsTransformer(nn.Module):
         self.model = get_peft_model(self.model, peft_config)
         self.model.print_trainable_parameters()
 
-        # self.model.gradient_checkpointing_enable()
+        self.model.gradient_checkpointing_enable()
         # self.model.config.use_cache = False
 
-        # self.model.compile()
+        self.model.compile()
 
         self.vocab_size = self.model.config.vocab_size
         self.time_emb = SinusoidalTimeEmbedding(hidden_dim)
