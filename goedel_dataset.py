@@ -1,7 +1,8 @@
 import torch
 from torch.utils.data import Dataset
-import datasets  # <-- NEW
+import goedel_dataset  # <-- NEW
 import os
+import datasets
 
 
 class GoedelDataset(Dataset):

@@ -2,7 +2,7 @@ from typing import Optional, Dict, Any
 from torch.utils.data import DataLoader
 import lightning.pytorch as pl
 from transformers import AutoTokenizer
-from datasets import GoedelDataset
+from goedel_dataset import GoedelDataset
 import torch
 import torch.nn.functional as F
 import os
@@ -20,14 +20,14 @@ except ImportError:
 
 class AdaptedDataModule(pl.LightningDataModule):
     def __init__(self,
-                 tokenizer_name: str,
+                 tokenizer: str,
                  full_vocab_size: int,
                  batch_size: int = 64,
                  num_workers: int = 4,
                  data_path: str = "precomputed_hf_dataset",
                  scheduler_cfg: Dict[str, Any] | None = None):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.data_path = data_path
         self.full_vocab_size = full_vocab_size

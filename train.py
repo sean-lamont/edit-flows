@@ -41,11 +41,12 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    dm = AdaptedDataModule(tokenizer=tokenizer, batch_size=1)
+    dm = AdaptedDataModule(tokenizer=tokenizer, batch_size=1, full_vocab_size=151936)
 
     model = AdaptedEditFlowsTransformer(model_id)
     # hardcoded for now, since tokenizer length and model embedding matrix dimensions are different..
     lit_module = AdaptedLitModule(model, 151936, tokenizer.pad_token_id, 151651) #using <|quad_end|>
+
 
 
     wandb_logger = WandbLogger(project="edit-flows", name="standard strategy",  )
