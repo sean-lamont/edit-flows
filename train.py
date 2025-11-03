@@ -65,7 +65,7 @@ def main():
         monitor="val/bleu_score",
         mode="max",
         # dirpath="checkpoints",
-        filename="best-checkpoint-{epoch:02d}-{val_bleu_score:.2f}",
+        filename="best-checkpoint-{epoch:02d}-{val/bleu_score:.2f}",
         save_top_k=1,
         save_last=True
     )
@@ -80,8 +80,8 @@ def main():
                          logger=wandb_logger,
                          # limit_train_batches=10,
                          limit_val_batches=200,
-                         accumulate_grad_batches=8,
-                         gradient_clip_val=5,
+                         accumulate_grad_batches=32,
+                         gradient_clip_val=1,
                          num_sanity_val_steps=0,
                          val_check_interval=0.2,
                          callbacks=[checkpoint_callback],#, mem_callback],

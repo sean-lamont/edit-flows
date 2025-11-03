@@ -25,11 +25,11 @@ class AdaptedEditFlowsTransformer(nn.Module):
                                                           # _attn_implementation='flex_attention',
                                                           # _attn_implementation='flash_attention_2',
                                                           # _attn_implementation='eager'
-                                                          quantization_config=bnb_conf,
+                                                          # quantization_config=bnb_conf,
                                                           # output_attentions=True,
                                                           ).train()
 
-        self.model = prepare_model_for_kbit_training(self.model)
+        # self.model = prepare_model_for_kbit_training(self.model)
 
         # add LoRa and Quantization
 

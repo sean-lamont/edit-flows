@@ -14,7 +14,7 @@ import bitsandbytes.optim as bnb_optim
 
 
 class AdaptedLitModule(pl.LightningModule):
-    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=3e-4, scheduler_cfg=None,
+    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None,
                  anneal_end_step=10000):
         super().__init__()
         # (self.model, self.kappa, etc. are unchanged)
@@ -33,7 +33,7 @@ class AdaptedLitModule(pl.LightningModule):
         # (configure_optimizers and on_validation_epoch_start are unchanged)
 
     def configure_optimizers(self):
-        return bnb_optim.AdamW8bit(self.parameters(), lr=self.lr, betas=(0.9, 0.95))
+        return bnb_optim.AdamW8bit(self.parameters(), lr=self.lr, betas=(0.9, 0.95), percentile_clipping=5, weight_decay=1e-2, eps=1e-6)
 
     def on_validation_epoch_start(self):
         self.val_outputs = wandb.Table(
