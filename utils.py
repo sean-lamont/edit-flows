@@ -26,6 +26,7 @@ class SinusoidalTimeEmbedding(nn.Module):
         return self.proj(emb)
 
 def x2prob(x: Tensor, vocab_size: int) -> Tensor:
+
     return torch.nn.functional.one_hot(x, num_classes=vocab_size).float()
 
 def sample_p(pt: Tensor) -> Tensor:

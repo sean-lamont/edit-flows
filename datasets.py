@@ -1,29 +1,36 @@
 import torch
 from torch.utils.data import Dataset
-import numpy as np
-from typing import Callable
-import glob
-import json
+import datasets  # <-- NEW
+import os
+
 
 class GoedelDataset(Dataset):
-    def __init__(self, folder_path='processed_data_code_only'):
-        self.files = glob.glob(f'{folder_path}/*.jsonl')
-        self.data = []
+    def __init__(self, folder_path='precomputed_hf_dataset'):
+        """
+        Initializes the dataset by loading a pre-computed Hugging Face
+        Dataset from disk.
 
-        for file_path in self.files:
-            with open(file_path, 'r') as f:
-                for line in f:
-                    sample = json.loads(line)
-                    # if sample['type'] == 'correction':
-                    if len(sample['target']) > 10:
-                        if len(sample['prev_attempt']) < 2:
-                            sample['prev_attempt'] = 'Initial Attempt'
-                        self.data.append(sample)
+        Args:
+            folder_path (str): Path to the directory saved by
+                               `dataset.save_to_disk()`.
+        """
+        if not os.path.exists(folder_path):
+            raise FileNotFoundError(
+                f"Hugging Face dataset not found at {folder_path}. "
+                "Did you run the preprocess.py script?"
+            )
+
+        print(f"Loading precomputed dataset from {folder_path}...")
+        self.dataset = datasets.load_from_disk(folder_path)
+        print("Dataset loaded.")
 
     def __len__(self):
-        return len(self.data)
+        return len(self.dataset)
 
     def __getitem__(self, idx: int):
-        ret = self.data[idx]
-        ret['idx'] = idx
-        return ret
+        """
+        Returns a single sample from the Hugging Face dataset.
+        This will be a dictionary where values are Python lists,
+        not tensors.
+        """
+        return self.dataset[idx]
