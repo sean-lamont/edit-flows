@@ -29,8 +29,10 @@ class AdaptedEditFlowsTransformer(nn.Module):
                                                           # output_attentions=True,
                                                           ).train()
 
-        # self.model = prepare_model_for_kbit_training(self.model)
+        self.ins_head = self.model.lm_head.clone()
+        self.sub_head = self.model.lm_head.clone()
 
+        # self.model = prepare_model_for_kbit_training(self.model)
         # add LoRa and Quantization
 
         peft_config = LoraConfig(
@@ -52,14 +54,15 @@ class AdaptedEditFlowsTransformer(nn.Module):
         self.vocab_size = self.model.config.vocab_size
         self.time_emb = SinusoidalTimeEmbedding(hidden_dim)
 
-        self.rate_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, hidden_dim), nn.SiLU(),
-                                       nn.Linear(hidden_dim, 3)) # 3 for ins,sub,del,
+        self.rate_head = nn.Sequential(nn.Linear(3 * self.model.config.hidden_size + hidden_dim, self.model.config.hidden_size), nn.SiLU(),
+                                       nn.Linear(self.model.config.hidden_size, 3)) # 3 for ins,sub,del,
 
-        self.ins_head = nn.Sequential(nn.Linear(2 * (self.model.config.hidden_size + hidden_dim), self.model.config.hidden_size), nn.SiLU(),
-                                      nn.Linear(self.model.config.hidden_size, self.vocab_size))
+        # self.ins_head = nn.Sequential(nn.Linear(2 * (self.model.config.hidden_size + hidden_dim), self.model.config.hidden_size), nn.SiLU(),
+        #                               nn.Linear(self.model.config.hidden_size, self.vocab_size))
+        #
+        # self.sub_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, self.model.config.hidden_size), nn.SiLU(),
+        #                               nn.Linear(self.model.config.hidden_size, self.vocab_size))
 
-        self.sub_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, self.model.config.hidden_size), nn.SiLU(),
-                                      nn.Linear(self.model.config.hidden_size, self.vocab_size))
 
 
     def forward(self, tokens: torch.Tensor, t: torch.Tensor, pad_mask: torch.Tensor, context_tokens, pad_token,
@@ -166,35 +169,29 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         time_ = self.time_emb(t).unsqueeze(1).expand(-1, hidden_states.shape[1], -1)
 
-        x = torch.cat([hidden_states, time_], dim=-1)
+        # make new x shifted left, so insert head can view each token and what is next to it.
+        # set final value as duplicate of previous final
+        x_succ = torch.cat([hidden_states[:, 1:], hidden_states[:, -1].unsqueeze(1)], dim=1)
+        # concat over hidden dim
+        x_succ = torch.cat([hidden_states, x_succ],  dim=-1)
+
+        # do the same for previous token
+        x_prev = torch.cat([hidden_states[:, 0].unsqueeze(1), hidden_states[:, :-1]], dim=1)
+
+        # concat over hidden dim
+        x = torch.cat([hidden_states, x_succ, x_prev, time_], dim=-1)
 
         # (b, seq, 3)
         rates = F.softplus(self.rate_head(x))
-        sub = F.softmax(self.sub_head(x), dim=-1)
 
-        # make new x shifted left, so insert head can view each token and what is next to it.
+        # ins will be using lm_head, initialised to predict next token (natural task)
+        ins = F.softmax(self.ins_head(hidden_states), dim=-1)
 
-        # set final value as duplicate of previous final
-        x_sub = torch.cat([x[:, 1:], x[:, -1].unsqueeze(1)], dim=1)
+        # similar to masked diffusion adaption, use shifted tokens to get sub probs
+        sub = F.softmax(self.sub_head(x_prev), dim=-1)
 
-        # concat over hidden dim
-        x_sub = torch.cat([x, x_sub],  dim=-1)
-
-        # lm_output = torch.cat([torch.zeros_like(lm_output[:, 0], device=x.device, dtype=torch.bfloat16).unsqueeze(1), lm_output], dim=1)
-        ins = F.softmax(self.ins_head(x_sub), dim=-1)
-
-
-
-        # (b, seq, vocab)
-        # lm_output = self.model.lm_head(hidden_states)
-
-        # add zero vector for first entry
-        # lm_output = torch.cat([torch.zeros_like(lm_output[:, 0], device=x.device, dtype=torch.bfloat16).unsqueeze(1), lm_output], dim=1)
-
-        # add lm output for insert (usual objective from pretrained model), previous token as substitute, scaled by learned weighting params
-        # ins = F.softmax(self.ins_head(x) + rates[:, :, -1].unsqueeze(-1) * lm_output[:, 1:], dim=-1)
-        # sub = F.softmax(self.sub_head(x) + rates[:, :, -2].unsqueeze(-1) * lm_output[:, :-1], dim=-1)
-
+        # sub = F.softmax(self.sub_head(x), dim=-1)
+        # ins = F.softmax(self.ins_head(x), dim=-1)
 
         mask = (~pad_mask).unsqueeze(-1).float()
         return (rates * mask, ins * mask, sub * mask)
