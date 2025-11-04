@@ -1,3 +1,5 @@
+import copy
+
 import torch
 import matplotlib.pyplot as plt
 import time
@@ -29,8 +31,26 @@ class AdaptedEditFlowsTransformer(nn.Module):
                                                           # output_attentions=True,
                                                           ).train()
 
-        self.ins_head = self.model.lm_head.clone()
-        self.sub_head = self.model.lm_head.clone()
+        original_head = self.model.lm_head
+
+        # 2. Create a new linear layer with the *same dimensions*
+        # We check if the original had a bias (Qwen's doesn't, but this is safe)
+        self.ins_head = nn.Linear(
+            in_features=original_head.in_features,
+            out_features=original_head.out_features,
+            bias=(original_head.bias is not None)
+        )
+
+        self.sub_head = nn.Linear(
+            in_features=original_head.in_features,
+            out_features=original_head.out_features,
+            bias=(original_head.bias is not None)
+        )
+
+        self.ins_head.load_state_dict(original_head.state_dict())
+        self.sub_head.load_state_dict(original_head.state_dict())
+
+        del original_head
 
         # self.model = prepare_model_for_kbit_training(self.model)
         # add LoRa and Quantization
@@ -172,8 +192,6 @@ class AdaptedEditFlowsTransformer(nn.Module):
         # make new x shifted left, so insert head can view each token and what is next to it.
         # set final value as duplicate of previous final
         x_succ = torch.cat([hidden_states[:, 1:], hidden_states[:, -1].unsqueeze(1)], dim=1)
-        # concat over hidden dim
-        x_succ = torch.cat([hidden_states, x_succ],  dim=-1)
 
         # do the same for previous token
         x_prev = torch.cat([hidden_states[:, 0].unsqueeze(1), hidden_states[:, :-1]], dim=1)
