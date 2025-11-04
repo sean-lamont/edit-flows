@@ -49,7 +49,7 @@ def main():
 
 
 
-    wandb_logger = WandbLogger(project="edit-flows", name="standard strategy",  )
+    wandb_logger = WandbLogger(project="edit-flows", name="augmented_insert",  )
     # wandb_logger.watch(lit_module, log_freq=10, log='all')
 
     strategy = DeepSpeedStrategy(

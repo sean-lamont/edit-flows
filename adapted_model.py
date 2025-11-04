@@ -53,9 +53,9 @@ class AdaptedEditFlowsTransformer(nn.Module):
         self.time_emb = SinusoidalTimeEmbedding(hidden_dim)
 
         self.rate_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, hidden_dim), nn.SiLU(),
-                                       nn.Linear(hidden_dim, 3)) # 3 for ins,sub,del, extra 2 for weighting lm_head
+                                       nn.Linear(hidden_dim, 3)) # 3 for ins,sub,del,
 
-        self.ins_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, self.model.config.hidden_size), nn.SiLU(),
+        self.ins_head = nn.Sequential(nn.Linear(2 * (self.model.config.hidden_size + hidden_dim), self.model.config.hidden_size), nn.SiLU(),
                                       nn.Linear(self.model.config.hidden_size, self.vocab_size))
 
         self.sub_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, self.model.config.hidden_size), nn.SiLU(),
@@ -140,7 +140,6 @@ class AdaptedEditFlowsTransformer(nn.Module):
             plt.axvline(x=context_end_line, color='cyan', linestyle='--', label='Context / Target Boundary')
             plt.axhline(y=context_end_line, color='cyan', linestyle='--')
 
-            # Line 2: End of Active Target (Start of Padding)
             active_target_end_line = (context_len_b0 + active_target_len_b0) - 0.5
             plt.axvline(x=active_target_end_line, color='r', linestyle='--', label='Target / Padding Boundary')
             plt.axhline(y=active_target_end_line, color='r', linestyle='--')
@@ -169,8 +168,22 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         x = torch.cat([hidden_states, time_], dim=-1)
 
-        # (b, seq, 5)
+        # (b, seq, 3)
         rates = F.softplus(self.rate_head(x))
+        sub = F.softmax(self.sub_head(x), dim=-1)
+
+        # make new x shifted left, so insert head can view each token and what is next to it.
+
+        # set final value as duplicate of previous final
+        x_sub = torch.cat([x[:, 1:], x[:, -1].unsqueeze(1)], dim=1)
+
+        # concat over hidden dim
+        x_sub = torch.cat([x, x_sub],  dim=-1)
+
+        # lm_output = torch.cat([torch.zeros_like(lm_output[:, 0], device=x.device, dtype=torch.bfloat16).unsqueeze(1), lm_output], dim=1)
+        ins = F.softmax(self.ins_head(x_sub), dim=-1)
+
+
 
         # (b, seq, vocab)
         # lm_output = self.model.lm_head(hidden_states)
@@ -182,10 +195,6 @@ class AdaptedEditFlowsTransformer(nn.Module):
         # ins = F.softmax(self.ins_head(x) + rates[:, :, -1].unsqueeze(-1) * lm_output[:, 1:], dim=-1)
         # sub = F.softmax(self.sub_head(x) + rates[:, :, -2].unsqueeze(-1) * lm_output[:, :-1], dim=-1)
 
-        ins = F.softmax(self.ins_head(x), dim=-1)
-        sub = F.softmax(self.sub_head(x), dim=-1)
 
         mask = (~pad_mask).unsqueeze(-1).float()
-
-        # return (rates[:, :, :3] * mask, ins * mask, sub * mask)
         return (rates * mask, ins * mask, sub * mask)
