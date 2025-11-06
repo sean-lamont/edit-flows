@@ -10,7 +10,7 @@ from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 from utils import SinusoidalTimeEmbedding
 
 class AdaptedEditFlowsTransformer(nn.Module):
-    def __init__(self, pretrained_model_name: str, hidden_dim=512, debug_attn=False):
+    def __init__(self, pretrained_model_name: str, hidden_dim=512, debug_attn=False, lora_id=False):
         super().__init__()
 
         self.debug_attn = debug_attn
@@ -30,6 +30,10 @@ class AdaptedEditFlowsTransformer(nn.Module):
                                                           # quantization_config=bnb_conf,
                                                           # output_attentions=True,
                                                           ).train()
+
+        if lora_id:
+            self.model = PeftModel.from_pretrained(self.model, lora_id)
+
 
         original_head = self.model.lm_head
 

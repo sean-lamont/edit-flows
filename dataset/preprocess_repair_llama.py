@@ -1,3 +1,4 @@
+import datasets
 from datasets import load_dataset
 
 import torch
@@ -11,6 +12,8 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from datasets import Dataset
 
+from setup_tokenizer import get_model_and_tokenizer_info
+
 # CRITICAL: Assumes 'utils.py' is in the same directory or Python path
 # so that worker processes can import it.
 try:
@@ -20,89 +23,84 @@ except ImportError:
     print("Please make sure 'preprocess.py' is in the same directory as 'utils.py'.")
     exit(1)
 
-# --- Constants from model --
-GAP_TOKEN = 151651
+# --- obtain from setup_tokenizer --
 
 # --- Global tokenizer for worker processes ---
 # This will be initialized once per worker in init_worker
 
 
 def process_dataset(args: argparse.Namespace):
-    """
-    This function is run by a single worker process.
-    It processes one entire .jsonl file and returns a list of "good" samples.
-    """
-    global_tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer, gap_token_id, full_vocab = get_model_and_tokenizer_info(
+        base_model_id="TheBloke/CodeLlama-7B-fp16",
+        lora_adapter_id="ASSERT-KTH/RepairLLaMA-IR1-OR1",
+        special_token="<GAP>",
+        torch_dtype=torch.float16
+    )
 
-    # This import happens *inside* the worker
-    from utils import opt_align_xs_to_zs
-
-    tokenizer = global_tokenizer
     PAD_TOKEN_ID = tokenizer.pad_token_id
 
-    try:
-        def _process_sample(sample):
-            context = 'CONTEXT' # set as something nonzero
-            prev_attempt = sample['input']
-            target = sample['output']
+    def _process_sample(sample):
+        context = 'CONTEXT' # set as something nonzero
+        prev_attempt = sample['input']
+        target = sample['output']
 
-            context_ids = tokenizer(context, return_tensors='pt').input_ids.squeeze(0)
-            prev_ids = tokenizer(prev_attempt, return_tensors='pt').input_ids.squeeze(0)
-            target_ids = tokenizer(target, return_tensors='pt').input_ids.squeeze(0)
+        context_ids = tokenizer(context, return_tensors='pt').input_ids.squeeze(0)
+        prev_ids = tokenizer(prev_attempt, return_tensors='pt').input_ids.squeeze(0)
+        target_ids = tokenizer(target, return_tensors='pt').input_ids.squeeze(0)
 
-            # --- Check Original Length Filters (x0, x1) ---
-            if prev_ids.shape[0] > args.max_len or target_ids.shape[0] > args.max_len:
-                return None
+        # # --- Check Original Length Filters (x0, x1) ---
+        # if prev_ids.shape[0] > args.max_len or target_ids.shape[0] > args.max_len:
+        #     return None
 
-            # --- Truncate context (from datamodule.py) ---
-            context_ids = context_ids[:args.max_context_len]
+        # --- Truncate context (from datamodule.py) ---
+        context_ids = context_ids[:args.max_context_len]
 
-            # --- Run Alignment (from collate.py) ---
-            # This is the most expensive CPU step
-            z0, z1 = opt_align_xs_to_zs(
-                prev_ids.unsqueeze(0),
-                target_ids.unsqueeze(0),
-                PAD_TOKEN_ID,
-                GAP_TOKEN
-            )
-            z0 = z0.squeeze(0)
-            z1 = z1.squeeze(0)
+        # --- Run Alignment (from collate.py) ---
+        # This is the most expensive CPU step
+        z0, z1 = opt_align_xs_to_zs(
+            prev_ids.unsqueeze(0),
+            target_ids.unsqueeze(0),
+            PAD_TOKEN_ID,
+            gap_token_id,
+        )
+        z0 = z0.squeeze(0)
+        z1 = z1.squeeze(0)
 
-            # --- Check Aligned Length Filter (z) ---
-            if z0.shape[0] > args.max_z_len:
-                return None
+        # --- Check Aligned Length Filter (z) ---
+        # if z0.shape[0] > args.max_z_len:
+        #     return None
 
-            # --- This sample is "good". Add its data to the list. ---
-            output_data = {
-                'x0': prev_ids.long().tolist(),
-                'z0': z0.long().tolist(),
-                'z1': z1.long().tolist(),
-                'x1': target_ids.long().tolist(),
-                'context': context_ids.long().tolist(),
-                'type': 'correction'
-            }
-            return output_data
+        # --- This sample is "good". Add its data to the list. ---
+        output_data = {
+            'x0': prev_ids.long().tolist(),
+            'z0': z0.long().tolist(),
+            'z1': z1.long().tolist(),
+            'x1': target_ids.long().tolist(),
+            'context': context_ids.long().tolist(),
+            'type': 'correction'
+        }
+        return output_data
 
-        # Load ir1xor1 (full function to full function)
-        dataset = load_dataset("ASSERT-KTH/repairllama-datasets", "ir1xor1")
+    # Load ir1xor1 (full function to full function)
+    dataset = load_dataset("ASSERT-KTH/repairllama-datasets", "ir1xor1")
+    print (dataset)
 
-        num_processors = os.cpu_count()
+    num_processors = os.cpu_count()
 
-        # save as hf dataset, keeping train and val as they are split
-        processed_dataset = dataset.map(_process_sample, num_proc=num_processors,
-                                        remove_columns=dataset['train'].column_names)
+    # save as hf dataset, keeping train and val as they are split
+    processed_dataset = dataset.map(_process_sample, num_proc=num_processors,
+                                    remove_columns=dataset['train'].column_names)
 
-        # Filter out None values (samples that didn't pass the filters)
-        processed_dataset = processed_dataset.filter(lambda x: x is not None)
 
-        # filter out values where x0 + x1 > 1024
-        processed_dataset = processed_dataset.filter(lambda x: len(x['x0']) + len(x['x1']) <= 1024)
 
-        # save to hf hub
-        processed_dataset.push_to_hub('sean-lamont/repairllama_preprocessed', private=True)
+    # Filter out None values (samples that didn't pass the filters)
+    processed_dataset = processed_dataset.filter(lambda x: x is not None)
 
-    except Exception as e:
-        print(f"Exception processing dataset: {e}")
+    # filter out values where x0 + x1 > 1024
+    processed_dataset = processed_dataset.filter(lambda x: len(x['x0']) + len(x['x1']) <= 1024)
+
+    # save to hf hub
+    processed_dataset.push_to_hub('sean-lamont/repairllama_preprocessed', private=True)
 
     return
 

@@ -11,23 +11,37 @@ import torch
 from lightning.pytorch import Callback
 
 from dataset.goedel_dataset import GoedelDataset
+from setup_tokenizer import get_model_and_tokenizer_info
 
 
 def main():
-    FULL_VOCAB_SIZE = 151936
-    GAP_TOKEN_ID = 151651
+    # FULL_VOCAB_SIZE = 151936
+    # GAP_TOKEN_ID = 151651
+    # GAP_TOKEN = '<|quad_end|>'
+    GAP_TOKEN = '<GAP>'
 
-    model_id = "Goedel-LM/Goedel-Prover-V2-8B"
+    # model_id = "Goedel-LM/Goedel-Prover-V2-8B"
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    # tokenizer, gap_token_id, full_vocab_size = get_model_and_tokenizer_info(model_id, special_token=GAP_TOKEN)
+
+    model_id = "TheBloke/CodeLlama-7B-fp16"
+    lora_id = "ASSERT-KTH/RepairLLaMA-IR1-OR1"
+
+    tokenizer, gap_token_id, full_vocab_size = get_model_and_tokenizer_info(
+        base_model_id="TheBloke/CodeLlama-7B-fp16",
+        lora_adapter_id="ASSERT-KTH/RepairLLaMA-IR1-OR1",
+        special_token="<GAP>",
+        torch_dtype=torch.float16
+    )
 
     ds = GoedelDataset()
 
-    dm = AdaptedDataModule(dataset=ds, tokenizer=tokenizer, batch_size=1, full_vocab_size=FULL_VOCAB_SIZE)
+    dm = AdaptedDataModule(dataset=ds, tokenizer=tokenizer, batch_size=1, full_vocab_size=full_vocab_size)
 
-    model = AdaptedEditFlowsTransformer(model_id)
+    model = AdaptedEditFlowsTransformer(model_id, lora_id=lora_id)
 
-    lit_module = AdaptedLitModule(model, FULL_VOCAB_SIZE, tokenizer, tokenizer.pad_token_id, GAP_TOKEN_ID) #using <|quad_end|> for Goedel
+    lit_module = AdaptedLitModule(model, full_vocab_size, tokenizer, tokenizer.pad_token_id, gap_token_id) #using <|quad_end|> for Goedel
 
 
     wandb_logger = WandbLogger(project="edit-flows", name="correction_only",  )
