@@ -45,6 +45,7 @@ class AdaptedDataModule(pl.LightningDataModule):
         if stage == "fit" or stage is None:
             full_dataset = GoedelDataset(folder_path=self.data_path)
 
+
             split_dataset = full_dataset.dataset.train_test_split(
                 test_size=0.05, seed=42
             )

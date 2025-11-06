@@ -49,7 +49,7 @@ def main():
 
 
 
-    wandb_logger = WandbLogger(project="edit-flows", name="lm_head_arch",  )
+    wandb_logger = WandbLogger(project="edit-flows", name="correction_only",  )
     # wandb_logger.watch(lit_module, log_freq=10, log='all')
 
     strategy = DeepSpeedStrategy(

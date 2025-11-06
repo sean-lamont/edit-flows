@@ -23,6 +23,10 @@ class GoedelDataset(Dataset):
 
         print(f"Loading precomputed dataset from {folder_path}...")
         self.dataset = datasets.load_from_disk(folder_path)
+
+        # only load correction examples for now
+        self.dataset = self.dataset.filter(lambda example: example['type'] == 'correction')
+
         print("Dataset loaded.")
 
     def __len__(self):

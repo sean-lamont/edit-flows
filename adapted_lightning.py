@@ -103,7 +103,7 @@ class AdaptedLitModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss, metrics = self._loss(batch)
-        self.log('train/loss', loss, prog_bar=True)
+        self.log('train/loss', loss, prog_bar=True, on_epoch=True)
         for k, v in metrics.items():
             self.log(f'train/{k}', v, prog_bar=False)
         return loss
