@@ -14,18 +14,18 @@ import bitsandbytes.optim as bnb_optim
 
 
 class AdaptedLitModule(pl.LightningModule):
-    def __init__(self, model: nn.Module, full_vocab_size, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None,
+    def __init__(self, model: nn.Module, full_vocab_size, tokenizer, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None,
                  anneal_end_step=10000):
         super().__init__()
         # (self.model, self.kappa, etc. are unchanged)
         self.model = model
         self.kappa = CubicScheduler(**(scheduler_cfg or {'a': 0.0, 'b': 2.0}))
         self.anneal_end_step = anneal_end_step
+        self.tokenizer = tokenizer
         self.full_vocab_size = full_vocab_size
         self.pad_token = pad_token_id
         self.gap_token = gap_token_id
         self.lr = lr
-        self.tokenizer = AutoTokenizer.from_pretrained("Goedel-LM/Goedel-Prover-V2-8B")
         self.val_sample_count = 5
         self.max_seq_len = 7000
         self.bleu = BLEU()
@@ -53,7 +53,6 @@ class AdaptedLitModule(pl.LightningModule):
         xt_pad = batch['xt_pad']  # Padding mask for xt
         z_gap = batch['z_gap']  # Gap mask from zt
         z_pad = batch['z_pad']  # Padding mask from z0/z1
-        idx = batch['idx']
 
         attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step)
 
@@ -97,7 +96,6 @@ class AdaptedLitModule(pl.LightningModule):
             'attn_mask_ratio': attn_mask_ratio,
             'N': N,
             't': t,
-            'idx': idx[0] if isinstance(idx, list) else idx,
             'edit_dist': uz_mask.sum().float()
         }
 

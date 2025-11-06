@@ -20,16 +20,15 @@ except ImportError:
 
 class AdaptedDataModule(pl.LightningDataModule):
     def __init__(self,
+                 dataset,
                  tokenizer: str,
                  full_vocab_size: int,
                  batch_size: int = 64,
                  num_workers: int = 4,
-                 data_path: str = "precomputed_hf_dataset",
                  scheduler_cfg: Dict[str, Any] | None = None):
         super().__init__()
         self.tokenizer = tokenizer
         self.batch_size = batch_size
-        self.data_path = data_path
         self.full_vocab_size = full_vocab_size
 
         self.num_workers = num_workers if num_workers is not None else os.cpu_count()
@@ -40,13 +39,13 @@ class AdaptedDataModule(pl.LightningDataModule):
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.pad_token = self.tokenizer.pad_token_id
         self.gap_token = 151651
+        self.dataset = dataset
 
     def setup(self, stage=None):
         if stage == "fit" or stage is None:
-            full_dataset = GoedelDataset(folder_path=self.data_path)
 
 
-            split_dataset = full_dataset.dataset.train_test_split(
+            split_dataset = self.dataset.train_test_split(
                 test_size=0.05, seed=42
             )
 
