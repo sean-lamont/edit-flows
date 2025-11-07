@@ -49,8 +49,15 @@ def process_dataset(args: argparse.Namespace):
         target_ids = tokenizer(target, return_tensors='pt').input_ids.squeeze(0)
 
         # # --- Check Original Length Filters (x0, x1) ---
-        # if prev_ids.shape[0] > args.max_len or target_ids.shape[0] > args.max_len:
-        #     return None
+        if prev_ids.shape[0] > args.max_len or target_ids.shape[0] > args.max_len:
+            return {
+                'x0': prev_ids.long().tolist(),
+                'z0': prev_ids.long().tolist(),
+                'z1': target_ids.long().tolist(),
+                'x1': target_ids.long().tolist(),
+                'context': context_ids.long().tolist(),
+                'type': 'correction'
+            }
 
         # --- Truncate context (from datamodule.py) ---
         context_ids = context_ids[:args.max_context_len]
