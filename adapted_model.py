@@ -3,7 +3,7 @@ import copy
 import torch
 import matplotlib.pyplot as plt
 import time
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, PeftModel
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
@@ -70,7 +70,7 @@ class AdaptedEditFlowsTransformer(nn.Module):
         self.model = get_peft_model(self.model, peft_config)
         self.model.print_trainable_parameters()
 
-        self.model.gradient_checkpointing_enable()
+        # self.model.gradient_checkpointing_enable()
         # self.model.config.use_cache = False
 
         self.model.compile()
@@ -80,14 +80,6 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         self.rate_head = nn.Sequential(nn.Linear(3 * self.model.config.hidden_size + hidden_dim, self.model.config.hidden_size), nn.SiLU(),
                                        nn.Linear(self.model.config.hidden_size, 3)) # 3 for ins,sub,del,
-
-        # self.ins_head = nn.Sequential(nn.Linear(2 * (self.model.config.hidden_size + hidden_dim), self.model.config.hidden_size), nn.SiLU(),
-        #                               nn.Linear(self.model.config.hidden_size, self.vocab_size))
-        #
-        # self.sub_head = nn.Sequential(nn.Linear(self.model.config.hidden_size + hidden_dim, self.model.config.hidden_size), nn.SiLU(),
-        #                               nn.Linear(self.model.config.hidden_size, self.vocab_size))
-
-
 
     def forward(self, tokens: torch.Tensor, t: torch.Tensor, pad_mask: torch.Tensor, context_tokens, pad_token,
                 attn_mask_ratio: float = 0.0):
@@ -106,14 +98,17 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         B, L = combined_tokens.shape
 
+
+        ## For Qwen 3 ##
+
         # Create the base causal mask (True = keep)
         # This is [L, L], which will be broadcast to [B, 1, L, L]
         causal_bool = torch.tril(torch.ones((L, L), device=tokens.device, dtype=torch.bool))
 
         # Create the annealed random mask (True = keep)
         # This is [B, 1, L, L] for a different mask per batch item
-        # random_bool = torch.rand(B, 1, L, L, device=tokens.device) < attn_mask_ratio
-        random_bool = torch.rand(B, 1, L, L, device=tokens.device) < 0.1
+        random_bool = torch.rand(B, 1, L, L, device=tokens.device) < attn_mask_ratio
+
 
         # pad_locations is [B, L], True where there is a pad
         pad_locations = (combined_tokens == pad_token)
@@ -128,19 +123,15 @@ class AdaptedEditFlowsTransformer(nn.Module):
         padding_bool = ~padding_mask_bool
 
         # We want to keep positions that are:
-        # (Causal OR Random) AND (Not Padding)
         final_mask_bool = (causal_bool | random_bool) & padding_bool
 
-        # attention_mask = ~final_mask_bool
-
-        # 5. Convert boolean mask to a float mask for the model
-        # The model's forward pass expects 0.0 for "keep" and -inf for "mask out"
+        # Qwen forward pass expects 0.0 for "keep" and -inf for "mask out"
         attention_mask = torch.zeros(B, 1, L, L, device=tokens.device, dtype=torch.bfloat16)
 
         attention_mask.masked_fill_(~final_mask_bool, -torch.inf)
 
         outputs = self.model.forward(input_ids=combined_tokens,
-                                     attention_mask=attention_mask,  # <-- Pass the dense mask here
+                                     attention_mask=attention_mask,
                                      output_hidden_states=True,
                                      output_attentions=True)
 
@@ -211,9 +202,6 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         # similar to masked diffusion adaption, use shifted tokens to get sub probs
         sub = F.softmax(self.sub_head(x_prev), dim=-1)
-
-        # sub = F.softmax(self.sub_head(x), dim=-1)
-        # ins = F.softmax(self.ins_head(x), dim=-1)
 
         mask = (~pad_mask).unsqueeze(-1).float()
         return (rates * mask, ins * mask, sub * mask)

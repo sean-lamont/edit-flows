@@ -14,13 +14,10 @@ from datasets import Dataset
 
 from setup_tokenizer import get_model_and_tokenizer_info
 
-# CRITICAL: Assumes 'utils.py' is in the same directory or Python path
-# so that worker processes can import it.
 try:
     from utils import opt_align_xs_to_zs
 except ImportError:
     print("Error: Could not import 'opt_align_xs_to_zs' from 'utils.py'.")
-    print("Please make sure 'preprocess.py' is in the same directory as 'utils.py'.")
     exit(1)
 
 # --- obtain from setup_tokenizer --
@@ -34,8 +31,14 @@ def process_dataset(args: argparse.Namespace):
         base_model_id="TheBloke/CodeLlama-7B-fp16",
         lora_adapter_id="ASSERT-KTH/RepairLLaMA-IR1-OR1",
         special_token="<GAP>",
-        torch_dtype=torch.float16
+        torch_dtype=torch.float16,
+        skip_model=True # for this case, only want tokenizer since model emb dim is lower and we are adding a token
     )
+
+
+    # full_vocab = 32017
+    # gap_token_id = 32016
+    # tokenizer=AutoTokenizer.from_pretrained("ASSERT-KTH/RepairLLaMA-IR1-OR1")
 
     PAD_TOKEN_ID = tokenizer.pad_token_id
 
@@ -48,14 +51,15 @@ def process_dataset(args: argparse.Namespace):
         prev_ids = tokenizer(prev_attempt, return_tensors='pt').input_ids.squeeze(0)
         target_ids = tokenizer(target, return_tensors='pt').input_ids.squeeze(0)
 
+
         # # --- Check Original Length Filters (x0, x1) ---
-        if prev_ids.shape[0] > args.max_len or target_ids.shape[0] > args.max_len:
+        if prev_ids.shape[0] + target_ids.shape[0] > args.max_len:
             return {
-                'x0': prev_ids.long().tolist(),
-                'z0': prev_ids.long().tolist(),
-                'z1': target_ids.long().tolist(),
-                'x1': target_ids.long().tolist(),
-                'context': context_ids.long().tolist(),
+                'x0': prev_ids[:1025].long().tolist(),
+                'z0': prev_ids[:1025].long().tolist(),
+                'z1': target_ids[:1025].long().tolist(),
+                'x1': target_ids[:1025].long().tolist(),
+                'context': context_ids[:1025].long().tolist(),
                 'type': 'correction'
             }
 
@@ -90,21 +94,24 @@ def process_dataset(args: argparse.Namespace):
 
     # Load ir1xor1 (full function to full function)
     dataset = load_dataset("ASSERT-KTH/repairllama-datasets", "ir1xor1")
-    print (dataset)
 
     num_processors = os.cpu_count()
 
     # save as hf dataset, keeping train and val as they are split
     processed_dataset = dataset.map(_process_sample, num_proc=num_processors,
-                                    remove_columns=dataset['train'].column_names)
+                                    remove_columns=dataset['train'].column_names, load_from_cache_file=False)
 
 
 
     # Filter out None values (samples that didn't pass the filters)
-    processed_dataset = processed_dataset.filter(lambda x: x is not None)
+    processed_dataset = processed_dataset.filter(lambda x: x is not None, load_from_cache_file=False)
 
     # filter out values where x0 + x1 > 1024
-    processed_dataset = processed_dataset.filter(lambda x: len(x['x0']) + len(x['x1']) <= 1024)
+
+
+    processed_dataset = processed_dataset.filter(lambda x: len(x['x0']) + len(x['x1']) <= args.max_len, load_from_cache_file=False)
+
+
 
     # save to hf hub
     processed_dataset.push_to_hub('sean-lamont/repairllama_preprocessed', private=True)

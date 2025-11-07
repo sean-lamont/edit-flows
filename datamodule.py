@@ -2,10 +2,10 @@ from typing import Optional, Dict, Any
 from torch.utils.data import DataLoader
 import lightning.pytorch as pl
 from transformers import AutoTokenizer
-from goedel_dataset import GoedelDataset
 import torch
 import torch.nn.functional as F
 import os
+import datasets
 
 from torch.nn.utils.rnn import pad_sequence
 from scheduler import CubicScheduler
@@ -23,6 +23,7 @@ class AdaptedDataModule(pl.LightningDataModule):
                  dataset,
                  tokenizer: str,
                  full_vocab_size: int,
+                 gap_token,
                  batch_size: int = 64,
                  num_workers: int = 4,
                  scheduler_cfg: Dict[str, Any] | None = None):
@@ -38,19 +39,21 @@ class AdaptedDataModule(pl.LightningDataModule):
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.pad_token = self.tokenizer.pad_token_id
-        self.gap_token = 151651
-        self.dataset = dataset
+        self.gap_token = gap_token #151651
+
+        self.dataset = datasets.load_dataset(dataset)
 
     def setup(self, stage=None):
         if stage == "fit" or stage is None:
+            # split_dataset = self.dataset.train_test_split(
+            #     test_size=0.05, seed=42
+            # )
+            #
+            # self.ds_train = split_dataset['train']
+            # self.ds_val = split_dataset['test']
 
-
-            split_dataset = self.dataset.train_test_split(
-                test_size=0.05, seed=42
-            )
-
-            self.ds_train = split_dataset['train']
-            self.ds_val = split_dataset['test']
+            self.ds_train = self.dataset['train']
+            self.ds_val = self.dataset['test']
 
             self.ds_train.set_format(type='torch')
             self.ds_val.set_format(type='torch')
@@ -74,24 +77,19 @@ class AdaptedDataModule(pl.LightningDataModule):
         t = torch.rand(len(batch), 1)
         t = torch.clamp(t - 1e-2, min=0.0)
 
-        # 4. Calculate zt (stochastic interpolation)
         k_t = self.kappa(t)
         k_t_broadcast = k_t.view(-1, 1).expand_as(z0)
 
         rand_probs = torch.rand_like(z0, dtype=torch.float32)
         zt = torch.where(rand_probs < k_t_broadcast, z1, z0)
 
-        # 5. --- MODIFIED: Generate z_pad and z_gap from zt ---
-        # This now correctly follows the original logic
         z_pad = (zt == self.pad_token)
         z_gap = (zt == self.gap_token)
 
-        # 6. Calculate uz_mask
         uz_mask = make_ut_mask_from_z(
             zt, z1, self.full_vocab_size, self.pad_token, self.gap_token
         )
 
-        # 7. Remove gap tokens to create xt (variable length)
         xts = []
         for i in range(len(batch)):
             zt_sample = zt[i]

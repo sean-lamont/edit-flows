@@ -9,6 +9,7 @@ def get_model_and_tokenizer_info(
     lora_adapter_id: Optional[str] = None,
     special_token: str = "<GAP>",
     torch_dtype=torch.float16,
+    skip_model=False
 ) -> Tuple[AutoTokenizer, int, int]:
     """
     Loads a tokenizer and model, optionally applies LoRA adapters, checks vocabulary size,
@@ -34,17 +35,21 @@ def get_model_and_tokenizer_info(
     # 1. Load base model and tokenizer
     try:
         tokenizer = AutoTokenizer.from_pretrained(lora_adapter_id, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model_id,
-            trust_remote_code=True,
-            dtype=torch_dtype,
-            device_map="auto"
-        )
+        if not skip_model:
+            model = AutoModelForCausalLM.from_pretrained(
+                base_model_id,
+                trust_remote_code=True,
+                dtype=torch_dtype,
+                device_map="auto"
+            )
 
-        # 2. Apply LoRA adapters if provided
-        if lora_adapter_id:
-            print(f"  Applying LoRA adapters...")
-            model = PeftModel.from_pretrained(model, lora_adapter_id)
+            # 2. Apply LoRA adapters if provided
+            if lora_adapter_id:
+                print(f"  Applying LoRA adapters...")
+                model = PeftModel.from_pretrained(model, lora_adapter_id)
+                model_embedding_size = model.get_input_embeddings().weight.size(0)
+                full_vocab_size = model_embedding_size
+
 
         print("✅ Model and tokenizer loaded successfully.")
     except Exception as e:
@@ -65,15 +70,14 @@ def get_model_and_tokenizer_info(
 
     # 3. Compare vocab sizes to find the true vocabulary size
     tokenizer_vocab_size = len(tokenizer)
-    model_embedding_size = model.get_input_embeddings().weight.size(0)
 
-    full_vocab_size = max(len(tokenizer), model_embedding_size)
+    # full_vocab_size = max(len(tokenizer), model_embedding_size)
+    if not skip_model:
+        print(f"   - Model embedding matrix size: {model_embedding_size}")
+    else:
+        full_vocab_size = len(tokenizer)
 
     print(f"   - Tokenizer vocabulary size: {tokenizer_vocab_size}")
-    print(f"   - Model embedding matrix size: {model_embedding_size}")
-
-    if tokenizer_vocab_size < model_embedding_size:
-        print(f"   ⚠️ Mismatch detected! Using model's embedding size as the true 'full_vocab_size': {full_vocab_size}")
 
     special_token_id = tokenizer.convert_tokens_to_ids(special_token)
     print(f"   '{special_token}' ID is: {special_token_id}")

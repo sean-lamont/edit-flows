@@ -1,11 +1,10 @@
 import torch
 from torch.utils.data import Dataset
-import goedel_dataset  # <-- NEW
 import os
 import datasets
 
 
-class GoedelDataset(Dataset):
+class HFDataset(Dataset):
     def __init__(self, name='sean-lamont/goedel_preprocessed'):
         # if not os.path.exists(folder_path):
         #     raise FileNotFoundError(

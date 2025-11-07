@@ -65,7 +65,7 @@ def process_file(file_path: str, args: argparse.Namespace):
                 try:
                     sample = json.loads(line)
 
-                    # --- Apply original GoedelDataset filter (from goedel_dataset.py) ---
+                    # --- Apply original GoedelDataset filter (from HFDataset.py) ---
                     if len(sample['target']) <= 10:
                         continue
 

@@ -14,7 +14,7 @@ import bitsandbytes.optim as bnb_optim
 
 
 class AdaptedLitModule(pl.LightningModule):
-    def __init__(self, model: nn.Module, full_vocab_size, tokenizer, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None,
+    def __init__(self, model: nn.Module,  tokenizer, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None,
                  anneal_end_step=10000):
         super().__init__()
         # (self.model, self.kappa, etc. are unchanged)
@@ -22,7 +22,6 @@ class AdaptedLitModule(pl.LightningModule):
         self.kappa = CubicScheduler(**(scheduler_cfg or {'a': 0.0, 'b': 2.0}))
         self.anneal_end_step = anneal_end_step
         self.tokenizer = tokenizer
-        self.full_vocab_size = full_vocab_size
         self.pad_token = pad_token_id
         self.gap_token = gap_token_id
         self.lr = lr
@@ -94,8 +93,8 @@ class AdaptedLitModule(pl.LightningModule):
             'u_sub': lam_sub.sum(1).mean(),
             'u_del': lam_del.sum(1).mean(),
             'attn_mask_ratio': attn_mask_ratio,
-            'N': N,
-            't': t,
+            'N': N.mean(),
+            't': t.mean(),
             'edit_dist': uz_mask.sum().float()
         }
 
