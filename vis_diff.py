@@ -64,7 +64,8 @@ def create_diff_report(input_file, col1, col2, col3, output_file):
             fromlines=text1,
             tolines=text2,
             fromdesc=f"{col1} (Row {i + 1})",
-            todesc=f"{col2} (Row {i + 1})"
+            todesc=f"{col2} (Row {i + 1})",
+            context=True
         )
         html_parts.append(diff_table_1v2)
 
@@ -74,7 +75,8 @@ def create_diff_report(input_file, col1, col2, col3, output_file):
             fromlines=text2,  # Use text2 as the "from"
             tolines=text3,  # Use text3 as the "to"
             fromdesc=f"{col2} (Row {i + 1})",
-            todesc=f"{col3} (Row {i + 1})"
+            todesc=f"{col3} (Row {i + 1})",
+            context = True
         )
         html_parts.append(diff_table_2v3)
         html_parts.append("<hr style='border-top: 2px solid #bbb;'>")  # Separator
