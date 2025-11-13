@@ -1,23 +1,41 @@
-import traceback
-
+import bitsandbytes.optim as bnb_optim
 import lightning.pytorch as pl
 from sacrebleu.metrics import BLEU
-# (Other imports unchanged)
 from torch.nn import functional as F
-from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
-import torch
-import wandb
 
+import wandb
 from scheduler import CubicScheduler
 from utils import *
-import bitsandbytes.optim as bnb_optim
 
+
+def top_p_probs(probs, top_p):
+    # Sort the probabilities in descending order
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+
+    # Calculate cumulative probabilities
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    # Find the index where the cumulative probability exceeds top_p
+    sorted_indices_to_remove = cumulative_probs > top_p
+
+    # Ensure at least one token is selected (take the highest prob)
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = torch.tensor(False, device=cumulative_probs.device)
+
+    # Scatter back to original indices
+    indices_to_remove = sorted_indices_to_remove.scatter(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+
+    # Set probabilities of tokens to remove to 0
+    probs[indices_to_remove] = torch.tensor(0.0, device=probs.device)
+
+    # Renormalize the probabilities
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    return probs
 
 class AdaptedLitModule(pl.LightningModule):
     def __init__(self, model: nn.Module,  tokenizer, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None,
                  anneal_end_step=10000):
         super().__init__()
-        # (self.model, self.kappa, etc. are unchanged)
         self.model = model
         self.kappa = CubicScheduler(**(scheduler_cfg or {'a': 0.0, 'b': 2.0}))
         self.anneal_end_step = anneal_end_step
@@ -118,14 +136,15 @@ class AdaptedLitModule(pl.LightningModule):
         for k, v in metrics.items():
             self.log(f'val/{k}', v, prog_bar=False, sync_dist=True)
 
-        if batch_idx < self.val_sample_count:
+        # if batch_idx < self.val_sample_count or self.val_sample_count == -1:
+        if True: # todo until we load from just lora weights
             # --- MODIFIED: Use x0_padded and x1_padded from batch ---
             x0_sample = batch['x0_padded'][0].unsqueeze(0)
             context = [batch['contexts'][0]]
             target_seq = self.tokenizer.decode(batch['x1_padded'][0].squeeze().tolist(), skip_special_tokens=False)
 
             # generate a trajectory
-            trajectory = self.sample(x0_sample, context, n_steps=100)
+            trajectory = self.sample(x0_sample, context, n_steps=1000)
 
             # log the initial and final states of the trajectory
             initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False)
@@ -148,7 +167,7 @@ class AdaptedLitModule(pl.LightningModule):
         )
 
     @torch.no_grad()
-    def sample(self, x0, context, n_steps=100, t_min=0.0):
+    def sample(self, x0, context, n_steps=100, t_min=0.0, top_p=0.5):
         # (This function is unchanged)
         self.model.eval()
         device = x0.device
@@ -159,9 +178,13 @@ class AdaptedLitModule(pl.LightningModule):
         traj = [xt.clone()]
 
         for _ in range(n_steps):
-            attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step)
+            attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step) # todo make this a class param updated during training only
+            # print (attn_mask_ratio)
+            attn_mask_ratio = 1.0
+
             adapt_h = get_adaptive_h(dt, t, self.kappa)
             rates, ins_probs, sub_probs = self.forward(xt, t, pad_mask, context, attn_mask_ratio)
+
             lam_i, lam_s, lam_d = rates[..., 0], rates[..., 1], rates[..., 2]
 
             ins_mask = torch.rand_like(lam_i) < 1 - torch.exp(-adapt_h * lam_i)
@@ -175,9 +198,14 @@ class AdaptedLitModule(pl.LightningModule):
             ins_tokens = torch.full_like(xt, self.pad_token)
             sub_tokens = torch.full_like(xt, self.pad_token)
 
+            if top_p < 1.0:
+                # Apply top-p sampling
+                ins_probs = top_p_probs(ins_probs[non_pad], top_p)
+                sub_probs = top_p_probs(sub_probs[non_pad], top_p)
+
             if non_pad.any():
-                ins_tokens[non_pad] = torch.multinomial(ins_probs[non_pad], 1).squeeze(-1)
-                sub_tokens[non_pad] = torch.multinomial(sub_probs[non_pad], 1).squeeze(-1)
+                ins_tokens[non_pad] = torch.multinomial(ins_probs, 1).squeeze(-1)
+                sub_tokens[non_pad] = torch.multinomial(sub_probs, 1).squeeze(-1)
 
             xt[sub_mask] = sub_tokens[sub_mask]
             xt = apply_ins_del(xt, ins_mask, del_mask, ins_tokens, max_seq_len=self.max_seq_len,
@@ -189,7 +217,6 @@ class AdaptedLitModule(pl.LightningModule):
         return traj
 
 
-# (apply_ins_del and get_adaptive_h are unchanged)
 def apply_ins_del(xt, ins_mask, del_mask, ins_tokens, max_seq_len, pad_token):
     batch_size, seq_len = xt.shape
     device = xt.device

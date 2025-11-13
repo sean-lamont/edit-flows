@@ -10,12 +10,7 @@ import datasets
 from torch.nn.utils.rnn import pad_sequence
 from scheduler import CubicScheduler
 
-try:
-    from utils import make_ut_mask_from_z
-except ImportError:
-    print("Error: Could not import 'make_ut_mask_from_z' from 'utils.py'.")
-    print("Please make sure 'datamodule.py' is in the same directory as 'utils.py'.")
-    exit(1)
+from utils import make_ut_mask_from_z
 
 
 class AdaptedDataModule(pl.LightningDataModule):
@@ -45,13 +40,6 @@ class AdaptedDataModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         if stage == "fit" or stage is None:
-            # split_dataset = self.dataset.train_test_split(
-            #     test_size=0.05, seed=42
-            # )
-            #
-            # self.ds_train = split_dataset['train']
-            # self.ds_val = split_dataset['test']
-
             self.ds_train = self.dataset['train']
             self.ds_val = self.dataset['test']
 
@@ -122,7 +110,8 @@ class AdaptedDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(self.ds_train, batch_size=self.batch_size,
-                          shuffle=True,
+                          # shuffle=True,
+                          shuffle=False,
                           collate_fn=self._collate, num_workers=self.num_workers)
 
     def val_dataloader(self):

@@ -15,12 +15,12 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         self.debug_attn = debug_attn
 
-        bnb_conf = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
+        # bnb_conf = BitsAndBytesConfig(
+        #     load_in_4bit=True,
+        #     bnb_4bit_quant_type="nf4",
+        #     bnb_4bit_use_double_quant=True,
+        #     bnb_4bit_compute_dtype=torch.bfloat16,
+        # )
 
         self.model = AutoModelForCausalLM.from_pretrained(pretrained_model_name, dtype=torch.bfloat16,
                                                           trust_remote_code=True,
@@ -37,8 +37,6 @@ class AdaptedEditFlowsTransformer(nn.Module):
 
         original_head = self.model.lm_head
 
-        # 2. Create a new linear layer with the *same dimensions*
-        # We check if the original had a bias (Qwen's doesn't, but this is safe)
         self.ins_head = nn.Linear(
             in_features=original_head.in_features,
             out_features=original_head.out_features,
@@ -71,7 +69,6 @@ class AdaptedEditFlowsTransformer(nn.Module):
         self.model.print_trainable_parameters()
 
         # self.model.gradient_checkpointing_enable()
-        # self.model.config.use_cache = False
 
         self.model.compile()
 
@@ -82,7 +79,7 @@ class AdaptedEditFlowsTransformer(nn.Module):
                                        nn.Linear(self.model.config.hidden_size, 3)) # 3 for ins,sub,del,
 
     def forward(self, tokens: torch.Tensor, t: torch.Tensor, pad_mask: torch.Tensor, context_tokens, pad_token,
-                attn_mask_ratio: float = 0.0):
+                attn_mask_ratio: float = 0.0, temp=0.8):
 
         context_lens = [c.shape[0] for c in context_tokens]
         pad_len = tokens.shape[1] + max(context_lens)
@@ -99,7 +96,7 @@ class AdaptedEditFlowsTransformer(nn.Module):
         B, L = combined_tokens.shape
 
 
-        ## For Qwen 3 ##
+        ## Works for Qwen 3 / CodeLlama , might have to change depending on attention implementation of model being adapted ##
 
         # Create the base causal mask (True = keep)
         # This is [L, L], which will be broadcast to [B, 1, L, L]
@@ -198,10 +195,10 @@ class AdaptedEditFlowsTransformer(nn.Module):
         rates = F.softplus(self.rate_head(x))
 
         # ins will be using lm_head, initialised to predict next token (natural task)
-        ins = F.softmax(self.ins_head(hidden_states), dim=-1)
+        ins = F.softmax(self.ins_head(hidden_states) / temp, dim=-1)
 
         # similar to masked diffusion adaption, use shifted tokens to get sub probs
-        sub = F.softmax(self.sub_head(x_prev), dim=-1)
+        sub = F.softmax(self.sub_head(x_prev) / temp,  dim=-1)
 
         mask = (~pad_mask).unsqueeze(-1).float()
         return (rates * mask, ins * mask, sub * mask)
