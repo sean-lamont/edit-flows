@@ -59,7 +59,7 @@ def create_diff_report(input_file, col1, col2, col3, output_file):
         text3 = str(row.get(col3, '')).splitlines()
 
         # --- Generate Diff 1 (col1 vs col2) ---
-        html_parts.append(f"<h3>Comparison: {col1} vs {col2}</h3>")
+        # html_parts.append(f"<h3>Comparison: {col1} vs {col2}</h3>")
         diff_table_1v2 = d.make_table(
             fromlines=text1,
             tolines=text2,
@@ -70,7 +70,7 @@ def create_diff_report(input_file, col1, col2, col3, output_file):
         html_parts.append(diff_table_1v2)
 
         # --- Generate Diff 2 (col2 vs col3) ---
-        html_parts.append(f"<h3>Comparison: {col2} vs {col3}</h3>")
+        # html_parts.append(f"<h3>Comparison: {col2} vs {col3}</h3>")
         diff_table_2v3 = d.make_table(
             fromlines=text2,  # Use text2 as the "from"
             tolines=text3,  # Use text3 as the "to"
@@ -79,10 +79,11 @@ def create_diff_report(input_file, col1, col2, col3, output_file):
             context = True
         )
         html_parts.append(diff_table_2v3)
-        html_parts.append("<hr style='border-top: 2px solid #bbb;'>")  # Separator
+        html_parts.append("<hr style='border-top: 2px solid #bbb;'>" + "\n")  # Separator
 
     html_parts.append("</body></html>")
-    final_html = "\n".join(html_parts)
+    final_html = "".join(html_parts)
+    # final_html = "\n".join(html_parts)
 
     # 5. Write the final HTML file
     try:
