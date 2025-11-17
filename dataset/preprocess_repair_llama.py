@@ -1,3 +1,12 @@
+"""
+A preprocessing script for the RepairLLAMA dataset.
+
+This script reads the raw RepairLLAMA data and transforms it into the format
+required for training the Edit Flows model. This involves extracting 'before'
+and 'after' code pairs and pre-computing the optimal alignments to save GPU space.
+
+"""
+
 import datasets
 from datasets import load_dataset
 
@@ -20,11 +29,6 @@ except ImportError:
     print("Error: Could not import 'opt_align_xs_to_zs' from 'utils.py'.")
     exit(1)
 
-# --- obtain from setup_tokenizer --
-
-# --- Global tokenizer for worker processes ---
-# This will be initialized once per worker in init_worker
-
 
 def process_dataset(args: argparse.Namespace):
     tokenizer, gap_token_id, full_vocab = get_model_and_tokenizer_info(
@@ -32,9 +36,8 @@ def process_dataset(args: argparse.Namespace):
         lora_adapter_id="ASSERT-KTH/RepairLLaMA-IR1-OR1",
         special_token="<GAP>",
         torch_dtype=torch.float16,
-        skip_model=True # for this case, only want tokenizer since model emb dim is lower and we are adding a token
+        skip_model=True  # for this case, only want tokenizer since model emb dim is lower and we are adding a token
     )
-
 
     # full_vocab = 32017
     # gap_token_id = 32016
@@ -43,7 +46,7 @@ def process_dataset(args: argparse.Namespace):
     PAD_TOKEN_ID = tokenizer.pad_token_id
 
     def _process_sample(sample):
-        context = 'CONTEXT' # set as something nonzero
+        context = 'CONTEXT'  # set as something nonzero
         prev_attempt = sample['input']
         target = sample['output']
 
@@ -51,22 +54,21 @@ def process_dataset(args: argparse.Namespace):
         prev_ids = tokenizer(prev_attempt, return_tensors='pt').input_ids.squeeze(0)
         target_ids = tokenizer(target, return_tensors='pt').input_ids.squeeze(0)
 
-
         # # --- Check Original Length Filters (x0, x1) ---
         if prev_ids.shape[0] + target_ids.shape[0] > args.max_len:
             return {
-                'x0': prev_ids[:1025].long().tolist(),
-                'z0': prev_ids[:1025].long().tolist(),
-                'z1': target_ids[:1025].long().tolist(),
-                'x1': target_ids[:1025].long().tolist(),
-                'context': context_ids[:1025].long().tolist(),
+                'x0': prev_ids[:args.max_len + 1].long().tolist(),
+                'z0': prev_ids[:args.max_len + 1].long().tolist(),
+                'z1': target_ids[:args.max_len + 1].long().tolist(),
+                'x1': target_ids[:args.max_len + 1].long().tolist(),
+                'context': context_ids[:args.max_len + 1].long().tolist(),
                 'type': 'correction'
             }
 
-        # --- Truncate context (from datamodule.py) ---
+        # --- Truncate context  ---
         context_ids = context_ids[:args.max_context_len]
 
-        # --- Run Alignment (from collate.py) ---
+        # --- Run Alignment  ---
         # This is the most expensive CPU step
         z0, z1 = opt_align_xs_to_zs(
             prev_ids.unsqueeze(0),
@@ -77,11 +79,6 @@ def process_dataset(args: argparse.Namespace):
         z0 = z0.squeeze(0)
         z1 = z1.squeeze(0)
 
-        # --- Check Aligned Length Filter (z) ---
-        # if z0.shape[0] > args.max_z_len:
-        #     return None
-
-        # --- This sample is "good". Add its data to the list. ---
         output_data = {
             'x0': prev_ids.long().tolist(),
             'z0': z0.long().tolist(),
@@ -101,17 +98,12 @@ def process_dataset(args: argparse.Namespace):
     processed_dataset = dataset.map(_process_sample, num_proc=num_processors,
                                     remove_columns=dataset['train'].column_names, load_from_cache_file=False)
 
-
-
     # Filter out None values (samples that didn't pass the filters)
     processed_dataset = processed_dataset.filter(lambda x: x is not None, load_from_cache_file=False)
 
     # filter out values where x0 + x1 > 1024
-
-
-    processed_dataset = processed_dataset.filter(lambda x: len(x['x0']) + len(x['x1']) <= args.max_len, load_from_cache_file=False)
-
-
+    processed_dataset = processed_dataset.filter(lambda x: len(x['x0']) + len(x['x1']) <= args.max_len,
+                                                 load_from_cache_file=False)
 
     # save to hf hub
     processed_dataset.push_to_hub('sean-lamont/repairllama_preprocessed', private=True)
@@ -149,18 +141,9 @@ def parse_args():
         help="Max token length for aligned z0/z1. Samples longer are FILTERED."
     )
 
-    # --- NEW: Multiprocessing ---
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=None,
-        help="Number of CPU processes to use. Defaults to all available cores."
-    )
-
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    # This check is crucial for multiprocessing on Windows/macOS
     args = parse_args()
     process_dataset(args)

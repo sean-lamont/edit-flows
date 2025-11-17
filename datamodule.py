@@ -1,3 +1,17 @@
+"""
+This module defines the PyTorch Lightning DataModule for the project.
+
+It encapsulates all data-related steps, including loading datasets from files,
+splitting them into training, validation, and test sets, and creating PyTorch
+DataLoaders for each.
+
+It expects a preprocessed dataset, where each batch contains the precomputed aligned
+sequences 'z0' and 'z1', as well as the original sequences 'x0' and 'x1', and the context.
+
+
+"""
+
+
 from typing import Optional, Dict, Any
 from torch.utils.data import DataLoader
 import lightning.pytorch as pl
@@ -34,7 +48,7 @@ class AdaptedDataModule(pl.LightningDataModule):
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.pad_token = self.tokenizer.pad_token_id
-        self.gap_token = gap_token #151651
+        self.gap_token = gap_token
 
         self.dataset = datasets.load_dataset(dataset)
 
@@ -47,8 +61,6 @@ class AdaptedDataModule(pl.LightningDataModule):
             self.ds_val.set_format(type='torch')
 
     def _collate(self, batch):
-
-        # 1. Unzip the batch
         x0s = [item['x0'] for item in batch]
         z0s = [item['z0'] for item in batch]
         z1s = [item['z1'] for item in batch]
@@ -57,11 +69,9 @@ class AdaptedDataModule(pl.LightningDataModule):
         idx = [item.get('idx', -1) for item in batch]
         type = [item.get('type', 'unknown') for item in batch]
 
-        # 2. Pad z0 and z1 efficiently
         z0 = pad_sequence(z0s, batch_first=True, padding_value=self.pad_token).long()
         z1 = pad_sequence(z1s, batch_first=True, padding_value=self.pad_token).long()
 
-        # 3. Sample t
         t = torch.rand(len(batch), 1)
         t = torch.clamp(t - 1e-2, min=0.0)
 
@@ -81,11 +91,9 @@ class AdaptedDataModule(pl.LightningDataModule):
         xts = []
         for i in range(len(batch)):
             zt_sample = zt[i]
-            # We can use the pre-computed z_gap mask here, but this is clearer
             xt_sample = zt_sample[zt_sample != self.gap_token]
             xts.append(xt_sample)
 
-        # 8. Pad xt, context, x0 and x1 efficiently
         xt = pad_sequence(xts, batch_first=True, padding_value=self.pad_token).long()
         xt_pad = (xt == self.pad_token)
 
@@ -93,7 +101,6 @@ class AdaptedDataModule(pl.LightningDataModule):
         x1_padded = pad_sequence(x1s, batch_first=True, padding_value=self.pad_token).long()
         x0_padded = pad_sequence(x0s, batch_first=True, padding_value=self.pad_token).long()
 
-        # 9. Return the batch, ready for the GPU
         return {
             'xt': xt,
             'contexts': contexts_padded,

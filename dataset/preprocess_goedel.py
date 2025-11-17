@@ -1,3 +1,14 @@
+"""
+
+A preprocessing script for the Goedel-Prover dataset.
+
+This script reads the raw Goedel-Prover data and transforms it into the format
+required for training the Edit Flows model. This typically involves extracting
+'before' and 'after' code pairs and saving them to a structured format like CSV.
+
+"""
+
+
 import torch
 import glob
 import json
@@ -9,8 +20,6 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from datasets import Dataset
 
-# CRITICAL: Assumes 'utils.py' is in the same directory or Python path
-# so that worker processes can import it.
 try:
     from utils import opt_align_xs_to_zs
 except ImportError:

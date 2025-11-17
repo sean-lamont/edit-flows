@@ -1,3 +1,11 @@
+"""
+This utility module handles the setup and configuration of the tokenizer.
+
+It initializes a pre-trained tokenizer from the Hugging Face Hub and configures
+it with any necessary special tokens for the code editing task.
+"""
+
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel

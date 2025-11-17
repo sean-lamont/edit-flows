@@ -1,3 +1,12 @@
+"""
+This is the main training script for the Edit Flows project.
+
+It initializes the DataModule, the adapted model within the LightningModule, and a
+PyTorch Lightning Trainer. It then starts the training and validation process.
+Configuration for the training run can be modified within this script.
+"""
+
+
 import lightning.pytorch as pl
 from lightning.pytorch.loggers import WandbLogger
 import wandb
@@ -16,15 +25,6 @@ from setup_tokenizer import get_model_and_tokenizer_info
 
 
 def main():
-    # FULL_VOCAB_SIZE = 151936
-    # GAP_TOKEN_ID = 151651
-    # GAP_TOKEN = '<|quad_end|>'
-
-    # model_id = "Goedel-LM/Goedel-Prover-V2-8B"
-
-
-    # tokenizer, gap_token_id, full_vocab_size = get_model_and_tokenizer_info(model_id, special_token=GAP_TOKEN)
-
     model_id = "TheBloke/CodeLlama-7B-fp16"
     lora_id = "ASSERT-KTH/RepairLLaMA-IR1-OR1" # need to overwrite modeling_llama file to ignore _prepare_decoder_attention_mask
 
@@ -42,7 +42,7 @@ def main():
 
     model = AdaptedEditFlowsTransformer(model_id, lora_id=lora_id)
 
-    lit_module = AdaptedLitModule(model, tokenizer, tokenizer.pad_token_id, gap_token_id) #using <|quad_end|> for Goedel
+    lit_module = AdaptedLitModule(model, tokenizer, tokenizer.pad_token_id, gap_token_id)
 
 
     wandb_logger = WandbLogger(project="code-repair", name="train_first_ckpt",  offline=False,
@@ -69,34 +69,34 @@ def main():
                          # detect_anomaly=True
                          )
 
-    # trainer.fit(lit_module, dm)
+    trainer.fit(lit_module, dm)
 
 
 
 
-    dm.setup('fit')
-
-    # trainer.validate(lit_module, dm, ckpt_path = 'code-repair/7shrv5ml/checkpoints/last.ckpt')
-    # trainer.validate(lit_module, dm, ckpt_path = 'code-repair/7shrv5ml/checkpoints/last.ckpt')
+    # dm.setup('fit')
+    #
+    # # trainer.validate(lit_module, dm, ckpt_path = 'code-repair/7shrv5ml/checkpoints/last.ckpt')
+    # # trainer.validate(lit_module, dm, ckpt_path = 'code-repair/7shrv5ml/checkpoints/last.ckpt')
+    # # trainer.validate(lit_module, dm.train_dataloader(), ckpt_path = 'code-repair/7shrv5ml/checkpoints/last.ckpt')
+    #
+    # trainer.validate(lit_module, dm.train_dataloader(), ckpt_path = 'code-repair/7shrv5ml/checkpoints/best-checkpoint-epoch=11-val/bleu_score=97.40.ckpt')
+    # wandb.finish()
+    #
+    # wandb_logger=WandbLogger(project="code-repair", name="val_first_ckpt", offline=False,group="Val Compare 1000" )
+    # trainer.logger = wandb_logger
+    # trainer.validate(lit_module, dm, ckpt_path = 'code-repair/7shrv5ml/checkpoints/best-checkpoint-epoch=11-val/bleu_score=97.40.ckpt')
+    # wandb.finish()
+    #
+    # wandb_logger=WandbLogger(project="code-repair", name="train_second_ckpt", offline=False,group="Val Compare 1000" )
+    # trainer.logger = wandb_logger
     # trainer.validate(lit_module, dm.train_dataloader(), ckpt_path = 'code-repair/7shrv5ml/checkpoints/last.ckpt')
-
-    trainer.validate(lit_module, dm.train_dataloader(), ckpt_path = 'code-repair/7shrv5ml/checkpoints/best-checkpoint-epoch=11-val/bleu_score=97.40.ckpt')
-    wandb.finish()
-
-    wandb_logger=WandbLogger(project="code-repair", name="val_first_ckpt", offline=False,group="Val Compare 1000" )
-    trainer.logger = wandb_logger
-    trainer.validate(lit_module, dm, ckpt_path = 'code-repair/7shrv5ml/checkpoints/best-checkpoint-epoch=11-val/bleu_score=97.40.ckpt')
-    wandb.finish()
-
-    wandb_logger=WandbLogger(project="code-repair", name="train_second_ckpt", offline=False,group="Val Compare 1000" )
-    trainer.logger = wandb_logger
-    trainer.validate(lit_module, dm.train_dataloader(), ckpt_path = 'code-repair/7shrv5ml/checkpoints/last.ckpt')
-    wandb.finish()
-
-    wandb_logger=WandbLogger(project="code-repair", name="val_second_ckpt", offline=False, group="Val Compare 1000" )
-    trainer.logger = wandb_logger
-    trainer.validate(lit_module, dm, ckpt_path = 'code-repair/7shrv5ml/checkpoints/last.ckpt')
-    wandb.finish()
+    # wandb.finish()
+    #
+    # wandb_logger=WandbLogger(project="code-repair", name="val_second_ckpt", offline=False, group="Val Compare 1000" )
+    # trainer.logger = wandb_logger
+    # trainer.validate(lit_module, dm, ckpt_path = 'code-repair/7shrv5ml/checkpoints/last.ckpt')
+    # wandb.finish()
 
 
 if __name__ == "__main__":

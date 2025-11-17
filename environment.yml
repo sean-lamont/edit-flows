@@ -1,4 +1,4 @@
-name: goedelv2
+name: edit-flows
 channels:
   - defaults
   - nvidia

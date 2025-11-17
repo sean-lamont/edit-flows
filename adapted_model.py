@@ -1,3 +1,13 @@
+"""
+
+This module contains the core AdaptedModel class.
+
+The model adapts a pre-trained autoregressive model to an Edit Flow model,
+annealing the attention over time.
+
+"""
+
+
 import copy
 
 import torch
@@ -130,8 +140,9 @@ class AdaptedEditFlowsTransformer(nn.Module):
         outputs = self.model.forward(input_ids=combined_tokens,
                                      attention_mask=attention_mask,
                                      output_hidden_states=True,
-                                     output_attentions=True)
+                                     output_attentions=True) # for debugging
 
+        # plots the attention map to verify annealing
         if self.debug_attn:
             # We'll just plot for the first item in the batch (B=0)
             context_len_b0 = context_lens[0]

@@ -1,3 +1,9 @@
+"""
+
+This module defines the PyTorch Lightning LightningModule for the main Edit Flow training and sampling.
+
+"""
+
 import bitsandbytes.optim as bnb_optim
 import lightning.pytorch as pl
 from sacrebleu.metrics import BLEU
@@ -32,8 +38,9 @@ def top_p_probs(probs, top_p):
     probs = probs / probs.sum(dim=-1, keepdim=True)
     return probs
 
+
 class AdaptedLitModule(pl.LightningModule):
-    def __init__(self, model: nn.Module,  tokenizer, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None,
+    def __init__(self, model: nn.Module, tokenizer, pad_token_id, gap_token_id, lr=1e-4, scheduler_cfg=None,
                  anneal_end_step=10000):
         super().__init__()
         self.model = model
@@ -43,14 +50,15 @@ class AdaptedLitModule(pl.LightningModule):
         self.pad_token = pad_token_id
         self.gap_token = gap_token_id
         self.lr = lr
-        self.val_sample_count = 5
+        self.val_sample_count = 5  # number of samples to generate during validation, -1 for all
         self.max_seq_len = 7000
         self.bleu = BLEU()
         self.val_t = None
         # (configure_optimizers and on_validation_epoch_start are unchanged)
 
     def configure_optimizers(self):
-        return bnb_optim.AdamW8bit(self.parameters(), lr=self.lr, betas=(0.9, 0.95), percentile_clipping=5, weight_decay=1e-2, eps=1e-6)
+        return bnb_optim.AdamW8bit(self.parameters(), lr=self.lr, betas=(0.9, 0.95), percentile_clipping=5,
+                                   weight_decay=1e-2, eps=1e-6)
 
     def on_validation_epoch_start(self):
         self.val_outputs = wandb.Table(
@@ -97,21 +105,15 @@ class AdaptedLitModule(pl.LightningModule):
 
         loss_vec = u_tot - term2
 
-        N = torch.sum(~z_pad, dim=1).float()
-        N = torch.clamp(N, min=1.0)
-
-        loss_vec = loss_vec  # / N
+        loss_vec = loss_vec
 
         return loss_vec.mean(), {
             'utot': u_tot.mean(),
-            'u_tot / N': (u_tot / N).mean(),
             '-term2': -term2.mean(),
-            '-term2 / N': -(term2 / N).mean(),
             'u_ins': lam_ins.sum(1).mean(),
             'u_sub': lam_sub.sum(1).mean(),
             'u_del': lam_del.sum(1).mean(),
             'attn_mask_ratio': attn_mask_ratio,
-            'N': N.mean(),
             't': t.mean(),
             'edit_dist': uz_mask.sum().float()
         }
@@ -124,7 +126,7 @@ class AdaptedLitModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # use fixed t for more consistent results
+        # use fixed t for consistend comparison
         if self.val_t is None:
             self.val_t = torch.rand(batch['t'].shape[0], 1, device=batch['t'].device, dtype=torch.bfloat16)
             self.val_t = torch.clamp(self.val_t - 1e-2, min=0.0)
@@ -136,9 +138,7 @@ class AdaptedLitModule(pl.LightningModule):
         for k, v in metrics.items():
             self.log(f'val/{k}', v, prog_bar=False, sync_dist=True)
 
-        # if batch_idx < self.val_sample_count or self.val_sample_count == -1:
-        if True: # todo until we load from just lora weights
-            # --- MODIFIED: Use x0_padded and x1_padded from batch ---
+        if batch_idx < self.val_sample_count or self.val_sample_count == -1:
             x0_sample = batch['x0_padded'][0].unsqueeze(0)
             context = [batch['contexts'][0]]
             target_seq = self.tokenizer.decode(batch['x1_padded'][0].squeeze().tolist(), skip_special_tokens=False)
@@ -168,7 +168,6 @@ class AdaptedLitModule(pl.LightningModule):
 
     @torch.no_grad()
     def sample(self, x0, context, n_steps=100, t_min=0.0, top_p=0.5):
-        # (This function is unchanged)
         self.model.eval()
         device = x0.device
         t = torch.full((x0.size(0), 1), t_min, device=device, dtype=torch.bfloat16)
@@ -178,9 +177,9 @@ class AdaptedLitModule(pl.LightningModule):
         traj = [xt.clone()]
 
         for _ in range(n_steps):
-            attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step) # todo make this a class param updated during training only
-            # print (attn_mask_ratio)
-            attn_mask_ratio = 1.0
+            attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step)
+            # todo make this a class param updated during training, need to set to 1 if loading just for validation/sampling
+            # attn_mask_ratio = 1.0
 
             adapt_h = get_adaptive_h(dt, t, self.kappa)
             rates, ins_probs, sub_probs = self.forward(xt, t, pad_mask, context, attn_mask_ratio)
