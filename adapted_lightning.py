@@ -12,6 +12,7 @@ from torch.nn import functional as F
 import wandb
 from scheduler import CubicScheduler
 from utils import *
+from models.sinusoidal_transformer import SimpleEditFlowsTransformer
 
 
 def top_p_probs(probs, top_p):
@@ -54,9 +55,12 @@ class AdaptedLitModule(pl.LightningModule):
         self.max_seq_len = 7000
         self.bleu = BLEU()
         self.val_t = None
+        self.is_sinusoidal = isinstance(model, SimpleEditFlowsTransformer)
         # (configure_optimizers and on_validation_epoch_start are unchanged)
 
     def configure_optimizers(self):
+        if self.is_sinusoidal:
+            return torch.optim.Adam(self.parameters(), lr=self.lr)
         return bnb_optim.AdamW8bit(self.parameters(), lr=self.lr, betas=(0.9, 0.95), percentile_clipping=5,
                                    weight_decay=1e-2, eps=1e-6)
 
@@ -67,21 +71,22 @@ class AdaptedLitModule(pl.LightningModule):
         )
 
     def forward(self, tokens, t, pad_mask, contexts, attn_mask_ratio):
-        # This function call is unchanged, but we now pass `xt_pad` to the `pad_mask` argument
+        if self.is_sinusoidal:
+            return self.model(tokens, t, pad_mask)
         return self.model(tokens, t, pad_mask, contexts, self.pad_token, attn_mask_ratio)
 
     def _loss(self, batch):
         xt = batch['xt']
-        contexts = batch['contexts']  # This is a list[Tensor]
+        contexts = batch['contexts']
         t = batch['t']
         uz_mask = batch['uz_mask']
-        xt_pad = batch['xt_pad']  # Padding mask for xt
-        z_gap = batch['z_gap']  # Gap mask from zt
-        z_pad = batch['z_pad']  # Padding mask from z0/z1
+        xt_pad = batch['xt_pad']
+        z_gap = batch['z_gap']
+        z_pad = batch['z_pad']
 
         attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step)
 
-        rates, ins_probs, sub_probs = self.forward(xt, t, xt_pad, contexts, attn_mask_ratio, )
+        rates, ins_probs, sub_probs = self.forward(xt, t, xt_pad, contexts, attn_mask_ratio)
 
         lam_ins = rates[:, :, 0]
         lam_sub = rates[:, :, 1]
@@ -105,8 +110,6 @@ class AdaptedLitModule(pl.LightningModule):
 
         loss_vec = u_tot - term2
 
-        loss_vec = loss_vec
-
         return loss_vec.mean(), {
             'utot': u_tot.mean(),
             '-term2': -term2.mean(),
@@ -126,9 +129,8 @@ class AdaptedLitModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # use fixed t for consistend comparison
         if self.val_t is None:
-            self.val_t = torch.rand(batch['t'].shape[0], 1, device=batch['t'].device, dtype=torch.bfloat16)
+            self.val_t = torch.rand(batch['t'].shape[0], 1, device=batch['t'].device, dtype=torch.bfloat16 if not self.is_sinusoidal else torch.float32)
             self.val_t = torch.clamp(self.val_t - 1e-2, min=0.0)
 
         batch['t'] = self.val_t
@@ -140,18 +142,17 @@ class AdaptedLitModule(pl.LightningModule):
 
         if batch_idx < self.val_sample_count or self.val_sample_count == -1:
             x0_sample = batch['x0_padded'][0].unsqueeze(0)
-            context = [batch['contexts'][0]]
-            target_seq = self.tokenizer.decode(batch['x1_padded'][0].squeeze().tolist(), skip_special_tokens=False)
+            context = [batch['contexts'][0]] if not self.is_sinusoidal else None
+            target_seq = self.tokenizer.decode(batch['x1_padded'][0].squeeze().tolist(), skip_special_tokens=False) if not self.is_sinusoidal else str(batch['x1_padded'][0].squeeze().tolist())
 
-            # generate a trajectory
             trajectory = self.sample(x0_sample, context, n_steps=1000)
 
-            # log the initial and final states of the trajectory
-            initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False)
-            final_seq = self.tokenizer.decode(trajectory[-1].squeeze().tolist(), skip_special_tokens=False)
+            initial_seq = self.tokenizer.decode(trajectory[0].squeeze().tolist(), skip_special_tokens=False) if not self.is_sinusoidal else str(trajectory[0].squeeze().tolist())
+            final_seq = self.tokenizer.decode(trajectory[-1].squeeze().tolist(), skip_special_tokens=False) if not self.is_sinusoidal else str(trajectory[-1].squeeze().tolist())
 
-            score = self.bleu.corpus_score([final_seq], [[target_seq]]).score
-            self.log('val/bleu_score', score, prog_bar=True, sync_dist=True)
+            if not self.is_sinusoidal:
+                score = self.bleu.corpus_score([final_seq], [[target_seq]]).score
+                self.log('val/bleu_score', score, prog_bar=True, sync_dist=True)
 
             self.val_outputs.add_data(
                 self.global_step,
@@ -170,7 +171,8 @@ class AdaptedLitModule(pl.LightningModule):
     def sample(self, x0, context, n_steps=100, t_min=0.0, top_p=0.5):
         self.model.eval()
         device = x0.device
-        t = torch.full((x0.size(0), 1), t_min, device=device, dtype=torch.bfloat16)
+        dtype = torch.bfloat16 if not self.is_sinusoidal else torch.float32
+        t = torch.full((x0.size(0), 1), t_min, device=device, dtype=dtype)
         dt = 1 / n_steps
         pad_mask = (x0 == self.pad_token)
         xt = x0.clone()
@@ -178,9 +180,6 @@ class AdaptedLitModule(pl.LightningModule):
 
         for _ in range(n_steps):
             attn_mask_ratio = min(1.0, self.global_step / self.anneal_end_step)
-            # todo make this a class param updated during training, need to set to 1 if loading just for validation/sampling
-            # attn_mask_ratio = 1.0
-
             adapt_h = get_adaptive_h(dt, t, self.kappa)
             rates, ins_probs, sub_probs = self.forward(xt, t, pad_mask, context, attn_mask_ratio)
 
@@ -198,7 +197,6 @@ class AdaptedLitModule(pl.LightningModule):
             sub_tokens = torch.full_like(xt, self.pad_token)
 
             if top_p < 1.0:
-                # Apply top-p sampling
                 ins_probs = top_p_probs(ins_probs[non_pad], top_p)
                 sub_probs = top_p_probs(sub_probs[non_pad], top_p)
 
