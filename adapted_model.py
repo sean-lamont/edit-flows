@@ -1,10 +1,8 @@
 """
-
 This module contains the core AdaptedModel class.
 
 The model adapts a pre-trained autoregressive model to an Edit Flow model,
 annealing the attention over time.
-
 """
 
 
