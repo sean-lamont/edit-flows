@@ -157,6 +157,6 @@ def fill_gap_tokens_with_repeats(
 
     # Use indices to gather from x_ut
     batch_indices = torch.arange(batch_size, device=x_ut.device).unsqueeze(1)
-    result = x_ut[batch_indices, indices]  # (batch_size, z_seq_len, vocab_size)
+    result = x_ut[batch_indices, indices]  # (batch_size, z_seq_len, vocab_size) (indexing with [b, 1], [b, z_len])
     result[z_pad_mask] = 0  # Set pad positions to 0
     return result
