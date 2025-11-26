@@ -94,16 +94,27 @@ def rm_gap_tokens(z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Te
     """
     Remove gap tokens from a batched tensor and right-pad with PAD_TOKEN.
     """    
-    batch_size, _ = z.shape
-    z_no_gap = []
-    for b in range(batch_size):
-        z_no_pad = z[b][z[b] != PAD_TOKEN]
-        z_no_gap.append(z_no_pad[z_no_pad != GAP_TOKEN])
-    max_len = max(len(z) for z in z_no_gap)
-    x = torch.stack([F.pad(z, (0, max_len - len(z)), value=PAD_TOKEN) for z in z_no_gap], dim=0).long()
-    x_pad_mask = (x == PAD_TOKEN)
+    batch_size, z_len = z.shape
+    device = z.device
+
     z_gap_mask = (z == GAP_TOKEN)
     z_pad_mask = (z == PAD_TOKEN)
+    
+    # Mask for tokens to keep (neither GAP nor PAD)
+    keep_mask = ~z_gap_mask & ~z_pad_mask
+    
+    # Get the values and their original batch indices
+    kept_values = z[keep_mask]
+    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, z_len)[keep_mask]
+
+    # Calculate new positions and scatter into a new tensor
+    new_lengths = keep_mask.sum(dim=1)
+    max_len = new_lengths.max().item()
+    x = torch.full((batch_size, max_len), PAD_TOKEN, dtype=z.dtype, device=device)
+    new_pos = torch.arange(z_len, device=device).unsqueeze(0).expand(batch_size, -1)[keep_mask] - z_gap_mask.cumsum(dim=1)[keep_mask]
+    x[batch_indices, new_pos] = kept_values
+
+    x_pad_mask = (x == PAD_TOKEN)
     assert ((~x_pad_mask).sum(1) + z_gap_mask.sum(1)).equal((~z_pad_mask).sum(1))
     return x, x_pad_mask, z_gap_mask, z_pad_mask
 

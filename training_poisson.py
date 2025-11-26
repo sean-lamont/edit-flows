@@ -10,12 +10,12 @@ import torch
 from torchtyping import TensorType as T
 from tqdm import tqdm
 
-from constants import PAD_TOKEN, GAP_TOKEN
+from constants import PAD_TOKEN, GAP_TOKEN, MASK_TOKEN
 from data import sample_cond_pt, make_x0_with_bounds, make_batch, make_ut_mask_from_z, \
     fill_gap_tokens_with_repeats
-from flows import CubicScheduler, EmptyCoupling, x2prob, UniformCoupling, GeneratorCoupling
+from flows import CubicScheduler, EmptyCoupling, x2prob, UniformCoupling, GeneratorCoupling, sample_p
 from model import SimpleEditFlowsTransformer
-from sampling import run_sampling
+from sampling_poisson import run_sampling
 from utils import opt_align_xs_to_zs, pretty_print, safe_chr, rm_gap_tokens
 
 
@@ -45,7 +45,7 @@ def poisson_make_uz_mask(
     # mask (batch_size, z_seq_len, u_ops) where 1 indicates operation that bring z_t closer to z_1
     u_mask = torch.zeros((batch_size, z_seq_len, n_ops), dtype=torch.bool, device=z_t.device)
     # u_mask[z_ins, z_1[z_ins]] = True
-    u_mask[z_sub, z_1[vocab_size]] = True
+    u_mask[z_sub, z_1[z_sub]] = True
     u_mask[:, :, -1][z_del] = True
     u_mask[:, :, -2][z_ins] = True
 
@@ -55,6 +55,35 @@ def poisson_make_uz_mask(
     return u_mask
 
 
+# sample with scheduler prob for each value whether to be z_0, z_1, or [mask].
+def sample_zt(z_0, z_1, mask_scheduler, default_scheduler, t, V):
+    z_neq = (z_0 != z_1) & (z_0 != PAD_TOKEN) & (z_1 != PAD_TOKEN)
+    z_ins = (z_0 == GAP_TOKEN) & (z_1 != GAP_TOKEN) & z_neq  # (batch_size, z_seq_len)
+
+    # t orig = (batch_size, 1) -> (batch_size, 1, 1)
+    t = t.reshape(-1, 1, 1)
+
+
+    mask_t = mask_scheduler(t)
+    default_t = default_scheduler(t)
+
+    # one-hot vecs (b, s, v)
+    p_0 = x2prob(z_0, V + 4)
+    p_1 = x2prob(z_1, V + 4)
+    p_mask = x2prob(torch.tensor([MASK_TOKEN]).expand_as(z_0).to(z_0.device), V + 4)
+
+    # for insert
+    pt_ins = (1 - mask_t) * p_0 \
+             + mask_t * (1 - default_t) * p_mask \
+             + mask_t * default_t * p_1
+
+    # for delete/sub
+    pt = (1 - default_t) * p_0 + default_t * p_1
+
+    pt = torch.where(z_ins.unsqueeze(-1), pt_ins, pt)
+
+    return sample_p(pt)
+
 
 def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, device: torch.device, V: int):
     torch.manual_seed(42)
@@ -63,7 +92,7 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
     metrics = defaultdict(list)
 
     batch_size = 128
-    min_seq_len = 64
+    min_seq_len = 128
     max_seq_len = 128
 
     seq_align_fn = opt_align_xs_to_zs
@@ -72,7 +101,8 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
     # num_cycles_fn = lambda: np.random.uniform(2.5, 4)
 
     num_cycles_fn = lambda: 3.5
-    x_int_fn = lambda: np.random.uniform(0, 2 * np.pi)
+    # x_int_fn = lambda: np.random.uniform(0, 2 * np.pi)
+    x_int_fn = lambda: 0
 
     generator_fn = lambda x1: make_x0_with_bounds(batch_size=int(x1.shape[0]), min_length=min_seq_len,
                                                   max_length=max_seq_len,
@@ -82,14 +112,17 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
     # generator_fn = lambda x1: make_x0_like_x1(
     #     x1, vocab_size=V, pad_token=PAD_TOKEN, num_cycles_fn=lambda: np.random.uniform(1, 2.5), x_int_fn=x_int_fn)
 
-    # coupling = EmptyCoupling()
+    coupling = EmptyCoupling()
     # coupling = GeneratorCoupling(generator_fn=generator_fn)
     # coupling = ExtendedCoupling(n_insert=64, vocab_size=V, pad_token=PAD_TOKEN)
-    coupling = UniformCoupling(
-        min_len=min_seq_len, max_len=max_seq_len, mirror_len=True, vocab_size=V, pad_token=PAD_TOKEN)
+    # coupling = UniformCoupling(
+    #     min_len=min_seq_len, max_len=max_seq_len, mirror_len=True, vocab_size=V, pad_token=PAD_TOKEN)
 
-    scheduler = CubicScheduler(a=1.0, b=1.0)
-    
+    # stick with just two schedulers for now, although we could have separate schedulers for mask sub, normal sub, delete,
+    # mask scheduler should have more density earlier (set t**3 for mask, linear for default)
+    mask_scheduler = CubicScheduler(a=0.0, b=3.0)
+    default_scheduler = CubicScheduler(a=1.0, b=1.0)
+
     model.to(device)
     model.train()
 
@@ -111,19 +144,16 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
             x_int_fn=x_int_fn,
         )
 
-        # todo need to update whole logic to deal with z_t with masks..
+        z_t = sample_zt(z_0, z_1, mask_scheduler, default_scheduler, t, V)
 
-        # todo update zt to add masks
-        z_t = sample_cond_pt(x2prob(z_0, V + 3), x2prob(z_1, V + 3), t, scheduler)  # interpolates in Z space
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = rm_gap_tokens(z_t)  # removes gap tokens and pads to max length
         assert (~x_pad_mask).sum(1).max().item() == x_t.shape[1]
 
-        # todo - check mask correct for new setup
         # uz_mask indicates which operations bring z_t closer to z_1 (batch_size, z_seq_len, vocab_size + 2)
         uz_mask = poisson_make_uz_mask(
             cast(T["batch_size", "z_seq_len", "long"], z_t),
             cast(T["batch_size", "z_seq_len", "long"], z_1),
-            vocab_size=V + 3,  # +3 for PAD, BOS, MASK tokens
+            vocab_size=V + 2,  # +2 for PAD, BOS tokens
         )
 
         # Feeds x_t, t to the model to obtain rates and probabilities for edit operations
@@ -143,7 +173,6 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
         # match the new ordering in uz_mask (sub, ins, del)
         ux_cat = torch.cat([u_tia_sub, u_tia_ins, u_tia_del], dim=-1)  # (batch_size, x_seq_len, vocab_size + 2)
 
-        # todo should work with original function?
         uz_cat = fill_gap_tokens_with_repeats(ux_cat, z_gap_mask, z_pad_mask)  # (batch_size, z_seq_len, vocab_size + 2)
         u_tot = u_t.sum(dim=(1, 2))  # (batch_size,)
 
@@ -153,8 +182,17 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
             raise ValueError("NaN detected in uz_cat")
 
         # Compute Bregman divergence loss
-        sched_coeff = (scheduler.derivative(t) / (1 - scheduler(t))).to(device)
+        default_coeff = (default_scheduler.derivative(t) / (1 - default_scheduler(t))).to(device)
+        ins_coeff = (mask_scheduler.derivative(t) / (1 - mask_scheduler(t))).to(device)
+
         log_uz_cat = torch.clamp(uz_cat.log(), min=-20)
+
+        z_neq = (z_0 != z_1) & (z_0 != PAD_TOKEN) & (z_1 != PAD_TOKEN)
+        z_ins = (z_0 == GAP_TOKEN) & (z_1 != GAP_TOKEN) & z_neq  # (batch_size, z_seq_len)
+
+        sched_coeff = torch.where(z_ins.to(device), ins_coeff, default_coeff)
+
+
         loss = u_tot - (log_uz_cat * uz_mask.to(device) * sched_coeff.unsqueeze(-1)).sum(dim=(1, 2))
         loss = loss.mean()
 
@@ -182,7 +220,7 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
                 best_avg_loss = avg_loss
                 torch.save(model.state_dict(), "best_model.pt")
                 print(f"\nNew best model saved with avg loss {avg_loss:.4f}")
-            
+
             pbar.set_description(f"Avg Loss: {avg_loss:.4f}")
             print(f"Step {step}: Avg Loss (100 steps) = {avg_loss:.4f}, "
                   f"u_tot = {u_tot.mean().item():.4f}, "
