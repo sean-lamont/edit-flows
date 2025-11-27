@@ -27,16 +27,17 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
     metrics = defaultdict(list)
 
     batch_size = 128
-    min_seq_len = 64
+    min_seq_len = 128
     max_seq_len = 128
 
     seq_align_fn = opt_align_xs_to_zs
     # seq_align_fn = shifted_align_xs_to_zs
 
     # num_cycles_fn = lambda: np.random.uniform(2.5, 4)
+    # x_int_fn = lambda: np.random.uniform(0, 2 * np.pi)
 
     num_cycles_fn = lambda: 3.5
-    x_int_fn = lambda: np.random.uniform(0, 2 * np.pi)
+    x_int_fn = lambda: 0
 
     generator_fn = lambda x1: make_x0_with_bounds(batch_size=int(x1.shape[0]), min_length=min_seq_len,
                                                   max_length=max_seq_len,
@@ -46,11 +47,11 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
     # generator_fn = lambda x1: make_x0_like_x1(
     #     x1, vocab_size=V, pad_token=PAD_TOKEN, num_cycles_fn=lambda: np.random.uniform(1, 2.5), x_int_fn=x_int_fn)
 
-    # coupling = EmptyCoupling()
+    coupling = EmptyCoupling()
     # coupling = GeneratorCoupling(generator_fn=generator_fn)
     # coupling = ExtendedCoupling(n_insert=64, vocab_size=V, pad_token=PAD_TOKEN)
-    coupling = UniformCoupling(
-        min_len=min_seq_len, max_len=max_seq_len, mirror_len=True, vocab_size=V, pad_token=PAD_TOKEN)
+    # coupling = UniformCoupling(
+    #     min_len=min_seq_len, max_len=max_seq_len, mirror_len=True, vocab_size=V, pad_token=PAD_TOKEN)
 
     scheduler = CubicScheduler(a=1.0, b=1.0)
     

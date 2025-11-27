@@ -9,8 +9,8 @@ from training_poisson import train_model
 from sampling_poisson import run_sampling
 from config import V, L
 
-torch.manual_seed(42)
-np.random.seed(42)
+# torch.manual_seed(42)
+# np.random.seed(42)
 
 model = PoissonEditFlowsTransformer(
     vocab_size=V + 3,  # +3 for PAD + BOS tokens, MASK
@@ -32,12 +32,13 @@ device = torch.device(
 # Call the training function
 
 # (Optional) Save / Load the model state
-train = True
+train = False
 overwrite = True
 
 save_dir = Path(f"results/poisson")
 save_dir.mkdir(parents=True, exist_ok=True)
 model_name = Path(f"best_model.pt")
+# model_name = Path(f"results/empty_cubic/best_model.pt")
 
 if train:
     model, optim = train_model(model, optim, device, V + 1)
@@ -63,6 +64,7 @@ if train:
 
 else:
     save_path = 'best_model.pt'
+    # save_path = f"results/empty_cubic/best_model.pt"
     checkpoint = torch.load(save_path)#, map_location={'cpu': 'cuda'})
     model.load_state_dict(checkpoint)
     model.to(device)

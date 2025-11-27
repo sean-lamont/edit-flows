@@ -15,7 +15,7 @@ from flows import CubicScheduler, EmptyCoupling
 
 
 def run_sampling(model: SimpleEditFlowsTransformer, device: torch.device, V: int, step: int = 0):
-    n_steps = 1000
+    n_steps = 100
     n_samples = 4
     t_min = 0.0
 
@@ -25,7 +25,7 @@ def run_sampling(model: SimpleEditFlowsTransformer, device: torch.device, V: int
     t = t_min * torch.ones(n_samples, 1)
 
     # Sample initial x_t = x_0 from the coupling
-    min_seq_len = 64
+    min_seq_len = 128
     max_seq_len = 128
     num_cycles_fn = lambda: np.random.uniform(2.5, 4)
     x_int_fn = lambda: np.random.uniform(0, 2 * np.pi)

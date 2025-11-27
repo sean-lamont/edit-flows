@@ -9,8 +9,8 @@ from training import train_model
 from sampling import run_sampling
 from config import V, L
 
-torch.manual_seed(42)
-np.random.seed(42)
+# torch.manual_seed(42)
+# np.random.seed(42)
 
 model = SimpleEditFlowsTransformer(
     vocab_size=V + 2,  # +2 for PAD + BOS tokens

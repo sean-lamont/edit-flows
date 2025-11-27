@@ -87,24 +87,75 @@ def poisson_apply_ins_del_operations(
             repeated_batch_indices = ins_b.repeat_interleave(num_insertions_at_loc)
             repeated_base_pos = base_positions.repeat_interleave(num_insertions_at_loc)
 
-            # 4. Generate insertion offsets (1, 2, ..., n) for each location
-            # This creates a sequence [1, 1, 2, 1, 2, 3, ...] for ins_vals [1, 2, 3, ...]
-            is_start_of_sequence = torch.cat([torch.tensor([True], device=device), num_insertions_at_loc[:-1] > 0])
-            offsets = (~is_start_of_sequence.repeat_interleave(num_insertions_at_loc)).cumsum(dim=0) + 1
+            # --- DELETE THE LINES BELOW ---
+            # is_start_of_sequence = torch.cat([torch.tensor([True], device=device), num_insertions_at_loc[:-1] > 0])
+            # offsets = (~is_start_of_sequence.repeat_interleave(num_insertions_at_loc)).cumsum(dim=0) + 1
 
-            # 5. Calculate final insertion positions and create a mask for valid positions
-            final_ins_pos = repeated_base_pos + offsets.to(repeated_base_pos.device)
+            # final_ins_pos = repeated_base_pos + offsets.to(repeated_base_pos.device)
+            # --- DELETE THE LINES ABOVE ---
+
+            # --- INSERT THIS CORRECTED BLOCK ---
+            # 4. Generate insertion offsets (1, 2, ..., n) for each location
+            flat_indices = torch.arange(total_insertions, device=device)
+
+            # Find start index of each group in the flat array
+            group_starts = torch.cat([
+                torch.tensor([0], device=device),
+                num_insertions_at_loc.cumsum(dim=0)[:-1]
+            ])
+
+            # Map every element to its group's start index
+            repeated_starts = group_starts.repeat_interleave(num_insertions_at_loc)
+
+            # Subtract start from current to get 1-based offset
+            offsets = flat_indices - repeated_starts + 1
+
+            # 5. Calculate final insertion positions
+            final_ins_pos = repeated_base_pos + offsets
+            # -----------------------------------
+
             valid_mask = (final_ins_pos >= 0) & (final_ins_pos < max_new_len)
             x_new[repeated_batch_indices[valid_mask], final_ins_pos[valid_mask]] = MASK_TOKEN
-
     if max_new_len > max_seq_len:
         print(f"Warning: max_new_len {max_new_len} exceeds max_seq_len {max_seq_len}, truncating.")
         max_new_len = max_seq_len
 
     return x_new[:, :max_new_len]
 
+
+def get_analytic_mean(model_rate, t, h):
+    """
+    Integrates the rate 3/(1-t) over [t, t+h].
+    Result = 3 * ln((1-t)/(1-(t+h)))
+    """
+    # Safety: Clamp t to avoid 1.0 singularity
+    t_safe = torch.clamp(t, max=1.0 - 1e-5)
+    t_next = torch.clamp(t + h, max=1.0 - 1e-5)
+
+    # Analytic Integral of 3/(1-x) is -3ln(1-x)
+    # Definite integral from t to t+h:
+    # 3 * [ln(1 - t_safe) - ln(1 - t_next)]
+    # Note: ln(a) - ln(b) = ln(a/b)
+
+    numerator = 1.0 - t_safe
+    denominator = 1.0 - t_next
+
+    # Calculate the exact "Area Under Curve" for this step
+    true_mass = 3.0 * torch.log(numerator / denominator)
+
+    # The model predicts the instantaneous rate "Height"
+    # We want to scale that height to match the true area
+    # Rate at start = 3 / (1 - t_safe)
+    current_rate = 3.0 / numerator
+    euler_mass = current_rate * h
+
+    correction = true_mass / euler_mass
+
+    # Apply correction to model output
+    return model_rate * h * correction
+
 def run_sampling(model, device: torch.device, V: int, step: int = 0):
-    n_steps = 100
+    n_steps = 10
     n_samples = 4
     t_min = 0.01
 
@@ -139,9 +190,11 @@ def run_sampling(model, device: torch.device, V: int, step: int = 0):
 
     # just use default sampler for now (todo maybe change later)
     scheduler = CubicScheduler(a=1.0, b=1.0) # Re-initialize scheduler for sampling
+    mask_scheduler = CubicScheduler(a=3.0, b=0.0) # Re-initialize scheduler for sampling
 
     with tqdm(desc="Euler Sampling") as pbar:
-        while t.max() <= 1 - default_h:
+        # while t.max() <= 1 - default_h:
+        while t.max() <= 1:
             u_t, sub_probs = model.forward(
                 cast(T["batch_size", "x_seq_len", "long"], x_t.to(device)),
                 cast(T["batch_size", 1, "float"], t.to(device)),
@@ -151,14 +204,20 @@ def run_sampling(model, device: torch.device, V: int, step: int = 0):
             lambda_sub = u_t[:, :, 1]  # Substitution rate     (n_samples, x_seq_len)
             lambda_del = u_t[:, :, 2]  # Deletion rate         (n_samples, x_seq_len)
 
-            adapt_h = get_adaptive_h(default_h, t, scheduler)
+            # print(f"Lambda Stats: t = {t.mean().item():.4f}, Min={lambda_ins.min().item():.4f}, Max={lambda_ins.max().item():.4f}, Mean: {lambda_ins.mean().item()}")
 
-            # Sample insertions and deletion/substitutions based on rates
-            # ins_mask = torch.rand(
-            #     size=lambda_ins.shape, device=lambda_ins.device) < 1 - torch.exp(-adapt_h * lambda_ins)
+            # print (f'lam_shape: {lambda_ins[0].shape}')
+            # print (f'x_shape: {x_t.shape}')
+
+            # print (f'num_valid_tokens: {valid_token_mask.sum(dim=1)}')
+            valid_token_mask = (~x_pad_mask).float()
+            lambda_ins = lambda_ins * valid_token_mask
+
+            # adapt_h = get_adaptive_h(default_h, t, scheduler)
+            adapt_h = default_h
 
             ins_vals = torch.poisson(adapt_h * lambda_ins).long()
-
+            # ins_vals = torch.poisson(get_analytic_mean(lambda_ins, t, adapt_h)).long()
 
             del_sub_mask = torch.rand(
                 size=lambda_sub.shape, device=lambda_sub.device
@@ -214,6 +273,7 @@ def run_sampling(model, device: torch.device, V: int, step: int = 0):
 
         for i, seq in enumerate(seqs):
             y = seq[seq != PAD_TOKEN]  # Remove padding token
+            # y = seq  # Remove padding token
             x = np.arange(len(y))
             ax[j, i].scatter(x, y, label=f"Step {seq_indices[i]}", s=10)
             ax[j, i].set_title(f"Step {seq_indices[i]}")

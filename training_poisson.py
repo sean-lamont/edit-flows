@@ -119,8 +119,9 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
     #     min_len=min_seq_len, max_len=max_seq_len, mirror_len=True, vocab_size=V, pad_token=PAD_TOKEN)
 
     # stick with just two schedulers for now, although we could have separate schedulers for mask sub, normal sub, delete,
-    # mask scheduler should have more density earlier (set t**3 for mask, linear for default)
-    mask_scheduler = CubicScheduler(a=0.0, b=3.0)
+    # mask scheduler should have more density earlier (set 1 - (1 - t**3)) for mask, linear for default)
+    mask_scheduler = CubicScheduler(a=3.0, b=0.0)
+
     default_scheduler = CubicScheduler(a=1.0, b=1.0)
 
     model.to(device)
