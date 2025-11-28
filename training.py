@@ -1,6 +1,7 @@
 import hashlib
 import sys
 from collections import defaultdict
+from pathlib import Path
 from typing import cast
 
 import matplotlib.pyplot as plt
@@ -16,13 +17,14 @@ from data import sample_cond_pt, make_x0_with_bounds, make_batch, make_ut_mask_f
 from flows import CubicScheduler, EmptyCoupling, x2prob, UniformCoupling, GeneratorCoupling
 from model import SimpleEditFlowsTransformer
 from sampling import run_sampling
-from utils import opt_align_xs_to_zs, pretty_print, safe_chr, rm_gap_tokens
+from utils import opt_align_xs_to_zs, pretty_print, safe_chr, rm_gap_tokens, shifted_align_xs_to_zs
 
 
 
-def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, device: torch.device, V: int):
-    torch.manual_seed(42)
-    np.random.seed(42)
+def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, device: torch.device, V: int,
+                save_dir=Path('')):
+    # torch.manual_seed(42)
+    # np.random.seed(42)
 
     metrics = defaultdict(list)
 
@@ -30,14 +32,17 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
     min_seq_len = 128
     max_seq_len = 128
 
-    seq_align_fn = opt_align_xs_to_zs
-    # seq_align_fn = shifted_align_xs_to_zs
+
+    # seq_align_fn = opt_align_xs_to_zs
+    seq_align_fn = shifted_align_xs_to_zs
 
     # num_cycles_fn = lambda: np.random.uniform(2.5, 4)
-    # x_int_fn = lambda: np.random.uniform(0, 2 * np.pi)
 
-    num_cycles_fn = lambda: 3.5
-    x_int_fn = lambda: 0
+    num_cycles_fn = lambda: np.random.uniform(2.5, 4)
+    x_int_fn = lambda: np.random.uniform(0, 2 * np.pi)
+
+    # num_cycles_fn = lambda: 3.5
+    # x_int_fn = lambda: 0
 
     generator_fn = lambda x1: make_x0_with_bounds(batch_size=int(x1.shape[0]), min_length=min_seq_len,
                                                   max_length=max_seq_len,
@@ -47,9 +52,12 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
     # generator_fn = lambda x1: make_x0_like_x1(
     #     x1, vocab_size=V, pad_token=PAD_TOKEN, num_cycles_fn=lambda: np.random.uniform(1, 2.5), x_int_fn=x_int_fn)
 
-    coupling = EmptyCoupling()
-    # coupling = GeneratorCoupling(generator_fn=generator_fn)
+    # coupling = EmptyCoupling()
+
+    coupling = GeneratorCoupling(generator_fn=generator_fn)
+
     # coupling = ExtendedCoupling(n_insert=64, vocab_size=V, pad_token=PAD_TOKEN)
+
     # coupling = UniformCoupling(
     #     min_len=min_seq_len, max_len=max_seq_len, mirror_len=True, vocab_size=V, pad_token=PAD_TOKEN)
 
@@ -138,7 +146,7 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
             avg_loss = np.mean(metrics["loss"][-100:])
             if avg_loss < best_avg_loss:
                 best_avg_loss = avg_loss
-                torch.save(model.state_dict(), "best_model.pt")
+                torch.save(model.state_dict(), save_dir / Path('best_model.pt'))
                 print(f"\nNew best model saved with avg loss {avg_loss:.4f}")
             
             pbar.set_description(f"Avg Loss: {avg_loss:.4f}")
@@ -150,7 +158,7 @@ def train_model(model: SimpleEditFlowsTransformer, optim: torch.optim.Adam, devi
                   f"u_con = {u_con:.4f}")
 
         if step > 0 and step % 500 == 0:
-            run_sampling(model, device, V, step)
+            run_sampling(model, device, V, step, save_dir=save_dir)
             model.train()
 
     # Plotting metrics

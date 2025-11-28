@@ -8,16 +8,16 @@ from pathlib import Path
 from matplotlib.animation import FuncAnimation
 
 from constants import PAD_TOKEN
-from data import make_batch
+from data import make_batch, make_x0_with_bounds
 from model import SimpleEditFlowsTransformer
-from utils import apply_ins_del_operations, get_adaptive_h, pretty_print, opt_align_xs_to_zs
-from flows import CubicScheduler, EmptyCoupling
+from utils import apply_ins_del_operations, get_adaptive_h, pretty_print, opt_align_xs_to_zs, shifted_align_xs_to_zs
+from flows import CubicScheduler, EmptyCoupling, UniformCoupling, GeneratorCoupling
 
 
-def run_sampling(model: SimpleEditFlowsTransformer, device: torch.device, V: int, step: int = 0):
-    n_steps = 100
+def run_sampling(model: SimpleEditFlowsTransformer, device: torch.device, V: int, step: int = 0, save_dir=Path('')):
+    n_steps = 5
     n_samples = 4
-    t_min = 0.0
+    t_min = 0.01
 
     model.eval()
 
@@ -27,10 +27,29 @@ def run_sampling(model: SimpleEditFlowsTransformer, device: torch.device, V: int
     # Sample initial x_t = x_0 from the coupling
     min_seq_len = 128
     max_seq_len = 128
+
     num_cycles_fn = lambda: np.random.uniform(2.5, 4)
     x_int_fn = lambda: np.random.uniform(0, 2 * np.pi)
+
     coupling = EmptyCoupling()
+
+    # coupling = UniformCoupling(
+    #     min_len=min_seq_len, max_len=max_seq_len, mirror_len=True, vocab_size=V, pad_token=PAD_TOKEN)
+
+    generator_fn = lambda x1: make_x0_with_bounds(batch_size=int(x1.shape[0]), min_length=min_seq_len,
+                                                  max_length=max_seq_len,
+                                                  vocab_size=V, pad_token=PAD_TOKEN,
+                                                  num_cycles_fn=lambda: np.random.uniform(1., 2.5), x_int_fn=x_int_fn)
+
+    # generator_fn = lambda x1: make_x0_like_x1(
+    #     x1, vocab_size=V, pad_token=PAD_TOKEN, num_cycles_fn=lambda: np.random.uniform(1, 2.5), x_int_fn=x_int_fn)
+
+    coupling = EmptyCoupling()
+
+    # coupling = GeneratorCoupling(generator_fn=generator_fn)
+
     seq_align_fn = opt_align_xs_to_zs
+    # seq_align_fn = shifted_align_xs_to_zs
 
     x_0, _, _, _, _, _ = make_batch(
         batch_size=n_samples,
@@ -64,7 +83,7 @@ def run_sampling(model: SimpleEditFlowsTransformer, device: torch.device, V: int
 
             # Sample insertions and deletion/substitutions based on rates
             ins_mask = torch.rand(
-                size=lambda_ins.shape, device=lambda_ins.device) < 1 - torch.exp(-adapt_h * 0.04 * lambda_ins)
+                size=lambda_ins.shape, device=lambda_ins.device) < 1 - torch.exp(-adapt_h * lambda_ins)
             del_sub_mask = torch.rand(
                 size=lambda_sub.shape, device=lambda_sub.device
             ) < 1 - torch.exp(-adapt_h * (lambda_sub + lambda_del))
@@ -126,7 +145,7 @@ def run_sampling(model: SimpleEditFlowsTransformer, device: torch.device, V: int
             ax[j, i].legend()
 
     plt.tight_layout()
-    plt.savefig(f"model_samples_step_{step}.png", dpi=300, bbox_inches='tight')
+    plt.savefig(save_dir / Path(f"model_samples_step_{step}.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
     # # Make video animation of the edit flows through sampling steps
