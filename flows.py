@@ -26,9 +26,6 @@ class Coupling(ABC):
     def sample(self, x1: Tensor) -> tuple[Tensor, Tensor]:
         raise NotImplementedError
 
-
-# todo: Coupling to delete random subsequences given target to form source
-
 class SubSequenceCoupling(Coupling):
     def __init__(self, num_subsequences: int, min_size: int, max_size: int, pad_token: int = 129):
         super().__init__()
