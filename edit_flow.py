@@ -1,6 +1,7 @@
 import math
 import os
 import typing
+import pickle
 
 import hydra.utils
 import lightning as L
@@ -299,8 +300,20 @@ class EditFlow(L.LightningModule):
         u_tot = u_t.sum(dim=(1, 2))
 
         if torch.isnan(ux_cat).any():
+            print (f'x_0: {x_0} z_0: {z_0}, z_1: {z_1}, z_t: {z_t}, t: {t}, x_t: {x_t}')
+            print (f'x_0: {x_0.shape} z_0: {z_0.shape}, z_1: {z_1.shape}, z_t: {z_t.shape}, t: {t.shape}, x_t: {x_t.shape}')
+            pickle.dump(f'ux_nan_dump_{self.global_step}.pkl',
+                {'x_0': x_0, 'x_1': x_1, 'z_0': z_0, 'z_1': z_1, 'z_t': z_t, 't': t, 'x_t': x_t},
+                protocol=pickle.HIGHEST_PROTOCOL
+            )
             raise ValueError("NaN detected in ux_cat")
         if torch.isnan(uz_cat).any():
+            print (f'x_0: {x_0} z_0: {z_0}, z_1: {z_1}, z_t: {z_t}, t: {t}, x_t: {x_t}')
+            print (f'x_0: {x_0.shape} z_0: {z_0.shape}, z_1: {z_1.shape}, z_t: {z_t.shape}, t: {t.shape}, x_t: {x_t.shape}')
+            pickle.dump(f'uz_nan_dump_{self.global_step}.pkl',
+                        {'x_0': x_0, 'x_1': x_1, 'z_0': z_0, 'z_1': z_1, 'z_t': z_t, 't': t, 'x_t': x_t},
+                        protocol=pickle.HIGHEST_PROTOCOL
+                        )
             raise ValueError("NaN detected in uz_cat")
 
 
