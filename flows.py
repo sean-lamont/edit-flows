@@ -31,7 +31,9 @@ class EmptyCoupling(Coupling):
     """A coupling that samples empty prior sequences
     """
     def sample(self, x1: Tensor):
-        x0 = torch.empty((x1.shape[0], 0), dtype=x1.dtype, device=x1.device).long()
+        # x0 = torch.empty((x1.shape[0], 0), dtype=x1.dtype, device=x1.device).long()
+        # x0 = torch.empty((x1.shape[0], 0), dtype=x1.dtype, device=x1.device).long()
+        x0 = torch.full((x1.shape[0], 1), 101, dtype=x1.dtype, device=x1.device).long() # todo parameterise, currently BOS token
         return x0, x1
 
 
