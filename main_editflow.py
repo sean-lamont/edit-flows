@@ -77,11 +77,25 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
         print('Batch input_ids.shape', batch[1].shape)
         first = batch[1][0, :k]
         last = batch[1][0, -k:]
+        print('x0\n\n')
         print(f'First {k} tokens:', tokenizer.decode(first))
         print('ids:', first)
         print(f'Last {k} tokens:', tokenizer.decode(last))
         print('ids:', last)
-
+        print(f'z0\n\n')
+        first = batch[2][0, :k]
+        last = batch[2][0, -k:]
+        print(f'First {k} tokens:', tokenizer.decode(first))
+        print('ids:', first)
+        print(f'Last {k} tokens:', tokenizer.decode(last))
+        print('ids:', last)
+        print(f'z1\n\n')
+        first = batch[3][0, :k]
+        last = batch[3][0, -k:]
+        print(f'First {k} tokens:', tokenizer.decode(first))
+        print('ids:', first)
+        print(f'Last {k} tokens:', tokenizer.decode(last))
+        print('ids:', last)
 
 def generate_samples(config, logger, tokenizer):
     logger.info('Generating samples.')

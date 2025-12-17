@@ -527,47 +527,153 @@ def get_tokenizer(config):
     return tokenizer
 
 
-def collate_edit_batch(batch, coupling, seq_align_fn, pad_token):
-    # print (batch)
-    # exit()
+def collate_edit_batch(batch, coupling, seq_align_fn, pad_token, vocab_size, gap_token_id, del_prob=0.05):
     x1_list = [b['input_ids'] for b in batch]
 
     x_1, x_0 = [], []
     z_1, z_0 = [], []
 
-
-
     for _x1 in x1_list:
-        # seq_len = torch.sum(_x1 != )
+        # 1. Clean Inputs
         _x1 = _x1[_x1 != pad_token]
         _x1 = _x1.unsqueeze(0)
+
+        # 2. Sample & Align
+        # Start with standard alignment (usually empty/masked source)
         _x0, _ = coupling.sample(_x1)
         _z0, _z1 = seq_align_fn(_x0, _x1)
-        # print (_x1, _x0, _z1, _z0, _x1.shape, _x0.shape, _z1.shape, _z0.shape)
+
+        _z0_flat = _z0.squeeze(0)
+        _z1_flat = _z1.squeeze(0)
+
+        # --- PHASE A: DELETION NOISE ONLY ---
+        # Goal: Insert [Garbage] in z0 and [Gap] in z1 at the same positions.
+        seq_len = _z0_flat.size(0)
+
+        # We can insert before any existing token or at the end
+        n_slots = seq_len + 1
+        ins_mask = torch.rand(n_slots) < del_prob
+
+        if ins_mask.any():
+            num_ins = ins_mask.sum().item()
+
+            # 1. Generate Noise for Source (The "Error" to delete)
+            # We sample from full vocab, then resample any collisions with Pad/Gap
+            noise_tokens = torch.randint(0, vocab_size, (num_ins,), device=_x0.device)
+
+            # Rejection sampling loop to ensure no Pad or Gap tokens are picked
+            mask_invalid = (noise_tokens == pad_token) | (noise_tokens == gap_token_id)
+            while mask_invalid.any():
+                # Resample only the invalid ones
+                num_invalid = mask_invalid.sum().item()
+                new_tokens = torch.randint(0, vocab_size, (num_invalid,), device=_x0.device)
+                noise_tokens[mask_invalid] = new_tokens
+
+                # Re-check
+                mask_invalid = (noise_tokens == pad_token) | (noise_tokens == gap_token_id)
+
+            # 2. Generate Gaps for Target (The "Correct" empty state)
+            gap_tokens = torch.full((num_ins,), gap_token_id, dtype=torch.long, device=_x0.device)
+
+            # 3. Interleave logic to insert new rows
+            z0_parts, z1_parts = [], []
+            ins_indices = torch.nonzero(ins_mask).squeeze(1).tolist()
+
+            last_pos = 0
+            noise_idx = 0
+
+            for pos in ins_indices:
+                # Copy existing valid chunk
+                if pos > last_pos:
+                    z0_parts.append(_z0_flat[last_pos:pos])
+                    z1_parts.append(_z1_flat[last_pos:pos])
+
+                # Insert the Noise/Gap pair
+                z0_parts.append(noise_tokens[noise_idx: noise_idx + 1])
+                z1_parts.append(gap_tokens[noise_idx: noise_idx + 1])
+                noise_idx += 1
+
+                last_pos = pos
+
+            # Append remainder
+            if last_pos < seq_len:
+                z0_parts.append(_z0_flat[last_pos:])
+                z1_parts.append(_z1_flat[last_pos:])
+
+            _z0_flat = torch.cat(z0_parts)
+            _z1_flat = torch.cat(z1_parts)
+
+        # Reshape back to [1, Seq]
+        _z0 = _z0_flat.unsqueeze(0)
+        _z1 = _z1_flat.unsqueeze(0)
+
+        # Reconstruct x0 from the modified z0 (removing only gaps)
+        # Any garbage tokens we added are NOT gaps, so they stay in x0
+        _x0_rec = _z0[_z0 != gap_token_id].unsqueeze(0)
+
         x_1.append(_x1.squeeze(0))
-        x_0.append(_x0.squeeze(0))
+        x_0.append(_x0_rec.squeeze(0))
         z_1.append(_z1.squeeze(0))
         z_0.append(_z0.squeeze(0))
 
-    # Find the maximum length of each sequence in the batch
+    # 3. Padding (Standard Logic)
     x0_max_len = max(len(x) for x in x_0)
     x1_max_len = max(len(x) for x in x_1)
     z_max_len = max(len(z) for z in z_1)
-    assert z_max_len == max(len(z) for z in z_0), "z_1 and z_0 must have the same max length"
 
-    # Add <PAD> token at end of each sequence to make them equal length
     x_1 = torch.stack([F.pad(x, (0, x1_max_len - x.shape[0]), value=pad_token) for x in x_1], dim=0).long()
     x_0 = torch.stack([F.pad(x, (0, x0_max_len - x.shape[0]), value=pad_token) for x in x_0], dim=0).long()
     z_1 = torch.stack([F.pad(x, (0, z_max_len - x.shape[0]), value=pad_token) for x in z_1], dim=0).long()
     z_0 = torch.stack([F.pad(x, (0, z_max_len - x.shape[0]), value=pad_token) for x in z_0], dim=0).long()
 
     t = torch.rand(x_1.shape[0], 1)
-
     t = torch.clamp(t, min=0.01, max=0.99)
-
 
     return x_0, x_1, z_0, z_1, t
 
+
+#
+# def collate_edit_batch(batch, coupling, seq_align_fn, pad_token):
+#     # print (batch)
+#     # exit()
+#     x1_list = [b['input_ids'] for b in batch]
+#
+#     x_1, x_0 = [], []
+#     z_1, z_0 = [], []
+#
+#
+#
+#     for _x1 in x1_list:
+#         # seq_len = torch.sum(_x1 != )
+#         _x1 = _x1[_x1 != pad_token]
+#         _x1 = _x1.unsqueeze(0)
+#         _x0, _ = coupling.sample(_x1)
+#         _z0, _z1 = seq_align_fn(_x0, _x1)
+#         # print (_x1, _x0, _z1, _z0, _x1.shape, _x0.shape, _z1.shape, _z0.shape)
+#         x_1.append(_x1.squeeze(0))
+#         x_0.append(_x0.squeeze(0))
+#         z_1.append(_z1.squeeze(0))
+#         z_0.append(_z0.squeeze(0))
+#
+#     # Find the maximum length of each sequence in the batch
+#     x0_max_len = max(len(x) for x in x_0)
+#     x1_max_len = max(len(x) for x in x_1)
+#     z_max_len = max(len(z) for z in z_1)
+#     assert z_max_len == max(len(z) for z in z_0), "z_1 and z_0 must have the same max length"
+#
+#     # Add <PAD> token at end of each sequence to make them equal length
+#     x_1 = torch.stack([F.pad(x, (0, x1_max_len - x.shape[0]), value=pad_token) for x in x_1], dim=0).long()
+#     x_0 = torch.stack([F.pad(x, (0, x0_max_len - x.shape[0]), value=pad_token) for x in x_0], dim=0).long()
+#     z_1 = torch.stack([F.pad(x, (0, z_max_len - x.shape[0]), value=pad_token) for x in z_1], dim=0).long()
+#     z_0 = torch.stack([F.pad(x, (0, z_max_len - x.shape[0]), value=pad_token) for x in z_0], dim=0).long()
+#
+#     t = torch.rand(x_1.shape[0], 1)
+#
+#     t = torch.clamp(t, min=0.01, max=0.99)
+#
+#
+#     return x_0, x_1, z_0, z_1, t
+#
 
 def get_dataloaders(config, tokenizer, skip_train=False,
                     skip_valid=False, valid_seed=None):
@@ -614,16 +720,16 @@ def get_dataloaders(config, tokenizer, skip_train=False,
             block_size=config.model.length,
             streaming=False)
 
-
     coupling = EmptyCoupling()
 
-    seq_align_fn = functools.partial(opt_align_xs_to_zs, gap_token=3) # todo fixed for now
-
+    seq_align_fn = functools.partial(opt_align_xs_to_zs, gap_token=3)  # todo fixed for now
 
     collate_fn = functools.partial(collate_edit_batch,
                                    seq_align_fn=seq_align_fn,
                                    coupling=coupling,
                                    pad_token=tokenizer.pad_token_id,
+                                   vocab_size=tokenizer.vocab_size,
+                                   gap_token_id=3
                                    )
 
     if skip_train:
