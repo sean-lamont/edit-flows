@@ -13,7 +13,7 @@ time_conditioning: False
 seed: 1
 
 loader:
-  global_batch_size: 96
+  global_batch_size: 256
   eval_global_batch_size: ${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**
   batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
@@ -48,7 +48,7 @@ trainer:
   devices: ${device_count:}
   accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   gradient_clip_val: 1.0
-  precision: 'bf16'
+  precision: 'bf16-mixed'
   num_sanity_val_steps: 2
   max_steps: 1_000_000
   log_every_n_steps: 10
@@ -61,12 +61,13 @@ wandb:
 #  notes: Mulan for text
   group: null
   job_type: null
-  name: null
+#  offline: true
+#  name: poisson_1
 #  id: ${.name}_${seed}
   tags:
-    - ${noise.type}
     - ${data.train}
     - ${data.valid}
+#    - ${noise.type}
 
 hydra:
   run:
@@ -77,6 +78,8 @@ hydra:
 checkpointing:
   # Use custom `save_dir` if, e.g., saving to S3 bucket, otherwise leave this parameter as is
   save_dir: ${cwd:}
+#  save_dir: /home/sean/edit-flows/outputs/lm1b/2025.12.17/110724
+#  save_dir: ${cwd:}
   # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt

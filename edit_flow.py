@@ -147,7 +147,6 @@ class EditFlow(L.LightningModule):
 
         self.V = self.tokenizer.vocab_size
 
-
         self.gen_ppl_eval_model_name_or_path = self.config.eval. \
             gen_ppl_eval_model_name_or_path
 
@@ -183,7 +182,6 @@ class EditFlow(L.LightningModule):
 
         self.fast_forward_epochs = None
         self.fast_forward_batches = None
-
 
         # higher mass earlier for structure prediction, giving more time for unmasking
         self.mask_scheduler = CubicScheduler(a=3.0, b=0.0)
@@ -272,93 +270,138 @@ class EditFlow(L.LightningModule):
     def _compute_loss(self, batch):
         x_0, x_1, z_0, z_1, t = batch
 
-        z_t = sample_zt(z_0, z_1, self.mask_scheduler, self.default_scheduler,
-                        t, self.V, pad_token=self.pad_token, gap_token=self.gap_token,
-                        mask_token=self.mask_token)
-
-        # print (x_0, x_1, z_0, z_1, z_t, x_0.shape, x_1.shape, z_0.shape, z_1.shape, z_t.shape)
-        # exit()
+        z_t = self.sample_zt_sparse(z_0, z_1, t)
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = rm_gap_tokens(z_t, pad_token=self.pad_token, gap_token=self.gap_token)
 
-        assert (~x_pad_mask).sum(1).max().item() == x_t.shape[1]
-
-        uz_mask = poisson_make_uz_mask(z_t, z_1, vocab_size=self.V, gap_token=self.gap_token, pad_token=self.pad_token)
-
-        u_t, sub_probs = self.backbone.forward(x_t, t, x_pad_mask)  # attention mask not used in DiT
-
-        lambda_ins = u_t[:, :, 0]
-        lambda_sub = u_t[:, :, 1]
-        lambda_del = u_t[:, :, 2]
-
-        u_tia_sub = lambda_sub.unsqueeze(-1) * sub_probs
-        u_tia_ins = lambda_ins.unsqueeze(-1)
-        u_tia_del = lambda_del.unsqueeze(-1)
-
-        ux_cat = torch.cat([u_tia_sub, u_tia_ins, u_tia_del], dim=-1)
-        uz_cat = fill_gap_tokens_with_repeats(ux_cat, z_gap_mask, z_pad_mask)
+        u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
         u_tot = u_t.sum(dim=(1, 2))
 
-        if torch.isnan(ux_cat).any():
-            print (f'x_0: {x_0} z_0: {z_0}, z_1: {z_1}, z_t: {z_t}, t: {t}, x_t: {x_t}')
-            print (f'x_0: {x_0.shape} z_0: {z_0.shape}, z_1: {z_1.shape}, z_t: {z_t.shape}, t: {t.shape}, x_t: {x_t.shape}')
-            pickle.dump(f'ux_nan_dump_{self.global_step}.pkl',
-                {'x_0': x_0, 'x_1': x_1, 'z_0': z_0, 'z_1': z_1, 'z_t': z_t, 't': t, 'x_t': x_t},
-                protocol=pickle.HIGHEST_PROTOCOL
-            )
-            raise ValueError("NaN detected in ux_cat")
-        if torch.isnan(uz_cat).any():
-            print (f'x_0: {x_0} z_0: {z_0}, z_1: {z_1}, z_t: {z_t}, t: {t}, x_t: {x_t}')
-            print (f'x_0: {x_0.shape} z_0: {z_0.shape}, z_1: {z_1.shape}, z_t: {z_t.shape}, t: {t.shape}, x_t: {x_t.shape}')
-            pickle.dump(f'uz_nan_dump_{self.global_step}.pkl',
-                        {'x_0': x_0, 'x_1': x_1, 'z_0': z_0, 'z_1': z_1, 'z_t': z_t, 't': t, 'x_t': x_t},
-                        protocol=pickle.HIGHEST_PROTOCOL
-                        )
-            raise ValueError("NaN detected in uz_cat")
+        uz_mask = poisson_make_uz_mask(z_t, z_1, vocab_size=self.V,
+                                       gap_token=self.gap_token, pad_token=self.pad_token)
+
+        target_ins = uz_mask[:, :, -2]
+        target_del = uz_mask[:, :, -1]
+        target_sub = uz_mask[:, :, :-2].any(dim=-1)  # True where substitution happens
+
+        log_sum_exp_x = sub_logits.logsumexp(dim=-1)
+
+        log_sum_exp_z = fill_gap_tokens_with_repeats(
+            log_sum_exp_x.unsqueeze(-1), z_gap_mask, z_pad_mask
+        ).squeeze(-1)
+
+        non_gap_mask = ~z_gap_mask
+        x_indices = non_gap_mask.cumsum(dim=1) - 1
+        x_indices = x_indices.clamp(min=0, max=x_t.shape[1] - 1)
+
+        valid_vocab_limit = sub_logits.size(-1) - 1
+        safe_z1 = z_1.clamp(min=0, max=valid_vocab_limit)
+
+        batch_idx = torch.arange(x_t.shape[0], device=self.device).unsqueeze(1)
+
+        target_logits_z = sub_logits[batch_idx, x_indices, safe_z1]
+
+        vocab_nll = log_sum_exp_z - target_logits_z
+
+        eps = 1e-9
+        log_rates = torch.log(u_t + eps)
+        uz_log_rates = fill_gap_tokens_with_repeats(log_rates, z_gap_mask, z_pad_mask)
+
+        log_rate_ins = uz_log_rates[:, :, 0]
+        log_rate_sub = uz_log_rates[:, :, 1]
+        log_rate_del = uz_log_rates[:, :, 2]
+
+        selected_log_ll = (
+                (log_rate_ins * target_ins) +
+                (log_rate_del * target_del) +
+                ((log_rate_sub - vocab_nll) * target_sub)
+        )
+
+        default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps)).squeeze()
+        ins_coeff = (self.mask_scheduler.derivative(t) / (1 - self.mask_scheduler(t) + eps)).squeeze()
+        z_ins_event = (z_0 == self.gap_token) & (z_1 != self.gap_token) & (z_0 != z_1)
+        sched_coeff = torch.where(z_ins_event, ins_coeff.unsqueeze(-1), default_coeff.unsqueeze(-1))
 
 
-        default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t))).to(self.device)
-        ins_coeff = (self.mask_scheduler.derivative(t) / (1 - self.mask_scheduler(t))).to(self.device)
+        term2 = (selected_log_ll * sched_coeff).sum(dim=1)
+        loss = u_tot - term2
 
-        uz_cat = torch.clamp(uz_cat, min=0)
+        u_ins = u_t[:, :, 0].sum(dim=1).mean()
+        u_del = u_t[:, :, 2].sum(dim=1).mean()
+        u_sub = u_t[:, :, 1].sum(dim=1).mean()
 
-        log_uz_cat = torch.clamp(uz_cat.log(), min=-20)
+        return loss.mean(), u_tot, u_ins, u_del, u_sub, term2.mean()
+
+    def sample_zt_sparse(self, z_0, z_1, t):
+        """
+        Samples z_t without expanding full vocabulary distributions.
+        """
+        t = t.reshape(-1, 1)  # [Batch, 1]
+        mask_t = self.mask_scheduler(t)
+        default_t = self.default_scheduler(t)
+
+        w_z0_ins = 1 - mask_t
+        w_mask_ins = mask_t * (1 - default_t)
+        w_z1_ins = mask_t * default_t
+
+        w_z0_std = 1 - default_t
+        w_mask_std = torch.zeros_like(default_t)
+        w_z1_std = default_t
 
         z_neq = (z_0 != z_1) & (z_0 != self.pad_token) & (z_1 != self.pad_token)
-        z_ins = (z_0 == self.gap_token) & (z_1 != self.gap_token) & z_neq
+        is_ins = (z_0 == self.gap_token) & (z_1 != self.gap_token) & z_neq
 
-        sched_coeff = torch.where(z_ins.to(self.device), ins_coeff, default_coeff)
+        B, L = z_0.shape
+        w_z0 = torch.where(is_ins, w_z0_ins, w_z0_std).expand(B, L)
+        w_mask = torch.where(is_ins, w_mask_ins, w_mask_std).expand(B, L)
+        w_z1 = torch.where(is_ins, w_z1_ins, w_z1_std).expand(B, L)
 
-        loss = u_tot - (log_uz_cat * uz_mask.to(self.device) * sched_coeff.unsqueeze(-1)).sum(dim=(1, 2))
-        loss = loss.mean()
+        probs = torch.stack([w_z0, w_mask, w_z1], dim=-1)
+        flat_probs = probs.view(-1, 3)
+        choices = torch.multinomial(flat_probs, 1).view(B, L)
 
-        assert not torch.isnan(loss) and not torch.isinf(loss), "Loss is NaN or Inf"
+        z_t = torch.where(choices == 0, z_0,
+                          torch.where(choices == 1, torch.tensor(self.mask_token, device=self.device),
+                                      z_1))
 
-        u_ins = lambda_ins.sum(dim=1).mean()
-        u_del = lambda_del.sum(dim=1).mean()
-        u_sub = lambda_sub.sum(dim=1).mean()
-        u_con = (uz_cat * uz_mask.to(self.device)).sum(dim=(1, 2)).mean()
-
-        self.log_dict({
-            "loss": loss,
-            "u_tot": u_tot.mean(),
-            "u_ins": u_ins,
-            "u_del": u_del,
-            "u_sub": u_sub,
-            "u_con": u_con,
-        },
-            prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
-
-        return loss
+        return z_t
 
     def training_step(self, batch, batch_idx):
-        return self._compute_loss(batch)
+        try:
+            loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
+            self.log_dict(
+                {
+                    "train_loss": loss,
+                    "train_u_tot": u_tot.mean(),
+                    "train_u_ins": u_ins,
+                    "train_u_del": u_del,
+                    "train_u_sub": u_sub,
+                    "train_term2": term2,
+                }, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
+            return loss
+        except Exception as e:
+            print(f'Error in training: {e}')
+            return None
 
     def on_validation_epoch_start(self):
         self.backbone.eval()
 
     def validation_step(self, batch, batch_idx):
-        return self._compute_loss(batch)
+        try:
+            loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
+            self.log_dict(
+                {
+                    "val_loss": loss,
+                    "val_u_tot": u_tot.mean(),
+                    "val_u_ins": u_ins,
+                    "val_u_del": u_del,
+                    "val_u_sub": u_sub,
+                    "val_term2": term2,
+                }, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+            return loss
+        except Exception as e:
+            print(f'Error in validation: {e}')
+            return None
 
     def on_validation_epoch_end(self):
         if ((self.config.eval.compute_perplexity_on_sanity
@@ -426,7 +469,8 @@ class EditFlow(L.LightningModule):
 
         t = t_min * torch.ones(batch_size_per_gpu, 1, device=self.device)
 
-        x_0 = torch.full((batch_size_per_gpu, 1), 101, device=self.device).long() # todo parameterise, currently BOS token
+        x_0 = torch.full((batch_size_per_gpu, 1), 101,
+                         device=self.device).long()  # todo parameterise, currently BOS token
         # x_0 = torch.empty((batch_size_per_gpu, 0),
         #                   device=self.device).long()  # todo sample from coupling optionally given x1
 
@@ -438,7 +482,9 @@ class EditFlow(L.LightningModule):
         with tqdm(desc="Euler Sampling") as pbar:
             # while t.max() <= 1 - default_h:
             while t.max() <= 1:
-                u_t, sub_probs = self.backbone.forward(x_t, t, x_pad_mask)
+                u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
+                sub_probs = F.softmax(sub_logits, dim=-1)
+
                 lambda_ins = u_t[:, :, 0]  # Insertion rate        (n_samples, x_seq_len)
                 lambda_sub = u_t[:, :, 1]  # Substitution rate     (n_samples, x_seq_len)
                 lambda_del = u_t[:, :, 2]  # Deletion rate         (n_samples, x_seq_len)
