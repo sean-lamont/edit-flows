@@ -743,7 +743,6 @@ def get_dataloaders(config, tokenizer, skip_train=False,
             shuffle=not config.data.streaming,
             persistent_workers=True,
             collate_fn=collate_fn
-
         )
         train_loader.tokenizer = tokenizer
     if skip_valid:

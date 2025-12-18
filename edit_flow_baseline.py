@@ -68,12 +68,11 @@ def sample_zt(z_0, z_1, mask_scheduler, default_scheduler, t, V, pad_token, gap_
     return sample_p(pt)
 
 
-def poisson_make_uz_mask(
+def make_uz_mask(
         z_t: torch.Tensor,
         z_1: torch.Tensor,
         pad_token,
         gap_token,
-        vocab_size,
 ) -> torch.Tensor:
     """
     Create a mask for u_cat for indexing the output rate tensor based on differences between z_t and z_1.
@@ -81,22 +80,20 @@ def poisson_make_uz_mask(
 
     - z_t[i] = GAP_TOKEN & z_1[i] = c => u_mask[i, insert] = 1
     - z_t[i] = c & z_1[i] = GAP_TOKEN => u_mask[i, delete] = 1
-    - z_t[i] = c1 & z_1[i] = c2 => u_mask[i, substitute, c1, c2] = 1
+    - z_t[i] = c1 & z_1[i] = c2 => u_mask[i, substitute] = 1
     """
     batch_size, z_seq_len = z_t.shape
-    n_ops = vocab_size + 2  # substitute + delete + insert
 
     z_neq = (z_t != z_1) & (z_t != pad_token) & (z_1 != pad_token)
     z_ins = (z_t == gap_token) & (z_1 != gap_token) & z_neq  # (batch_size, z_seq_len)
     z_del = (z_t != gap_token) & (z_1 == gap_token) & z_neq  # (batch_size, z_seq_len)
     z_sub = z_neq & ~z_ins & ~z_del  # (batch_size, z_seq_len)
 
-    # mask (batch_size, z_seq_len, u_ops) where 1 indicates operation that bring z_t closer to z_1
-    u_mask = torch.zeros((batch_size, z_seq_len, n_ops), dtype=torch.bool, device=z_t.device)
-    # u_mask[z_ins, z_1[z_ins]] = True
-    u_mask[z_sub, z_1[z_sub]] = True
-    u_mask[:, :, -1][z_del] = True
-    u_mask[:, :, -2][z_ins] = True
+    u_mask = torch.zeros((batch_size, z_seq_len, 3), dtype=torch.bool, device=z_t.device)
+
+    u_mask[:, :, 0][z_sub] = True
+    u_mask[:, :, 1][z_ins] = True
+    u_mask[:, :, 2][z_del] = True
 
     assert z_neq.sum() == (z_ins | z_del | z_sub).sum(), "Mismatch in number of edits"
     assert z_neq.sum() == u_mask.sum(), "Mismatch in number of edits in mask"
@@ -134,7 +131,7 @@ class Perplexity(NLL):
         return torch.exp(self.mean_value / self.weight)
 
 
-class EditFlow(L.LightningModule):
+class EditFlowBaseline(L.LightningModule):
     def __init__(
             self,
             config,
@@ -161,7 +158,7 @@ class EditFlow(L.LightningModule):
 
         self.gap_token = 3  # todo hardcoded for now, use unused token or manually add one
 
-        self.backbone = models.dit_edit_flow.DITEditFlow(
+        self.backbone = models.dit_edit_flow_baseline.DITEditFlow(
             self.config, vocab_size=self.V)
 
         # generative perplexity
@@ -182,9 +179,6 @@ class EditFlow(L.LightningModule):
 
         self.fast_forward_epochs = None
         self.fast_forward_batches = None
-
-        # higher mass earlier for structure prediction, giving more time for unmasking
-        self.mask_scheduler = CubicScheduler(a=3.0, b=0.0)
 
         # linear for unmasking (matches up with log linear sigma  = linear alpha with time from t = 1 to t = 0)
         self.default_scheduler = CubicScheduler(a=1.0, b=1.0)
@@ -275,21 +269,29 @@ class EditFlow(L.LightningModule):
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = rm_gap_tokens(z_t, pad_token=self.pad_token, gap_token=self.gap_token)
 
-        u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
+        u_t, sub_logits, ins_logits = self.backbone.forward(x_t, t, x_pad_mask)
+
         u_tot = u_t.sum(dim=(1, 2))
 
-        uz_mask = poisson_make_uz_mask(z_t, z_1, vocab_size=self.V,
-                                       gap_token=self.gap_token, pad_token=self.pad_token)
+        eps = 1e-9
 
-        target_ins = uz_mask[:, :, -2]
-        target_del = uz_mask[:, :, -1]
-        target_sub = uz_mask[:, :, :-2].any(dim=-1)  # True where substitution happens
+        log_rates = torch.log(u_t + eps)
 
-        log_sum_exp_x = sub_logits.logsumexp(dim=-1)
+        lse_sub_x = sub_logits.logsumexp(dim=-1, keepdim=True) # [B, Sx, 1]
+        lse_ins_x = ins_logits.logsumexp(dim=-1, keepdim=True) # [B, Sx, 1]
 
-        log_sum_exp_z = fill_gap_tokens_with_repeats(
-            log_sum_exp_x.unsqueeze(-1), z_gap_mask, z_pad_mask
-        ).squeeze(-1)
+        packed_features_x = torch.cat([log_rates, lse_sub_x, lse_ins_x], dim=-1)
+
+        packed_features_z = fill_gap_tokens_with_repeats(
+            packed_features_x, z_gap_mask, z_pad_mask
+        )
+
+        log_rate_ins = packed_features_z[..., 0]
+        log_rate_sub = packed_features_z[..., 1]
+        log_rate_del = packed_features_z[..., 2]
+        lse_sub_z    = packed_features_z[..., 3]
+        lse_ins_z    = packed_features_z[..., 4]
+
 
         non_gap_mask = ~z_gap_mask
         x_indices = non_gap_mask.cumsum(dim=1) - 1
@@ -297,34 +299,25 @@ class EditFlow(L.LightningModule):
 
         valid_vocab_limit = sub_logits.size(-1) - 1
         safe_z1 = z_1.clamp(min=0, max=valid_vocab_limit)
-
         batch_idx = torch.arange(x_t.shape[0], device=self.device).unsqueeze(1)
 
-        target_logits_z = sub_logits[batch_idx, x_indices, safe_z1]
+        target_sub_logits = sub_logits[batch_idx, x_indices, safe_z1]
+        target_ins_logits = ins_logits[batch_idx, x_indices, safe_z1]
 
-        vocab_nll = log_sum_exp_z - target_logits_z
+        uz_mask = make_uz_mask(z_t, z_1, self.pad_token, self.gap_token)
 
-        eps = 1e-9
-        log_rates = torch.log(u_t + eps)
-        uz_log_rates = fill_gap_tokens_with_repeats(log_rates, z_gap_mask, z_pad_mask)
+        target_sub_mask = uz_mask[:, :, 0]
+        target_ins_mask = uz_mask[:, :, 1]
+        target_del_mask = uz_mask[:, :, 2]
 
-        log_rate_ins = uz_log_rates[:, :, 0]
-        log_rate_sub = uz_log_rates[:, :, 1]
-        log_rate_del = uz_log_rates[:, :, 2]
+        term_ins = (log_rate_ins + target_ins_logits - lse_ins_z) * target_ins_mask
+        term_del = (log_rate_del) * target_del_mask
+        term_sub = (log_rate_sub + target_sub_logits - lse_sub_z) * target_sub_mask
 
-        selected_log_ll = (
-                (log_rate_ins * target_ins) +
-                (log_rate_del * target_del) +
-                ((log_rate_sub - vocab_nll) * target_sub)
-        )
+        selected_log_ll = term_ins + term_del + term_sub
 
         default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps)).squeeze()
-        ins_coeff = (self.mask_scheduler.derivative(t) / (1 - self.mask_scheduler(t) + eps)).squeeze()
-        z_ins_event = (z_0 == self.gap_token) & (z_1 != self.gap_token) & (z_0 != z_1)
-        sched_coeff = torch.where(z_ins_event, ins_coeff.unsqueeze(-1), default_coeff.unsqueeze(-1))
-
-
-        term2 = (selected_log_ll * sched_coeff).sum(dim=1)
+        term2 = (selected_log_ll * default_coeff).sum(dim=1)
         loss = u_tot - term2
 
         u_ins = u_t[:, :, 0].sum(dim=1).mean()
@@ -333,141 +326,74 @@ class EditFlow(L.LightningModule):
 
         return loss.mean(), u_tot, u_ins, u_del, u_sub, term2.mean()
 
-
     def sample_zt_sparse(self, z_0, z_1, t):
         """
-        Samples z_t efficiently.
-        Now includes "Mask Corruption":
-        When the model decides to 'Mask' (choice=1), 15% of the time it inserts
-        a Random Token instead, teaching the model to recover from garbage.
+        Samples z_t for Standard Edit Flows.
+        1. Interpolates directly between z_0 and z_1 using the default scheduler.
+        2. Injects 15% random noise into valid tokens.
+           (Falls back to original token if random generation hits Pad/Gap).
         """
-        # 1. Calculate Weights for the 3 choices: z_0, z_1, or Mask
-        t = t.reshape(-1, 1) # [Batch, 1]
-        mask_t = self.mask_scheduler(t)
-        default_t = self.default_scheduler(t)
-
-        # Probabilities for mixing
-        # Case A: Insertion Gap (z_0=Gap, z_1!=Gap)
-        w_z0_ins = 1 - mask_t
-        w_mask_ins = mask_t * (1 - default_t)
-        w_z1_ins = mask_t * default_t
-
-        # Case B: Standard (Sub/Del/Identity)
-        w_z0_std = 1 - default_t
-        w_mask_std = torch.zeros_like(default_t)
-        w_z1_std = default_t
-
-        # 2. Broadcast weights
-        z_neq = (z_0 != z_1) & (z_0 != self.pad_token) & (z_1 != self.pad_token)
-        is_ins = (z_0 == self.gap_token) & (z_1 != self.gap_token) & z_neq
+        t = t.reshape(-1, 1)
+        probs_z1 = self.default_scheduler(t)
 
         B, L = z_0.shape
-        w_z0 = torch.where(is_ins, w_z0_ins, w_z0_std).expand(B, L)
-        w_mask = torch.where(is_ins, w_mask_ins, w_mask_std).expand(B, L)
-        w_z1 = torch.where(is_ins, w_z1_ins, w_z1_std).expand(B, L)
+        probs_z1 = probs_z1.expand(B, L)
 
-        # 3. Sample from Categorical(3)
-        probs = torch.stack([w_z0, w_mask, w_z1], dim=-1)
-        flat_probs = probs.view(-1, 3)
-        choices = torch.multinomial(flat_probs, 1).view(B, L)
+        use_z1 = torch.rand(B, L, device=self.device) < probs_z1
+        z_t = torch.where(use_z1, z_1, z_0)
 
-        # --- NEW: Random Noise Injection in Mask Slots ---
+        is_valid_token = (z_t != self.gap_token) & (z_t != self.pad_token)
 
-        # A. Generate Random Tokens (Full Batch)
-        # We start with random ints over the full vocab
-        random_tokens = torch.randint(0, self.V, z_0.shape, device=self.device)
-
-        # B. Enforce "No Pad / No Gap"
-        # Instead of a slow loop, we just check collisions and shift them to mask
-        # This is extremely fast on GPU.
-        safe_fallback = torch.tensor(self.mask_token, device=self.device)
-        invalid_mask = (random_tokens == self.pad_token) | (random_tokens == self.gap_token)
-        random_tokens = torch.where(invalid_mask, safe_fallback, random_tokens)
-
-        # C. Decide: Mask vs Random?
-        # "85% masks, the rest random" -> 15% random
         noise_prob = 0.15
-        use_random = torch.rand_like(z_0, dtype=torch.float) < noise_prob
+        noise_mask = (torch.rand_like(z_t, dtype=torch.float) < noise_prob) & is_valid_token
 
-        # Construct the "Middle Option" (Choice 1)
-        # If use_random is True, pick the noise. Otherwise, pick the actual Mask Token.
-        mask_or_noise = torch.where(use_random,
-                                    random_tokens,
-                                    torch.tensor(self.mask_token, device=self.device))
+        if noise_mask.any():
+            random_tokens = torch.randint(0, self.V, z_t.shape, device=self.device)
 
-        # -------------------------------------------------
+            invalid_random = (random_tokens == self.pad_token) | (random_tokens == self.gap_token)
+            random_tokens = torch.where(invalid_random, z_t, random_tokens)
 
-        # 4. Final Construct Result
-        # Choice 0 -> z_0
-        # Choice 1 -> mask_or_noise (Now includes random substitutions)
-        # Choice 2 -> z_1
-        z_t = torch.where(choices == 0, z_0,
-                          torch.where(choices == 1, mask_or_noise,
-                                      z_1))
+            z_t = torch.where(noise_mask, random_tokens, z_t)
 
         return z_t
-    # def sample_zt_sparse(self, z_0, z_1, t):
-    #     """
-    #     Samples z_t without expanding full vocabulary distributions.
-    #     """
-    #     t = t.reshape(-1, 1)  # [Batch, 1]
-    #     mask_t = self.mask_scheduler(t)
-    #     default_t = self.default_scheduler(t)
-    #
-    #     w_z0_ins = 1 - mask_t
-    #     w_mask_ins = mask_t * (1 - default_t)
-    #     w_z1_ins = mask_t * default_t
-    #
-    #     w_z0_std = 1 - default_t
-    #     w_mask_std = torch.zeros_like(default_t)
-    #     w_z1_std = default_t
-    #
-    #     z_neq = (z_0 != z_1) & (z_0 != self.pad_token) & (z_1 != self.pad_token)
-    #     is_ins = (z_0 == self.gap_token) & (z_1 != self.gap_token) & z_neq
-    #
-    #     B, L = z_0.shape
-    #     w_z0 = torch.where(is_ins, w_z0_ins, w_z0_std).expand(B, L)
-    #     w_mask = torch.where(is_ins, w_mask_ins, w_mask_std).expand(B, L)
-    #     w_z1 = torch.where(is_ins, w_z1_ins, w_z1_std).expand(B, L)
-    #
-    #     probs = torch.stack([w_z0, w_mask, w_z1], dim=-1)
-    #     flat_probs = probs.view(-1, 3)
-    #     choices = torch.multinomial(flat_probs, 1).view(B, L)
-    #
-    #     z_t = torch.where(choices == 0, z_0,
-    #                       torch.where(choices == 1, torch.tensor(self.mask_token, device=self.device),
-    #                                   z_1))
-    #
-    #     return z_t
+
 
     def training_step(self, batch, batch_idx):
-        loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
-        self.log_dict(
-            {
-                "train_loss": loss,
-                "train_u_tot": u_tot.mean(),
-                "train_u_ins": u_ins,
-                "train_u_del": u_del,
-                "train_u_sub": u_sub,
-                "train_term2": term2,
-            }, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
-        return loss
+        try:
+            loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
+            self.log_dict(
+                {
+                    "train_loss": loss,
+                    "train_u_tot": u_tot.mean(),
+                    "train_u_ins": u_ins,
+                    "train_u_del": u_del,
+                    "train_u_sub": u_sub,
+                    "train_term2": term2,
+                }, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
+            return loss
+        except Exception as e:
+            print(f'Error in training: {e}')
+            return None
 
     def on_validation_epoch_start(self):
         self.backbone.eval()
 
     def validation_step(self, batch, batch_idx):
-        loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
-        self.log_dict(
-            {
-                "val_loss": loss,
-                "val_u_tot": u_tot.mean(),
-                "val_u_ins": u_ins,
-                "val_u_del": u_del,
-                "val_u_sub": u_sub,
-                "val_term2": term2,
-            }, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
-        return loss
+        try:
+            loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
+            self.log_dict(
+                {
+                    "val_loss": loss,
+                    "val_u_tot": u_tot.mean(),
+                    "val_u_ins": u_ins,
+                    "val_u_del": u_del,
+                    "val_u_sub": u_sub,
+                    "val_term2": term2,
+                }, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+            return loss
+        except Exception as e:
+            print(f'Error in validation: {e}')
+            return None
 
     def on_validation_epoch_end(self):
         if ((self.config.eval.compute_perplexity_on_sanity
@@ -537,6 +463,7 @@ class EditFlow(L.LightningModule):
 
         x_0 = torch.full((batch_size_per_gpu, 1), 101,
                          device=self.device).long()  # todo parameterise, currently BOS token
+
         # x_0 = torch.empty((batch_size_per_gpu, 0),
         #                   device=self.device).long()  # todo sample from coupling optionally given x1
 
@@ -546,30 +473,21 @@ class EditFlow(L.LightningModule):
         # x_ts = [x_t.clone()]
 
         with tqdm(desc="Euler Sampling") as pbar:
-            # while t.max() <= 1 - default_h:
             while t.max() <= 1:
-                u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
+                u_t, sub_logits, ins_logits = self.backbone.forward(x_t, t, x_pad_mask)
+
                 sub_probs = F.softmax(sub_logits, dim=-1)
+                ins_probs = F.softmax(ins_logits, dim=-1)
 
-                lambda_ins = u_t[:, :, 0]  # Insertion rate        (n_samples, x_seq_len)
-                lambda_sub = u_t[:, :, 1]  # Substitution rate     (n_samples, x_seq_len)
-                lambda_del = u_t[:, :, 2]  # Deletion rate         (n_samples, x_seq_len)
+                lambda_ins = u_t[:, :, 0]
+                lambda_sub = u_t[:, :, 1]
+                lambda_del = u_t[:, :, 2]
 
-                # print(f"Lambda Stats: t = {t.mean().item():.4f}, Min={lambda_ins.min().item():.4f}, Max={lambda_ins.max().item():.4f}, Mean: {lambda_ins.mean().item()}")
-
-                # print (f'lam_shape: {lambda_ins[0].shape}')
-                # print (f'x_shape: {x_t.shape}')
-
-                # print (f'num_valid_tokens: {valid_token_mask.sum(dim=1)}')
-                valid_token_mask = (~x_pad_mask).float()
-                lambda_ins = lambda_ins * valid_token_mask
-
-                # adapt_h = get_adaptive_h(default_h, t, scheduler)
                 adapt_h = default_h
 
-                ins_vals = torch.poisson(adapt_h * lambda_ins).long()
-                # ins_vals = torch.poisson(get_analytic_mean(lambda_ins, t, adapt_h)).long()
-
+                # Sample insertions and deletion/substitutions based on rates
+                ins_mask = torch.rand(
+                    size=lambda_ins.shape, device=lambda_ins.device) < 1 - torch.exp(-adapt_h * lambda_ins)
                 del_sub_mask = torch.rand(
                     size=lambda_sub.shape, device=lambda_sub.device
                 ) < 1 - torch.exp(-adapt_h * (lambda_sub + lambda_del))
@@ -577,34 +495,32 @@ class EditFlow(L.LightningModule):
                 # For deletion/substitution, sample based on the relative rates
                 prob_del = torch.where(
                     del_sub_mask, lambda_del / (lambda_sub + lambda_del), torch.zeros_like(lambda_del))
-
                 del_mask = torch.bernoulli(prob_del).bool()
-
                 sub_mask = del_sub_mask & ~del_mask
-
                 assert sub_mask.sum() + del_mask.sum() == del_sub_mask.sum()
 
                 # Only sample tokens for non-pad positions, fill pad positions with PAD_TOKEN
-                sub_tokens = torch.full(sub_probs.shape[:2], self.pad_token, dtype=torch.long, device=self.device)
-
+                ins_tokens = torch.full(ins_probs.shape[:2], self.pad_token, dtype=torch.long)
+                sub_tokens = torch.full(sub_probs.shape[:2], self.pad_tokeself.pad, dtype=torch.long)
                 non_pad_mask = ~x_pad_mask
 
                 if non_pad_mask.any():
-                    sub_sampled = torch.multinomial(sub_probs[non_pad_mask], num_samples=1, replacement=True).squeeze(
-                        -1)
+                    ins_sampled = torch.multinomial(ins_probs[non_pad_mask].cpu(), num_samples=1, replacement=True).squeeze(-1)
+                    sub_sampled = torch.multinomial(sub_probs[non_pad_mask].cpu(), num_samples=1, replacement=True).squeeze(-1)
+                    ins_tokens[non_pad_mask] = ins_sampled
                     sub_tokens[non_pad_mask] = sub_sampled
 
                 # Apply operations based on masks
                 x_t[sub_mask] = sub_tokens[sub_mask]
-
-                x_t = poisson_apply_ins_del_operations(
+                x_t = apply_ins_del_operations(
                     x_t,
-                    ins_vals,
+                    ins_mask,
                     del_mask,
+                    ins_tokens,
                     max_seq_len=self.config.model.length,
                     pad_token=self.pad_token,
-                    mask_token=self.mask_token
                 )
+
                 x_pad_mask = (x_t == self.pad_token)  # Update padding mask after operations
 
                 t = t + adapt_h
@@ -723,14 +639,13 @@ class EditFlow(L.LightningModule):
                 self.gen_ppl_metric.update(
                     nlls, first_eos[..., 1:] + token_mask[..., 1:])
 
-
-def poisson_apply_ins_del_operations(
+def apply_ins_del_operations(
         x_t: torch.Tensor,
-        ins_vals: torch.Tensor,
+        ins_mask: torch.Tensor,
         del_mask: torch.Tensor,
-        pad_token,
+        ins_tokens,
         max_seq_len,
-        mask_token
+        pad_token,
 ) -> torch.Tensor:
     """
     Apply insertion and deletion operations to a sequence x_t based on the provided masks.
@@ -738,23 +653,19 @@ def poisson_apply_ins_del_operations(
     batch_size, seq_len = x_t.shape
     device = x_t.device
 
-    # Handle simultaneous ins+del as substituting a mask
-    replace_mask = (ins_vals > 0) & del_mask
+    # Handle simultaneous ins+del as substitutions
+    replace_mask = ins_mask & del_mask
     x_t_modified = x_t.clone()
-    x_t_modified[replace_mask] = mask_token
-    # subtract 1 from inserts
-    ins_vals[replace_mask] -= 1
+    x_t_modified[replace_mask] = ins_tokens[replace_mask]
 
     # Update ins/del masks after handling replacements
-    # eff_ins_mask = ins_mask & ~replace_mask
-    del_mask = del_mask & ~replace_mask
+    eff_ins_mask = ins_mask & ~replace_mask
+    eff_del_mask = del_mask & ~replace_mask
 
     # Compute new lengths after applying ins/del operations
     xt_pad_mask = (x_t == pad_token)  # (batch_size, seq_len)
     xt_seq_lens = (~xt_pad_mask).sum(dim=1)  # (batch_size,)
-
-    new_lengths = xt_seq_lens + ins_vals.sum(dim=1) - del_mask.sum(dim=1)
-
+    new_lengths = xt_seq_lens + eff_ins_mask.sum(dim=1) - eff_del_mask.sum(dim=1)
     max_new_len = int(new_lengths.max().item())
 
     if max_new_len <= 0:
@@ -767,57 +678,23 @@ def poisson_apply_ins_del_operations(
     # Compute positions
     batch_idx = torch.arange(batch_size, device=device).unsqueeze(1)  # (batch_size, 1)
     pos_idx = torch.arange(seq_len, device=device).unsqueeze(0)  # (1, seq_len)
-
-    cum_del = torch.cumsum(del_mask, dim=1)  # num del up to & incl. current pos
-
-    cum_ins = torch.cumsum(ins_vals, dim=1)  # num ins up to & incl. current pos
-
+    cum_del = torch.cumsum(eff_del_mask.float(), dim=1)  # num del up to & incl. current pos
+    cum_ins = torch.cumsum(eff_ins_mask.float(), dim=1)  # num ins up to & incl. current pos
     cum_ins_before = F.pad(cum_ins[:, :-1], (1, 0), value=0)  # num ins before current pos
 
     # Place non-deleted tokens
     new_pos = pos_idx + cum_ins_before - cum_del  # new pos of tokens shifted by ins/del
-
-    keep_mask = ~del_mask & (new_pos >= 0) & (new_pos < max_new_len)  # tokens to keep (non-deleted)
-
+    keep_mask = ~eff_del_mask & (new_pos >= 0) & (new_pos < max_new_len)  # tokens to keep (non-deleted)
     if keep_mask.any():
         x_new[batch_idx.expand(-1, seq_len)[keep_mask], new_pos[keep_mask].long()] = x_t_modified[keep_mask]
 
     # Place insertions
-    if (ins_vals > 0).any():
-        # Vectorized approach to handle multiple insertions per position
-        # 1. Find all locations that need insertions
-        ins_b, ins_p = (ins_vals > 0).nonzero(as_tuple=True)
+    if eff_ins_mask.any():
+        ins_pos = new_pos + 1  # insertions go 1 after new shifted pos
+        ins_valid = eff_ins_mask & (ins_pos >= 0) & (ins_pos < max_new_len)  # tokens to insert
+        if ins_valid.any():
+            x_new[batch_idx.expand(-1, seq_len)[ins_valid], ins_pos[ins_valid].long()] = ins_tokens[ins_valid]
 
-        # 2. Get the number of insertions and base positions for these locations
-        num_insertions_at_loc = ins_vals[ins_b, ins_p].long()
-        base_positions = new_pos[ins_b, ins_p]
-
-        # 3. Repeat batch indices and base positions for each insertion
-        total_insertions = num_insertions_at_loc.sum()
-        if total_insertions > 0:
-            repeated_batch_indices = ins_b.repeat_interleave(num_insertions_at_loc)
-            repeated_base_pos = base_positions.repeat_interleave(num_insertions_at_loc)
-
-            flat_indices = torch.arange(total_insertions, device=device)
-
-            # Find start index of each group in the flat array
-            group_starts = torch.cat([
-                torch.tensor([0], device=device),
-                num_insertions_at_loc.cumsum(dim=0)[:-1]
-            ])
-
-            # Map every element to its group's start index
-            repeated_starts = group_starts.repeat_interleave(num_insertions_at_loc)
-
-            # Subtract start from current to get 1-based offset
-            offsets = flat_indices - repeated_starts + 1
-
-            # 5. Calculate final insertion positions
-            final_ins_pos = repeated_base_pos + offsets
-            # -----------------------------------
-
-            valid_mask = (final_ins_pos >= 0) & (final_ins_pos < max_new_len)
-            x_new[repeated_batch_indices[valid_mask], final_ins_pos[valid_mask]] = mask_token
     if max_new_len > max_seq_len:
         print(f"Warning: max_new_len {max_new_len} exceeds max_seq_len {max_seq_len}, truncating.")
         max_new_len = max_seq_len
