@@ -84,7 +84,7 @@ def poisson_make_uz_mask(
     - z_t[i] = c1 & z_1[i] = c2 => u_mask[i, substitute, c1, c2] = 1
     """
     batch_size, z_seq_len = z_t.shape
-    n_ops = vocab_size + 2  # substitute + delete + insert
+    # n_ops = vocab_size + 2  # substitute + delete + insert
 
     z_neq = (z_t != z_1) & (z_t != pad_token) & (z_1 != pad_token)
     z_ins = (z_t == gap_token) & (z_1 != gap_token) & z_neq  # (batch_size, z_seq_len)
@@ -92,11 +92,15 @@ def poisson_make_uz_mask(
     z_sub = z_neq & ~z_ins & ~z_del  # (batch_size, z_seq_len)
 
     # mask (batch_size, z_seq_len, u_ops) where 1 indicates operation that bring z_t closer to z_1
-    u_mask = torch.zeros((batch_size, z_seq_len, n_ops), dtype=torch.bool, device=z_t.device)
+    # u_mask = torch.zeros((batch_size, z_seq_len, n_ops), dtype=torch.bool, device=z_t.device)
+    u_mask = torch.zeros((batch_size, z_seq_len, 3), dtype=torch.bool, device=z_t.device)
+
     # u_mask[z_ins, z_1[z_ins]] = True
-    u_mask[z_sub, z_1[z_sub]] = True
-    u_mask[:, :, -1][z_del] = True
-    u_mask[:, :, -2][z_ins] = True
+    # u_mask[z_sub, z_1[z_sub]] = True
+
+    u_mask[:, :, 0][z_sub] = True
+    u_mask[:, :, 1][z_ins] = True
+    u_mask[:, :, 2][z_del] = True
 
     assert z_neq.sum() == (z_ins | z_del | z_sub).sum(), "Mismatch in number of edits"
     assert z_neq.sum() == u_mask.sum(), "Mismatch in number of edits in mask"
@@ -248,6 +252,8 @@ class EditFlow(L.LightningModule):
                     'epoch': self.fast_forward_epochs,
                     'counter': (self.fast_forward_batches
                                 * self.config.loader.batch_size)})
+
+
             updated_dls.append(
                 torch.utils.data.DataLoader(
                     dl.dataset,
@@ -256,7 +262,10 @@ class EditFlow(L.LightningModule):
                     pin_memory=self.config.loader.pin_memory,
                     sampler=dl_sampler,
                     shuffle=False,
-                    persistent_workers=True))
+                    persistent_workers=True,
+                    collate_fn=dl.collate_fn
+                ))
+
         self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
     def forward(self, x, sigma):  # sigma is just t for our case
@@ -281,9 +290,13 @@ class EditFlow(L.LightningModule):
         uz_mask = poisson_make_uz_mask(z_t, z_1, vocab_size=self.V,
                                        gap_token=self.gap_token, pad_token=self.pad_token)
 
-        target_ins = uz_mask[:, :, -2]
-        target_del = uz_mask[:, :, -1]
-        target_sub = uz_mask[:, :, :-2].any(dim=-1)  # True where substitution happens
+        target_sub = uz_mask[:, :, 0]
+        target_ins = uz_mask[:, :, 1]
+        target_del = uz_mask[:, :, 2]
+
+        # target_ins = uz_mask[:, :, -2]
+        # target_del = uz_mask[:, :, -1]
+        # target_sub = uz_mask[:, :, :-2].any(dim=-1)  # True where substitution happens
 
         log_sum_exp_x = sub_logits.logsumexp(dim=-1)
 
