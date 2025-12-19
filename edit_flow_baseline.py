@@ -316,8 +316,10 @@ class EditFlowBaseline(L.LightningModule):
 
         selected_log_ll = term_ins + term_del + term_sub
 
-        default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps)).squeeze()
+        default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))#.squeeze()
+
         term2 = (selected_log_ll * default_coeff).sum(dim=1)
+
         loss = u_tot - term2
 
         u_ins = u_t[:, :, 0].sum(dim=1).mean()
@@ -359,41 +361,33 @@ class EditFlowBaseline(L.LightningModule):
 
 
     def training_step(self, batch, batch_idx):
-        try:
-            loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
-            self.log_dict(
-                {
-                    "train_loss": loss,
-                    "train_u_tot": u_tot.mean(),
-                    "train_u_ins": u_ins,
-                    "train_u_del": u_del,
-                    "train_u_sub": u_sub,
-                    "train_term2": term2,
-                }, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
-            return loss
-        except Exception as e:
-            print(f'Error in training: {e}')
-            return None
+        loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
+        self.log_dict(
+            {
+                "train_loss": loss,
+                "train_u_tot": u_tot.mean(),
+                "train_u_ins": u_ins,
+                "train_u_del": u_del,
+                "train_u_sub": u_sub,
+                "train_term2": term2,
+            }, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
+        return loss
 
     def on_validation_epoch_start(self):
         self.backbone.eval()
 
     def validation_step(self, batch, batch_idx):
-        try:
-            loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
-            self.log_dict(
-                {
-                    "val_loss": loss,
-                    "val_u_tot": u_tot.mean(),
-                    "val_u_ins": u_ins,
-                    "val_u_del": u_del,
-                    "val_u_sub": u_sub,
-                    "val_term2": term2,
-                }, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
-            return loss
-        except Exception as e:
-            print(f'Error in validation: {e}')
-            return None
+        loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
+        self.log_dict(
+            {
+                "val_loss": loss,
+                "val_u_tot": u_tot.mean(),
+                "val_u_ins": u_ins,
+                "val_u_del": u_del,
+                "val_u_sub": u_sub,
+                "val_term2": term2,
+            }, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        return loss
 
     def on_validation_epoch_end(self):
         if ((self.config.eval.compute_perplexity_on_sanity
@@ -500,13 +494,14 @@ class EditFlowBaseline(L.LightningModule):
                 assert sub_mask.sum() + del_mask.sum() == del_sub_mask.sum()
 
                 # Only sample tokens for non-pad positions, fill pad positions with PAD_TOKEN
-                ins_tokens = torch.full(ins_probs.shape[:2], self.pad_token, dtype=torch.long)
-                sub_tokens = torch.full(sub_probs.shape[:2], self.pad_tokeself.pad, dtype=torch.long)
+                ins_tokens = torch.full(ins_probs.shape[:2], self.pad_token, dtype=torch.long, device=self.device)
+                sub_tokens = torch.full(sub_probs.shape[:2], self.pad_token, dtype=torch.long, device=self.device)
+
                 non_pad_mask = ~x_pad_mask
 
                 if non_pad_mask.any():
-                    ins_sampled = torch.multinomial(ins_probs[non_pad_mask].cpu(), num_samples=1, replacement=True).squeeze(-1)
-                    sub_sampled = torch.multinomial(sub_probs[non_pad_mask].cpu(), num_samples=1, replacement=True).squeeze(-1)
+                    ins_sampled = torch.multinomial(ins_probs[non_pad_mask], num_samples=1, replacement=True).squeeze(-1)
+                    sub_sampled = torch.multinomial(sub_probs[non_pad_mask], num_samples=1, replacement=True).squeeze(-1)
                     ins_tokens[non_pad_mask] = ins_sampled
                     sub_tokens[non_pad_mask] = sub_sampled
 

@@ -61,7 +61,7 @@ wandb:
 #  notes: Mulan for text
   group: null
   job_type: null
-  offline: true
+#  offline: true
   name: edit_flow_baseline
 #  id: agzyw4ns
   tags:
