@@ -294,10 +294,6 @@ class EditFlow(L.LightningModule):
         target_ins = uz_mask[:, :, 1]
         target_del = uz_mask[:, :, 2]
 
-        # target_ins = uz_mask[:, :, -2]
-        # target_del = uz_mask[:, :, -1]
-        # target_sub = uz_mask[:, :, :-2].any(dim=-1)  # True where substitution happens
-
         log_sum_exp_x = sub_logits.logsumexp(dim=-1)
 
         log_sum_exp_z = fill_gap_tokens_with_repeats(
@@ -348,29 +344,18 @@ class EditFlow(L.LightningModule):
 
 
     def sample_zt_sparse(self, z_0, z_1, t):
-        """
-        Samples z_t efficiently.
-        Now includes "Mask Corruption":
-        When the model decides to 'Mask' (choice=1), 15% of the time it inserts
-        a Random Token instead, teaching the model to recover from garbage.
-        """
-        # 1. Calculate Weights for the 3 choices: z_0, z_1, or Mask
         t = t.reshape(-1, 1) # [Batch, 1]
         mask_t = self.mask_scheduler(t)
         default_t = self.default_scheduler(t)
 
-        # Probabilities for mixing
-        # Case A: Insertion Gap (z_0=Gap, z_1!=Gap)
         w_z0_ins = 1 - mask_t
         w_mask_ins = mask_t * (1 - default_t)
         w_z1_ins = mask_t * default_t
 
-        # Case B: Standard (Sub/Del/Identity)
         w_z0_std = 1 - default_t
         w_mask_std = torch.zeros_like(default_t)
         w_z1_std = default_t
 
-        # 2. Broadcast weights
         z_neq = (z_0 != z_1) & (z_0 != self.pad_token) & (z_1 != self.pad_token)
         is_ins = (z_0 == self.gap_token) & (z_1 != self.gap_token) & z_neq
 
@@ -379,79 +364,28 @@ class EditFlow(L.LightningModule):
         w_mask = torch.where(is_ins, w_mask_ins, w_mask_std).expand(B, L)
         w_z1 = torch.where(is_ins, w_z1_ins, w_z1_std).expand(B, L)
 
-        # 3. Sample from Categorical(3)
         probs = torch.stack([w_z0, w_mask, w_z1], dim=-1)
         flat_probs = probs.view(-1, 3)
         choices = torch.multinomial(flat_probs, 1).view(B, L)
 
-        # --- NEW: Random Noise Injection in Mask Slots ---
-
-        # A. Generate Random Tokens (Full Batch)
-        # We start with random ints over the full vocab
         random_tokens = torch.randint(0, self.V, z_0.shape, device=self.device)
 
-        # B. Enforce "No Pad / No Gap"
-        # Instead of a slow loop, we just check collisions and shift them to mask
-        # This is extremely fast on GPU.
         safe_fallback = torch.tensor(self.mask_token, device=self.device)
         invalid_mask = (random_tokens == self.pad_token) | (random_tokens == self.gap_token)
         random_tokens = torch.where(invalid_mask, safe_fallback, random_tokens)
 
-        # C. Decide: Mask vs Random?
-        # "85% masks, the rest random" -> 15% random
         noise_prob = 0.15
         use_random = torch.rand_like(z_0, dtype=torch.float) < noise_prob
 
-        # Construct the "Middle Option" (Choice 1)
-        # If use_random is True, pick the noise. Otherwise, pick the actual Mask Token.
         mask_or_noise = torch.where(use_random,
                                     random_tokens,
                                     torch.tensor(self.mask_token, device=self.device))
 
-        # -------------------------------------------------
-
-        # 4. Final Construct Result
-        # Choice 0 -> z_0
-        # Choice 1 -> mask_or_noise (Now includes random substitutions)
-        # Choice 2 -> z_1
         z_t = torch.where(choices == 0, z_0,
                           torch.where(choices == 1, mask_or_noise,
                                       z_1))
 
         return z_t
-    # def sample_zt_sparse(self, z_0, z_1, t):
-    #     """
-    #     Samples z_t without expanding full vocabulary distributions.
-    #     """
-    #     t = t.reshape(-1, 1)  # [Batch, 1]
-    #     mask_t = self.mask_scheduler(t)
-    #     default_t = self.default_scheduler(t)
-    #
-    #     w_z0_ins = 1 - mask_t
-    #     w_mask_ins = mask_t * (1 - default_t)
-    #     w_z1_ins = mask_t * default_t
-    #
-    #     w_z0_std = 1 - default_t
-    #     w_mask_std = torch.zeros_like(default_t)
-    #     w_z1_std = default_t
-    #
-    #     z_neq = (z_0 != z_1) & (z_0 != self.pad_token) & (z_1 != self.pad_token)
-    #     is_ins = (z_0 == self.gap_token) & (z_1 != self.gap_token) & z_neq
-    #
-    #     B, L = z_0.shape
-    #     w_z0 = torch.where(is_ins, w_z0_ins, w_z0_std).expand(B, L)
-    #     w_mask = torch.where(is_ins, w_mask_ins, w_mask_std).expand(B, L)
-    #     w_z1 = torch.where(is_ins, w_z1_ins, w_z1_std).expand(B, L)
-    #
-    #     probs = torch.stack([w_z0, w_mask, w_z1], dim=-1)
-    #     flat_probs = probs.view(-1, 3)
-    #     choices = torch.multinomial(flat_probs, 1).view(B, L)
-    #
-    #     z_t = torch.where(choices == 0, z_0,
-    #                       torch.where(choices == 1, torch.tensor(self.mask_token, device=self.device),
-    #                                   z_1))
-    #
-    #     return z_t
 
     def training_step(self, batch, batch_idx):
         loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
@@ -575,7 +509,10 @@ class EditFlow(L.LightningModule):
 
                 # print (f'num_valid_tokens: {valid_token_mask.sum(dim=1)}')
                 valid_token_mask = (~x_pad_mask).float()
+
                 lambda_ins = lambda_ins * valid_token_mask
+                lambda_sub = lambda_sub * valid_token_mask
+                lambda_del = lambda_del * valid_token_mask
 
                 # adapt_h = get_adaptive_h(default_h, t, scheduler)
                 adapt_h = default_h

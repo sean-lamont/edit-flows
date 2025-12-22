@@ -63,7 +63,6 @@ wandb:
   job_type: null
 #  offline: true
   name: poisson_with_dels
-  id: agzyw4ns
   tags:
     - ${data.train}
     - ${data.valid}
@@ -77,9 +76,7 @@ hydra:
 
 checkpointing:
   # Use custom `save_dir` if, e.g., saving to S3 bucket, otherwise leave this parameter as is
-  save_dir: /home/sean/edit-flows/outputs/lm1b/2025.12.17/171818
-  #  save_dir: /home/sean/edit-flows/outputs/lm1b/2025.12.17/110724
-#  save_dir: ${cwd:}
+  save_dir: ${cwd:}
   # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt

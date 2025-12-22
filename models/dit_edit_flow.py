@@ -351,7 +351,8 @@ class DITEditFlow(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         self.rate_layer = nn.Sequential(
             nn.Linear(config.model.hidden_size, config.model.hidden_size),
             nn.SiLU(),
-            nn.Linear(config.model.hidden_size, 3),  # Output 3 rates (insert, substitute, delete) as in original Edit Flows
+            nn.Linear(config.model.hidden_size, 3),
+            # Output 3 rates (insert, substitute, delete) as in original Edit Flows
         )
 
         self.output_layer = DDitFinalLayer(
@@ -378,20 +379,10 @@ class DITEditFlow(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             for i in range(len(self.blocks)):
                 x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
 
+            sub_logits = self.output_layer(x, c)  # bsz, seq_len, vocab
 
-
-            sub_logits = self.output_layer(x, c) # bsz, seq_len, vocab
-
-            rates = F.softplus(torch.clamp(self.rate_layer(x), max=1e6))  # (batch_size, x_seq_len, 3) - ensure positive rates
-
-
-            # sub_probs = F.softmax(sub_logits, dim=-1)  # (batch_size, x_seq_len, vocab_size)
-
-            # # Zero out outputs for padded positions
-            # mask_expanded = (~attention_mask).unsqueeze(-1).float()  # (batch_size, x_seq_len, 1)
-            # rates = rates * mask_expanded
-            # sub_probs = sub_probs * mask_expanded
-
+            rates = F.softplus(
+                torch.clamp(self.rate_layer(x), max=1e6))  # (batch_size, x_seq_len, 3) - ensure positive rates
 
             if attention_mask is not None:
                 mask_expanded = attention_mask.unsqueeze(-1).bool()

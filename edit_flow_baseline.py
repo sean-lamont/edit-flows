@@ -475,9 +475,11 @@ class EditFlowBaseline(L.LightningModule):
                 sub_probs = F.softmax(sub_logits, dim=-1)
                 ins_probs = F.softmax(ins_logits, dim=-1)
 
-                lambda_ins = u_t[:, :, 0]
-                lambda_sub = u_t[:, :, 1]
-                lambda_del = u_t[:, :, 2]
+                valid_token_mask = (~x_pad_mask).float()
+
+                lambda_ins = u_t[:, :, 0] * valid_token_mask
+                lambda_sub = u_t[:, :, 1] * valid_token_mask
+                lambda_del = u_t[:, :, 2] * valid_token_mask
 
                 adapt_h = default_h
 
