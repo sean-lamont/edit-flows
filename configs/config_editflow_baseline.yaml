@@ -63,7 +63,7 @@ wandb:
   job_type: null
 #  offline: true
   name: edit_flow_baseline
-#  id: agzyw4ns
+  id: cs6o8cg5
   tags:
     - ${data.train}
     - ${data.valid}

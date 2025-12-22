@@ -250,7 +250,9 @@ class EditFlowBaseline(L.LightningModule):
                     pin_memory=self.config.loader.pin_memory,
                     sampler=dl_sampler,
                     shuffle=False,
-                    persistent_workers=True))
+                    persistent_workers=True,
+                    collate_fn=dl.collate_fn
+                ))
         self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
     def forward(self, x, sigma):  # sigma is just t for our case
