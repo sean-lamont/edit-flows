@@ -253,7 +253,6 @@ class EditFlow(L.LightningModule):
                     'counter': (self.fast_forward_batches
                                 * self.config.loader.batch_size)})
 
-
             updated_dls.append(
                 torch.utils.data.DataLoader(
                     dl.dataset,
@@ -327,11 +326,20 @@ class EditFlow(L.LightningModule):
                 ((log_rate_sub - vocab_nll) * target_sub)
         )
 
-        default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps)).squeeze()
-        ins_coeff = (self.mask_scheduler.derivative(t) / (1 - self.mask_scheduler(t) + eps)).squeeze()
-        z_ins_event = (z_0 == self.gap_token) & (z_1 != self.gap_token) & (z_0 != z_1)
-        sched_coeff = torch.where(z_ins_event, ins_coeff.unsqueeze(-1), default_coeff.unsqueeze(-1))
+        mask_sub_coeff = (self.mask_scheduler.derivative(t) * self.default_scheduler(t)
+                          + self.mask_scheduler(t) * self.default_scheduler.derivative(t)) / (
+                                 self.mask_scheduler(t) * (1 - self.default_scheduler(t)) + eps)
 
+        mask_ids = (z_t == self.mask_token) & (z_1 != self.mask_token) & (z_0 != self.mask_token) & (z_1 != z_0)
+
+        default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))
+        ins_coeff = (self.mask_scheduler.derivative(t) / (1 - self.mask_scheduler(t) + eps))
+
+        z_ins_event = (z_0 == self.gap_token) & (z_1 != self.gap_token) & (z_0 != z_1)
+
+        sched_coeff = torch.where(z_ins_event, ins_coeff, default_coeff)
+
+        sched_coeff = torch.where(mask_ids, mask_sub_coeff, sched_coeff)
 
         term2 = (selected_log_ll * sched_coeff).sum(dim=1)
         loss = u_tot - term2
@@ -342,9 +350,8 @@ class EditFlow(L.LightningModule):
 
         return loss.mean(), u_tot, u_ins, u_del, u_sub, term2.mean()
 
-
     def sample_zt_sparse(self, z_0, z_1, t):
-        t = t.reshape(-1, 1) # [Batch, 1]
+        t = t.reshape(-1, 1)  # [Batch, 1]
         mask_t = self.mask_scheduler(t)
         default_t = self.default_scheduler(t)
 
