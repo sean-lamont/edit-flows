@@ -1,28 +1,13 @@
 import torch
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
 from tqdm import tqdm
 
-from edit_flow import EditFlow, poisson_make_uz_mask, fill_gap_tokens_with_repeats
+from edit_flow import EditFlow, stable_sigmoid_sum
 from flow_utils import rm_gap_tokens
 
-import torch
-import torch.nn.functional as F
-
-
-def stable_sigmoid_sum(a, b, dim=-1):
-    """
-    Computes sum(a * sigmoid(b)) stably, assuming a > 0.
-    """
-    log_a = torch.log(a + 1e-45)
-
-    # log(a * sig(b)) = log(a) + log_sigmoid(b)
-    log_terms = log_a + F.logsigmoid(b)
-
-    sum_in_log_space = torch.logsumexp(log_terms, dim=dim)
-
-    return torch.exp(sum_in_log_space)
 
 class LLaDABackbone(nn.Module):
     def __init__(self, config, vocab_size):
@@ -74,12 +59,6 @@ class LLaDABackbone(nn.Module):
 
         rates = torch.cat([sub_pred, ins_pred, del_pred], dim=-1)
 
-        # if attention_mask is not None:
-        #     mask_expanded = attention_mask.unsqueeze(-1).bool()
-        #     rates = rates.masked_fill(mask_expanded, 0.0)
-        #     # Force padded logits to -Inf (so softmax=0)
-        #     sub_logits = sub_logits.masked_fill(mask_expanded, -1e9)
-
         return rates, sub_logits
 
 
@@ -94,30 +73,6 @@ class EditFlowFineTune(EditFlow):
             self.config, vocab_size=self.V)
 
         self.gap_token = 126084  # for LLADA , reserved_token0
-
-        self.time_dependent = self.config.get('time_dependent',
-                                              False)  # whether the model outputs the rate, or reparameterised time independant score
-
-        self.rate_scaling = self.config.get('rate_scaling',
-                                            True)  # whether to include the scheduler term in the loss calculation
-
-    def get_sched_coeff(self, t, z_0, z_1, z_t, eps=1e-9):
-        default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))
-        ins_coeff = (self.mask_scheduler.derivative(t) / (1 - self.mask_scheduler(t) + eps))
-
-        mask_sub_coeff = (self.mask_scheduler.derivative(t) * self.default_scheduler(t)
-                          + self.mask_scheduler(t) * self.default_scheduler.derivative(t)) / (
-                                 self.mask_scheduler(t) * (1 - self.default_scheduler(t)) + eps)
-
-        z_ins_event = (z_0 == self.gap_token) & (z_1 != self.gap_token) & (z_0 != z_1)
-
-        mask_ids = (z_t == self.mask_token) & (z_1 != self.mask_token) & (z_0 != self.mask_token) & (z_1 != z_0)
-
-        sched_coeff = torch.where(z_ins_event, ins_coeff, default_coeff)
-
-        sched_coeff = torch.where(mask_ids, mask_sub_coeff, sched_coeff)
-
-        return sched_coeff
 
     def _compute_loss(self, batch):
         # context mask = (bsz, seq_len) where we keep original context (i.e. x0, z0, z1, x1 should all have context_ids the same)
@@ -169,7 +124,9 @@ class EditFlowFineTune(EditFlow):
             del_rates = del_rates.masked_fill(mask_expanded, -1e9)
 
             if self.rate_scaling:
-                u_tot = (ins_rates * sched_coeff).sum(dim=-1) + stable_sigmoid_sum(sched_coeff, sub_rates) + stable_sigmoid_sum(sched_coeff, del_rates)
+                u_tot = (ins_rates * sched_coeff).sum(dim=-1) + stable_sigmoid_sum(sched_coeff,
+                                                                                   sub_rates) + stable_sigmoid_sum(
+                    sched_coeff, del_rates)
             else:
                 u_tot = ins_rates.sum(dim=-1) + torch.sigmoid(sub_rates).sum(dim=-1) + torch.sigmoid(del_rates).sum(
                     dim=-1)
@@ -180,8 +137,7 @@ class EditFlowFineTune(EditFlow):
 
             u_t = u_t
 
-        uz_mask = poisson_make_uz_mask(z_t, z_1, vocab_size=self.V,
-                                       gap_token=self.gap_token, pad_token=self.pad_token)
+        uz_mask = self.make_uz_mask(z_t, z_1)
 
         target_sub = uz_mask[:, :, 0] & ~context_mask
         target_ins = uz_mask[:, :, 1] & ~context_mask
@@ -189,7 +145,7 @@ class EditFlowFineTune(EditFlow):
 
         log_sum_exp_x = sub_logits.logsumexp(dim=-1)
 
-        log_sum_exp_z = fill_gap_tokens_with_repeats(
+        log_sum_exp_z = self.fill_gap_tokens_with_repeats(
             log_sum_exp_x.unsqueeze(-1), z_gap_mask, z_pad_mask
         ).squeeze(-1)
 
@@ -206,7 +162,7 @@ class EditFlowFineTune(EditFlow):
 
         vocab_nll = log_sum_exp_z - target_logits_z
 
-        uz_log_rates = fill_gap_tokens_with_repeats(u_t, z_gap_mask, z_pad_mask)
+        uz_log_rates = self.fill_gap_tokens_with_repeats(u_t, z_gap_mask, z_pad_mask)
 
         log_rate_ins = uz_log_rates[:, :, 0]
         log_rate_sub = uz_log_rates[:, :, 1]
@@ -350,13 +306,10 @@ class EditFlowFineTune(EditFlow):
                 # Apply operations based on masks
                 x_t[sub_mask] = sub_tokens[sub_mask]
 
-                x_t = poisson_apply_ins_del_operations(
+                x_t = self.apply_ins_del_ops(
                     x_t,
                     ins_vals,
                     del_mask,
-                    max_seq_len=self.config.model.length,
-                    pad_token=self.pad_token,
-                    mask_token=self.mask_token
                 )
                 x_pad_mask = (x_t == self.pad_token)  # Update padding mask after operations
 
@@ -369,112 +322,3 @@ class EditFlowFineTune(EditFlow):
                 pbar.update(1)
 
         return x_t
-
-    def restore_model_and_sample(self, n_steps, eps=1e-5):
-        """Generate samples from the model."""
-        # Lightning auto-casting is not working in this method for some reason
-        self.backbone.eval()
-        samples = self._sample(n_steps=n_steps, eps=eps)
-        self.backbone.train()
-        return samples
-
-
-def poisson_apply_ins_del_operations(
-        x_t: torch.Tensor,
-        ins_vals: torch.Tensor,
-        del_mask: torch.Tensor,
-        pad_token,
-        max_seq_len,
-        mask_token
-) -> torch.Tensor:
-    """
-    Apply insertion and deletion operations to a sequence x_t based on the provided masks.
-    """
-    batch_size, seq_len = x_t.shape
-    device = x_t.device
-
-    # Handle simultaneous ins+del as substituting a mask
-    replace_mask = (ins_vals > 0) & del_mask
-    x_t_modified = x_t.clone()
-    x_t_modified[replace_mask] = mask_token
-    # subtract 1 from inserts
-    ins_vals[replace_mask] -= 1
-
-    # Update ins/del masks after handling replacements
-    # eff_ins_mask = ins_mask & ~replace_mask
-    del_mask = del_mask & ~replace_mask
-
-    # Compute new lengths after applying ins/del operations
-    xt_pad_mask = (x_t == pad_token)  # (batch_size, seq_len)
-    xt_seq_lens = (~xt_pad_mask).sum(dim=1)  # (batch_size,)
-
-    new_lengths = xt_seq_lens + ins_vals.sum(dim=1) - del_mask.sum(dim=1)
-
-    max_new_len = int(new_lengths.max().item())
-
-    if max_new_len <= 0:
-        print(f"Unexpected max_new_len <= 0: {max_new_len}, did we delete everything?")
-        return torch.full((batch_size, 1), pad_token, dtype=x_t.dtype, device=device)
-
-    # Pre-allocate result
-    x_new = torch.full((batch_size, max_new_len), pad_token, dtype=x_t.dtype, device=device)
-
-    # Compute positions
-    batch_idx = torch.arange(batch_size, device=device).unsqueeze(1)  # (batch_size, 1)
-    pos_idx = torch.arange(seq_len, device=device).unsqueeze(0)  # (1, seq_len)
-
-    cum_del = torch.cumsum(del_mask, dim=1)  # num del up to & incl. current pos
-
-    cum_ins = torch.cumsum(ins_vals, dim=1)  # num ins up to & incl. current pos
-
-    cum_ins_before = F.pad(cum_ins[:, :-1], (1, 0), value=0)  # num ins before current pos
-
-    # Place non-deleted tokens
-    new_pos = pos_idx + cum_ins_before - cum_del  # new pos of tokens shifted by ins/del
-
-    keep_mask = ~del_mask & (new_pos >= 0) & (new_pos < max_new_len)  # tokens to keep (non-deleted)
-
-    if keep_mask.any():
-        x_new[batch_idx.expand(-1, seq_len)[keep_mask], new_pos[keep_mask].long()] = x_t_modified[keep_mask]
-
-    # Place insertions
-    if (ins_vals > 0).any():
-        # Vectorized approach to handle multiple insertions per position
-        # 1. Find all locations that need insertions
-        ins_b, ins_p = (ins_vals > 0).nonzero(as_tuple=True)
-
-        # 2. Get the number of insertions and base positions for these locations
-        num_insertions_at_loc = ins_vals[ins_b, ins_p].long()
-        base_positions = new_pos[ins_b, ins_p]
-
-        # 3. Repeat batch indices and base positions for each insertion
-        total_insertions = num_insertions_at_loc.sum()
-        if total_insertions > 0:
-            repeated_batch_indices = ins_b.repeat_interleave(num_insertions_at_loc)
-            repeated_base_pos = base_positions.repeat_interleave(num_insertions_at_loc)
-
-            flat_indices = torch.arange(total_insertions, device=device)
-
-            # Find start index of each group in the flat array
-            group_starts = torch.cat([
-                torch.tensor([0], device=device),
-                num_insertions_at_loc.cumsum(dim=0)[:-1]
-            ])
-
-            # Map every element to its group's start index
-            repeated_starts = group_starts.repeat_interleave(num_insertions_at_loc)
-
-            # Subtract start from current to get 1-based offset
-            offsets = flat_indices - repeated_starts + 1
-
-            # 5. Calculate final insertion positions
-            final_ins_pos = repeated_base_pos + offsets
-            # -----------------------------------
-
-            valid_mask = (final_ins_pos >= 0) & (final_ins_pos < max_new_len)
-            x_new[repeated_batch_indices[valid_mask], final_ins_pos[valid_mask]] = mask_token
-    if max_new_len > max_seq_len:
-        print(f"Warning: max_new_len {max_new_len} exceeds max_seq_len {max_seq_len}, truncating.")
-        max_new_len = max_seq_len
-
-    return x_new[:, :max_new_len]
