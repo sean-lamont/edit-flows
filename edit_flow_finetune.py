@@ -1,10 +1,86 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import transformers
 from tqdm import tqdm
 
 from edit_flow import EditFlow, poisson_make_uz_mask, fill_gap_tokens_with_repeats
 from flow_utils import rm_gap_tokens
+
+import torch
+import torch.nn.functional as F
+
+
+def stable_sigmoid_sum(a, b, dim=-1):
+    """
+    Computes sum(a * sigmoid(b)) stably, assuming a > 0.
+    """
+    log_a = torch.log(a + 1e-45)
+
+    # log(a * sig(b)) = log(a) + log_sigmoid(b)
+    log_terms = log_a + F.logsigmoid(b)
+
+    sum_in_log_space = torch.logsumexp(log_terms, dim=dim)
+
+    return torch.exp(sum_in_log_space)
+
+class LLaDABackbone(nn.Module):
+    def __init__(self, config, vocab_size):
+        super().__init__()
+        self.config = config
+
+        # Load LLaDA
+        print(f"Loading LLaDA Backbone: {config.model_name}")
+        self.base_model = transformers.AutoModel.from_pretrained(
+            config.model_name,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        )
+        self.hidden_size = self.base_model.config.hidden_size
+        self.vocab_size = vocab_size
+
+        self.ins_head = nn.Sequential(
+            nn.Linear(self.hidden_size, 1024),
+            nn.GELU(),
+            nn.Linear(1024, 1)  # Output raw log_k
+        )
+
+        self.del_head = nn.Sequential(
+            nn.Linear(self.hidden_size, 1024),
+            nn.GELU(),
+            nn.Linear(1024, 1)  # Output raw logits
+        )
+
+        self.sub_head = nn.Sequential(
+            nn.Linear(self.hidden_size, 1024),
+            nn.GELU(),
+            nn.Linear(1024, 1)  # Output raw logits
+        )
+
+        if hasattr(self.base_model, 'lm_head'):
+            self.content_head = self.base_model.lm_head
+        else:
+            self.content_head = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
+
+    def forward(self, x, t=None, attention_mask=None):
+        outputs = self.base_model(x, attention_mask=attention_mask, output_hidden_states=True)
+        h = outputs.last_hidden_state
+
+        ins_pred = self.ins_head(h)
+        sub_pred = self.sub_head(h)
+        del_pred = self.del_head(h)
+
+        sub_logits = self.content_head(h)
+
+        rates = torch.cat([sub_pred, ins_pred, del_pred], dim=-1)
+
+        # if attention_mask is not None:
+        #     mask_expanded = attention_mask.unsqueeze(-1).bool()
+        #     rates = rates.masked_fill(mask_expanded, 0.0)
+        #     # Force padded logits to -Inf (so softmax=0)
+        #     sub_logits = sub_logits.masked_fill(mask_expanded, -1e9)
+
+        return rates, sub_logits
 
 
 class EditFlowFineTune(EditFlow):
@@ -13,6 +89,35 @@ class EditFlowFineTune(EditFlow):
             config,
             tokenizer: transformers.PreTrainedTokenizer):
         super().__init__(config, tokenizer)
+
+        self.backbone = LLaDABackbone(
+            self.config, vocab_size=self.V)
+
+        self.gap_token = 126084  # for LLADA , reserved_token0
+
+        self.time_dependent = self.config.get('time_dependent',
+                                              False)  # whether the model outputs the rate, or reparameterised time independant score
+
+        self.rate_scaling = self.config.get('rate_scaling',
+                                            True)  # whether to include the scheduler term in the loss calculation
+
+    def get_sched_coeff(self, t, z_0, z_1, z_t, eps=1e-9):
+        default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))
+        ins_coeff = (self.mask_scheduler.derivative(t) / (1 - self.mask_scheduler(t) + eps))
+
+        mask_sub_coeff = (self.mask_scheduler.derivative(t) * self.default_scheduler(t)
+                          + self.mask_scheduler(t) * self.default_scheduler.derivative(t)) / (
+                                 self.mask_scheduler(t) * (1 - self.default_scheduler(t)) + eps)
+
+        z_ins_event = (z_0 == self.gap_token) & (z_1 != self.gap_token) & (z_0 != z_1)
+
+        mask_ids = (z_t == self.mask_token) & (z_1 != self.mask_token) & (z_0 != self.mask_token) & (z_1 != z_0)
+
+        sched_coeff = torch.where(z_ins_event, ins_coeff, default_coeff)
+
+        sched_coeff = torch.where(mask_ids, mask_sub_coeff, sched_coeff)
+
+        return sched_coeff
 
     def _compute_loss(self, batch):
         # context mask = (bsz, seq_len) where we keep original context (i.e. x0, z0, z1, x1 should all have context_ids the same)
@@ -28,12 +133,52 @@ class EditFlowFineTune(EditFlow):
 
         u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
-        mask_expanded = context_mask.unsqueeze(-1).bool()
-        u_t = u_t.masked_fill(mask_expanded, 0.0)
-        # Force padded logits to -Inf (so softmax=0)
+        sub_rates = u_t[:, :, 0]
+        ins_rates = u_t[:, :, 1]
+        del_rates = u_t[:, :, 2]
+
+        mask_expanded = (context_mask | x_pad_mask).unsqueeze(-1).bool()
+
+        # Force padded/context logits to -Inf (so softmax=0)
         sub_logits = sub_logits.masked_fill(mask_expanded, -1e9)
 
-        u_tot = u_t.sum(dim=(1, 2))
+        # rates always positive for insert (time dependent = full rate, time independent = predicted # inserts)
+        ins_rates = F.softplus(torch.clamp(ins_rates, max=1e6))
+        ins_rates = ins_rates.masked_fill(mask_expanded, 0.0)
+
+        eps = 1e-9
+        sched_coeff = self.get_sched_coeff(t, z_0, z_1, z_t)
+
+        if self.time_dependent:  # model outputs the full rate prediction
+            sub_rates = F.softplus(torch.clamp(sub_rates, max=1e6))
+            sub_rates = sub_rates.masked_fill(mask_expanded, 0.0)
+
+            del_rates = F.softplus(torch.clamp(del_rates, max=1e6))
+            del_rates = del_rates.masked_fill(mask_expanded, 0.0)
+
+            u_tot = u_t.sum(dim=(1, 2))
+
+            u_t[:, :, 0] = sub_rates
+            u_t[:, :, 1] = ins_rates
+            u_t[:, :, 2] = del_rates
+
+            u_t = torch.log(u_t + eps)
+
+        else:  # model outputs time independent logit for a sub/delete
+            sub_rates = sub_rates.masked_fill(mask_expanded, -1e9)
+            del_rates = del_rates.masked_fill(mask_expanded, -1e9)
+
+            if self.rate_scaling:
+                u_tot = (ins_rates * sched_coeff).sum(dim=-1) + stable_sigmoid_sum(sched_coeff, sub_rates) + stable_sigmoid_sum(sched_coeff, del_rates)
+            else:
+                u_tot = ins_rates.sum(dim=-1) + torch.sigmoid(sub_rates).sum(dim=-1) + torch.sigmoid(del_rates).sum(
+                    dim=-1)
+
+            u_t[:, :, 0] = F.logsigmoid(sub_rates)
+            u_t[:, :, 1] = torch.log(ins_rates + eps)
+            u_t[:, :, 2] = F.logsigmoid(del_rates)
+
+            u_t = u_t
 
         uz_mask = poisson_make_uz_mask(z_t, z_1, vocab_size=self.V,
                                        gap_token=self.gap_token, pad_token=self.pad_token)
@@ -61,9 +206,7 @@ class EditFlowFineTune(EditFlow):
 
         vocab_nll = log_sum_exp_z - target_logits_z
 
-        eps = 1e-9
-        log_rates = torch.log(u_t + eps)
-        uz_log_rates = fill_gap_tokens_with_repeats(log_rates, z_gap_mask, z_pad_mask)
+        uz_log_rates = fill_gap_tokens_with_repeats(u_t, z_gap_mask, z_pad_mask)
 
         log_rate_ins = uz_log_rates[:, :, 0]
         log_rate_sub = uz_log_rates[:, :, 1]
@@ -75,27 +218,16 @@ class EditFlowFineTune(EditFlow):
                 ((log_rate_sub - vocab_nll) * target_sub)
         )
 
-        default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))
-        ins_coeff = (self.mask_scheduler.derivative(t) / (1 - self.mask_scheduler(t) + eps))
+        if self.rate_scaling:
+            term2 = (selected_log_ll * sched_coeff).sum(dim=1)
+        else:
+            term2 = selected_log_ll.sum(dim=1)
 
-        mask_sub_coeff = (self.mask_scheduler.derivative(t) * self.default_scheduler(t)
-                          + self.mask_scheduler(t) * self.default_scheduler.derivative(t)) / (
-                                 self.mask_scheduler(t) * (1 - self.default_scheduler(t)) + eps)
-
-        z_ins_event = (z_0 == self.gap_token) & (z_1 != self.gap_token) & (z_0 != z_1)
-
-        mask_ids = (z_t == self.mask_token) & (z_1 != self.mask_token) & (z_0 != self.mask_token) & (z_1 != z_0)
-
-        sched_coeff = torch.where(z_ins_event, ins_coeff, default_coeff)
-
-        sched_coeff = torch.where(mask_ids, mask_sub_coeff, sched_coeff)
-
-        term2 = (selected_log_ll * sched_coeff).sum(dim=1)
         loss = u_tot - term2
 
-        u_ins = u_t[:, :, 0].sum(dim=1).mean()
-        u_del = u_t[:, :, 2].sum(dim=1).mean()
-        u_sub = u_t[:, :, 1].sum(dim=1).mean()
+        u_ins = torch.exp(u_t[:, :, 0]).sum(dim=1).mean()
+        u_del = torch.exp(u_t[:, :, 2]).sum(dim=1).mean()
+        u_sub = torch.exp(u_t[:, :, 1]).sum(dim=1).mean()
 
         return loss.mean(), u_tot, u_ins, u_del, u_sub, term2.mean()
 
