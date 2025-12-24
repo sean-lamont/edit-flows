@@ -395,17 +395,30 @@ class EditFlowBase(L.LightningModule):
              or not self.trainer.sanity_checking)
                 and self.config.eval.generate_samples):
 
+            all_gen_lens = []
             samples, text_samples = None, None
             for _ in range(self.config.sampling.num_sample_batches):
                 samples = self._sample()
 
-                samples = [s[s != self.tokenizer.pad_token_id] for s in samples]# = input_ids[input_ids != tokenizer.pad_token_id]
+                # Calculate non-padded lengths
+                batch_lens = (samples != self.tokenizer.pad_token_id).sum(dim=1).float()
+                all_gen_lens.append(batch_lens)
+
+                samples = [s[s != self.tokenizer.pad_token_id] for s in
+                           samples]  # = input_ids[input_ids != tokenizer.pad_token_id]
 
                 # Decode the samples to be re-tokenized by eval model
                 text_samples = self.tokenizer.batch_decode(samples)
 
                 if self.config.eval.compute_generative_perplexity:
                     self.compute_generative_perplexity(text_samples)
+
+            if all_gen_lens:
+                all_gen_lens = torch.cat(all_gen_lens)
+                self.log_dict({
+                    "val/gen_len_mean": all_gen_lens.mean(),
+                    "val/gen_len_std": all_gen_lens.std(),
+                }, prog_bar=True, on_epoch=True, sync_dist=True)
 
             if self.trainer.global_rank == 0 and hasattr(self.trainer.logger, 'log_table'):
                 # Log the last generated samples
@@ -570,7 +583,7 @@ class EditFlow(EditFlowBase):
             log_r_sub = F.logsigmoid(raw_sub)
             log_r_del = F.logsigmoid(raw_del)
 
-        lse_sub_x = sub_vocab_logits.logsumexp(dim=-1)#, keepdim=True)
+        lse_sub_x = sub_vocab_logits.logsumexp(dim=-1)  # , keepdim=True)
 
         packed_features_x = torch.stack([log_r_sub, log_r_ins, log_r_del, lse_sub_x], dim=-1)
 
@@ -606,7 +619,7 @@ class EditFlow(EditFlowBase):
         )
 
         if self.rate_scaling:
-            term2 = (selected_log_ll * sched_coeff_z.to(selected_log_ll.dtype)).sum(dim=1)
+            term2 = (selected_log_ll * sched_coeff_z).sum(dim=1)
         else:
             term2 = selected_log_ll.sum(dim=1)
 

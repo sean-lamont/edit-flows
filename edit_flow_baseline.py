@@ -28,69 +28,80 @@ class EditFlowBaseline(EditFlowBase):
 
     def _compute_loss(self, batch):
         x_0, x_1, z_0, z_1, t = batch
+        bsz = x_0.shape[0]
 
         z_t = self.sample_zt(z_0, z_1, t)
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = self.rm_gap_tokens(z_t)
 
-        u_t, sub_logits, ins_logits = self.backbone.forward(x_t, t, x_pad_mask)
+        u_t_logits, sub_vocab_logits, ins_vocab_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
-        sub_rates = u_t[:, :, 0]
-        ins_rates = u_t[:, :, 1]
-        del_rates = u_t[:, :, 2]
+        sched_coeff_z = self.get_sched_coeff(t, z_0, z_1, z_t)
 
-        mask_expanded = x_pad_mask.unsqueeze(-1).bool()
+        raw_sub = u_t_logits[:, :, 0]
+        raw_ins = u_t_logits[:, :, 1]
+        raw_del = u_t_logits[:, :, 2]
+
+        mask_expanded = x_pad_mask.unsqueeze(-1)
 
         # Force padded/context logits to -Inf (so softmax=0)
-        sub_logits = sub_logits.masked_fill(mask_expanded, -1e9)
-        ins_logits = ins_logits.masked_fill(mask_expanded, -1e9)
+        sub_vocab_logits = sub_vocab_logits.masked_fill(mask_expanded, -1e9)
+        ins_vocab_logits = ins_vocab_logits.masked_fill(mask_expanded, -1e9)
 
         eps = 1e-9
-        sched_coeff = self.get_sched_coeff(t)
 
         if self.time_dependent:
-            sub_rates = F.softplus(torch.clamp(sub_rates, max=1e6))
-            ins_rates = F.softplus(torch.clamp(ins_rates, max=1e6))
-            del_rates = F.softplus(torch.clamp(del_rates, max=1e6))
+            r_sub = F.softplus(torch.clamp(raw_sub, max=1e6)).masked_fill(x_pad_mask, 0)
+            r_ins = F.softplus(torch.clamp(raw_ins, max=1e6)).masked_fill(x_pad_mask, 0)
+            r_del = F.softplus(torch.clamp(raw_del, max=1e6)).masked_fill(x_pad_mask, 0)
 
-            sub_rates = sub_rates.masked_fill(x_pad_mask, 0.0)
-            ins_rates = ins_rates.masked_fill(x_pad_mask, 0.0)
-            del_rates = del_rates.masked_fill(x_pad_mask, 0.0)
+            # u_tot = u_t_logits.sum(dim=(1, 2))
+            u_tot = (r_ins + r_sub + r_del).sum(dim=-1)
 
-            u_tot = u_t.sum(dim=(1, 2))
+            log_r_sub = torch.log(r_sub + eps)
+            log_r_ins = torch.log(r_ins + eps)
+            log_r_del = torch.log(r_del + eps)
 
-            u_t[:, :, 0] = sub_rates
-            u_t[:, :, 1] = ins_rates
-            u_t[:, :, 2] = del_rates
-
-            u_t = torch.log(u_t + eps)
+            # u_t_logits = torch.log(u_t_logits + eps)
 
         else:  # model outputs time independent logits for ins/sub/del
-            sub_rates = sub_rates.masked_fill(x_pad_mask, -1e9)
-            ins_rates = ins_rates.masked_fill(x_pad_mask, -1e9)
-            del_rates = del_rates.masked_fill(x_pad_mask, -1e9)
+            sched_coeff_x = torch.zeros_like(x_t, dtype=u_t_logits.dtype)
 
-            u_t[:, :, 0] = sub_rates
-            u_t[:, :, 1] = ins_rates
-            u_t[:, :, 2] = del_rates
+            if sched_coeff_z.dim() > 1 and sched_coeff_z.shape[1] == z_t.shape[1]:
+                mask_z = ~z_gap_mask
+                ranks = mask_z.cumsum(dim=1) - 1
+                valid_z = mask_z & (ranks < x_t.shape[1])
+
+                values = sched_coeff_z[valid_z]
+                dest_cols = ranks[valid_z]
+                dest_rows = torch.arange(bsz, device=x_t.device).unsqueeze(1).expand_as(z_t)[valid_z]
+
+                values = values.to(dtype=sched_coeff_x.dtype)
+                sched_coeff_x[dest_rows, dest_cols] = values
+
+            else:
+                sched_coeff_x = sched_coeff_z
+
+            r_ins = torch.sigmoid(raw_ins).masked_fill(x_pad_mask, 0)
+            r_sub = torch.sigmoid(raw_sub).masked_fill(x_pad_mask, 0)
+            r_del = torch.sigmoid(raw_del).masked_fill(x_pad_mask, 0)
 
             if self.rate_scaling:
-                u_tot = stable_sigmoid_sum(sched_coeff, u_t, dim=1).sum(dim=-1)
+                u_tot = (r_ins * sched_coeff_x).sum(dim=-1) + \
+                        (r_sub * sched_coeff_x).sum(dim=-1) + \
+                        (r_del * sched_coeff_x).sum(dim=-1)
             else:
-                u_tot = torch.sigmoid(u_t).sum(dim=-1)
+                u_tot = r_ins.sum(dim=-1) + r_sub.sum(dim=-1) + r_del.sum(dim=-1)
 
-            u_t = F.logsigmoid(u_t)
+            # Log Rates
+            log_r_ins = F.logsigmoid(r_ins)
+            log_r_sub = F.logsigmoid(raw_sub)
+            log_r_del = F.logsigmoid(raw_del)
 
-        uz_mask = self.make_uz_mask(z_t, z_1)
+        lse_sub_x = sub_vocab_logits.logsumexp(dim=-1)
+        lse_ins_x = ins_vocab_logits.logsumexp(dim=-1)
 
-        sub_mask = uz_mask[:, :, 0]
-        ins_mask = uz_mask[:, :, 1]
-        del_mask = uz_mask[:, :, 2]
-
-        lse_sub_x = sub_logits.logsumexp(dim=-1, keepdim=True)  # [B, Sx, 1]
-        lse_ins_x = ins_logits.logsumexp(dim=-1, keepdim=True)  # [B, Sx, 1]
-
-        packed_features_x = torch.cat([u_t, lse_sub_x, lse_ins_x], dim=-1)
+        packed_features_x = torch.stack([log_r_sub, log_r_ins, log_r_del, lse_sub_x, lse_ins_x], dim=-1)
 
         packed_features_z = self.fill_gap_tokens_with_repeats(
             packed_features_x, z_gap_mask, z_pad_mask
@@ -103,16 +114,21 @@ class EditFlowBaseline(EditFlowBase):
         lse_sub_z = packed_features_z[..., 3]
         lse_ins_z = packed_features_z[..., 4]
 
+        uz_mask = self.make_uz_mask(z_t, z_1)
+        sub_mask = uz_mask[:, :, 0]
+        ins_mask = uz_mask[:, :, 1]
+        del_mask = uz_mask[:, :, 2]
+
         non_gap_mask = ~z_gap_mask
         x_indices = non_gap_mask.cumsum(dim=1) - 1
         x_indices = x_indices.clamp(min=0, max=x_t.shape[1] - 1)
 
-        valid_vocab_limit = sub_logits.size(-1) - 1
-        safe_z1 = z_1.clamp(min=0, max=valid_vocab_limit)
+        valid_vocab_limit = sub_vocab_logits.size(-1) - 1
+        safe_z1 = z_1.clamp(min=0, ins_vocab_logitsmax=valid_vocab_limit)
         batch_idx = torch.arange(x_t.shape[0], device=self.device).unsqueeze(1)
 
-        target_sub_logits = sub_logits[batch_idx, x_indices, safe_z1]
-        target_ins_logits = ins_logits[batch_idx, x_indices, safe_z1]
+        target_sub_logits = sub_vocab_logits[batch_idx, x_indices, safe_z1]
+        target_ins_logits = ins_vocab_logits[batch_idx, x_indices, safe_z1]
 
         term_ins = (log_rate_ins + target_ins_logits - lse_ins_z) * ins_mask
         term_del = log_rate_del * del_mask
@@ -121,18 +137,18 @@ class EditFlowBaseline(EditFlowBase):
         selected_log_ll = term_ins + term_del + term_sub
 
         if self.rate_scaling:
-            term2 = (selected_log_ll * sched_coeff).sum(dim=1)
+            term2 = (selected_log_ll * sched_coeff_z).sum(dim=1)
         else:
             term2 = selected_log_ll.sum(dim=1)
 
         loss = u_tot - term2
 
-        u_t = torch.exp(u_t)
-        u_sub = u_t[:, :, 0].sum(dim=1).mean()
-        u_ins = u_t[:, :, 1].sum(dim=1).mean()
-        u_del = u_t[:, :, 2].sum(dim=1).mean()
+        with torch.no_grad():
+            u_ins_mean = r_ins.mean()
+            u_del_mean = r_del.mean()
+            u_sub_mean = r_sub.mean()
 
-        return loss.mean(), u_tot, u_ins, u_del, u_sub, term2.mean()
+        return loss.mean(), u_tot.mean(), u_ins_mean, u_del_mean, u_sub_mean, term2.mean()
 
     def sample_zt(self, z_0, z_1, t):
         """
@@ -198,11 +214,31 @@ class EditFlowBaseline(EditFlowBase):
                 sub_probs = F.softmax(sub_logits, dim=-1)
                 ins_probs = F.softmax(ins_logits, dim=-1)
 
-                valid_token_mask = (~x_pad_mask).float()
+                lambda_sub = u_t[:, :, 0]
+                lambda_ins = u_t[:, :, 1]
+                lambda_del = u_t[:, :, 2]
 
-                lambda_ins = u_t[:, :, 0] * valid_token_mask
-                lambda_sub = u_t[:, :, 1] * valid_token_mask
-                lambda_del = u_t[:, :, 2] * valid_token_mask
+                if not self.time_dependent:  # move logits to probabilities
+                    lambda_sub = torch.sigmoid(lambda_sub)
+                    lambda_ins = torch.sigmoid(lambda_ins)
+                    lambda_del = torch.sigmoid(lambda_del)
+                else:
+                    lambda_sub = F.softplus(torch.clamp(lambda_sub, max=1e6))
+                    lambda_ins = F.softplus(torch.clamp(lambda_ins, max=1e6))
+                    lambda_del = F.softplus(torch.clamp(lambda_del, max=1e6))
+
+                valid_token_mask = (~x_pad_mask)  # .float()
+
+                lambda_ins = torch.where(valid_token_mask, lambda_ins, 0.0)
+                lambda_sub = torch.where(valid_token_mask, lambda_sub, 0.0)
+                lambda_del = torch.where(valid_token_mask, lambda_del, 0.0)
+
+                if not self.time_dependent:  # scale raw count/bernoulli predictions by sampler rate
+                    sched_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))
+
+                    lambda_sub = lambda_sub * sched_coeff
+                    lambda_ins = lambda_ins * sched_coeff
+                    lambda_del = lambda_del * sched_coeff
 
                 adapt_h = default_h
 
