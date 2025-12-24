@@ -13,7 +13,6 @@ from tqdm import tqdm
 
 import dataloader
 import models
-from flow_utils import rm_gap_tokens
 from flows import CubicScheduler
 
 LOG2 = math.log(2)
@@ -365,6 +364,64 @@ class EditFlowBase(L.LightningModule):
                 self.gen_ppl_metric.update(
                     nlls, first_eos[..., 1:] + token_mask[..., 1:])
 
+    def training_step(self, batch, batch_idx):
+        loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
+        self.log_dict(
+            {
+                "train_loss": loss,
+                "train_u_tot": u_tot.mean(),
+                "train_u_ins": u_ins,
+                "train_u_del": u_del,
+                "train_u_sub": u_sub,
+                "train_term2": term2,
+            }, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
+        self.log_dict(
+            {
+                "val_loss": loss,
+                "val_u_tot": u_tot.mean(),
+                "val_u_ins": u_ins,
+                "val_u_del": u_del,
+                "val_u_sub": u_sub,
+                "val_term2": term2,
+            }, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        return loss
+
+    def on_validation_epoch_end(self):
+        if ((self.config.eval.compute_perplexity_on_sanity
+             or not self.trainer.sanity_checking)
+                and self.config.eval.generate_samples):
+
+            samples, text_samples = None, None
+            for _ in range(self.config.sampling.num_sample_batches):
+                samples = self._sample()
+
+                # Decode the samples to be re-tokenized by eval model
+                text_samples = self.tokenizer.batch_decode(samples)
+
+                if self.config.eval.compute_generative_perplexity:
+                    self.compute_generative_perplexity(text_samples)
+
+            if self.trainer.global_rank == 0 and hasattr(self.trainer.logger, 'log_table'):
+                # Log the last generated samples
+                text_samples = text_samples[:self.config.sampling.num_sample_log]
+
+                self.trainer.logger.log_table(
+                    key=f'samples@global_step{self.global_step}',
+                    columns=['Generated Samples'],
+                    data=[[s] for s in text_samples])
+
+            if self.config.eval.compute_generative_perplexity:
+                self.log('val/gen_ppl',
+                         self.gen_ppl_metric,
+                         on_epoch=True,
+                         on_step=False,
+                         sync_dist=True,
+                         prog_bar=True)
+
     # todo left padding?
     def rm_gap_tokens(self, z: torch.Tensor):
         """
@@ -443,7 +500,7 @@ class EditFlow(EditFlowBase):
     def _compute_loss(self, batch):
         x_0, x_1, z_0, z_1, t = batch
 
-        z_t = self.sample_zt_sparse(z_0, z_1, t)
+        z_t = self.sample_zt(z_0, z_1, t)
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = self.rm_gap_tokens(z_t)
 
@@ -548,7 +605,7 @@ class EditFlow(EditFlowBase):
 
         return loss.mean(), u_tot, u_ins, u_del, u_sub, term2.mean()
 
-    def sample_zt_sparse(self, z_0, z_1, t):
+    def sample_zt(self, z_0, z_1, t):
         t = t.reshape(-1, 1)  # [Batch, 1]
         mask_t = self.mask_scheduler(t)
         default_t = self.default_scheduler(t)
@@ -591,64 +648,6 @@ class EditFlow(EditFlowBase):
                                       z_1))
 
         return z_t
-
-    def training_step(self, batch, batch_idx):
-        loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
-        self.log_dict(
-            {
-                "train_loss": loss,
-                "train_u_tot": u_tot.mean(),
-                "train_u_ins": u_ins,
-                "train_u_del": u_del,
-                "train_u_sub": u_sub,
-                "train_term2": term2,
-            }, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
-        self.log_dict(
-            {
-                "val_loss": loss,
-                "val_u_tot": u_tot.mean(),
-                "val_u_ins": u_ins,
-                "val_u_del": u_del,
-                "val_u_sub": u_sub,
-                "val_term2": term2,
-            }, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
-        return loss
-
-    def on_validation_epoch_end(self):
-        if ((self.config.eval.compute_perplexity_on_sanity
-             or not self.trainer.sanity_checking)
-                and self.config.eval.generate_samples):
-
-            samples, text_samples = None, None
-            for _ in range(self.config.sampling.num_sample_batches):
-                samples = self._sample()
-
-                # Decode the samples to be re-tokenized by eval model
-                text_samples = self.tokenizer.batch_decode(samples)
-
-                if self.config.eval.compute_generative_perplexity:
-                    self.compute_generative_perplexity(text_samples)
-
-            if self.trainer.global_rank == 0 and hasattr(self.trainer.logger, 'log_table'):
-                # Log the last generated samples
-                text_samples = text_samples[:self.config.sampling.num_sample_log]
-
-                self.trainer.logger.log_table(
-                    key=f'samples@global_step{self.global_step}',
-                    columns=['Generated Samples'],
-                    data=[[s] for s in text_samples])
-
-            if self.config.eval.compute_generative_perplexity:
-                self.log('val/gen_ppl',
-                         self.gen_ppl_metric,
-                         on_epoch=True,
-                         on_step=False,
-                         sync_dist=True,
-                         prog_bar=True)
 
     @torch.no_grad()
     def _sample(self, n_steps=None, eps=1e-5):
