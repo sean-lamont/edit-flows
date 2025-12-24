@@ -741,8 +741,8 @@ class EditFlow(EditFlowBase):
                           del_mask: torch.Tensor,
                           ) -> torch.Tensor:
 
-        max_seq_len = self.config.model.length,
-        pad_token = self.pad_token,
+        max_seq_len = self.config.model.length
+        pad_token = self.pad_token
         mask_token = self.mask_token
 
         batch_size, seq_len = x_t.shape
