@@ -135,19 +135,24 @@ class EditFlowFineTune(EditFlow):
             u_t[:, :, 1] = torch.log(ins_rates + eps)
             u_t[:, :, 2] = F.logsigmoid(del_rates)
 
-            u_t = u_t
-
         uz_mask = self.make_uz_mask(z_t, z_1)
 
-        target_sub = uz_mask[:, :, 0] & ~context_mask
-        target_ins = uz_mask[:, :, 1] & ~context_mask
-        target_del = uz_mask[:, :, 2] & ~context_mask
+        sub_mask = uz_mask[:, :, 0] & ~context_mask
+        ins_mask = uz_mask[:, :, 1] & ~context_mask
+        del_mask = uz_mask[:, :, 2] & ~context_mask
 
-        log_sum_exp_x = sub_logits.logsumexp(dim=-1)
+        lse_sub_x = sub_logits.logsumexp(dim=-1)
 
-        log_sum_exp_z = self.fill_gap_tokens_with_repeats(
-            log_sum_exp_x.unsqueeze(-1), z_gap_mask, z_pad_mask
-        ).squeeze(-1)
+        packed_features_x = torch.cat([u_t, lse_sub_x], dim=-1)
+
+        packed_features_z = self.fill_gap_tokens_with_repeats(
+            packed_features_x, z_gap_mask, z_pad_mask
+        )
+
+        log_rate_ins = packed_features_z[..., 0]
+        log_rate_sub = packed_features_z[..., 1]
+        log_rate_del = packed_features_z[..., 2]
+        lse_sub_z = packed_features_z[..., 3]
 
         non_gap_mask = ~z_gap_mask
         x_indices = non_gap_mask.cumsum(dim=1) - 1
@@ -160,18 +165,12 @@ class EditFlowFineTune(EditFlow):
 
         target_logits_z = sub_logits[batch_idx, x_indices, safe_z1]
 
-        vocab_nll = log_sum_exp_z - target_logits_z
-
-        uz_log_rates = self.fill_gap_tokens_with_repeats(u_t, z_gap_mask, z_pad_mask)
-
-        log_rate_ins = uz_log_rates[:, :, 0]
-        log_rate_sub = uz_log_rates[:, :, 1]
-        log_rate_del = uz_log_rates[:, :, 2]
+        vocab_nll = lse_sub_z - target_logits_z
 
         selected_log_ll = (
-                (log_rate_ins * target_ins) +
-                (log_rate_del * target_del) +
-                ((log_rate_sub - vocab_nll) * target_sub)
+                (log_rate_ins * ins_mask) +
+                (log_rate_del * del_mask) +
+                ((log_rate_sub - vocab_nll) * sub_mask)
         )
 
         if self.rate_scaling:
@@ -181,9 +180,10 @@ class EditFlowFineTune(EditFlow):
 
         loss = u_tot - term2
 
-        u_ins = torch.exp(u_t[:, :, 0]).sum(dim=1).mean()
-        u_del = torch.exp(u_t[:, :, 2]).sum(dim=1).mean()
-        u_sub = torch.exp(u_t[:, :, 1]).sum(dim=1).mean()
+        u_t = torch.exp(u_t)
+        u_ins = u_t[:, :, 0].sum(dim=1).mean()
+        u_del = u_t[:, :, 2].sum(dim=1).mean()
+        u_sub = u_t[:, :, 1].sum(dim=1).mean()
 
         return loss.mean(), u_tot, u_ins, u_del, u_sub, term2.mean()
 

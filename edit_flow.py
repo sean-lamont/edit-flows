@@ -22,6 +22,7 @@ LOG2 = math.log(2)
 class NLL(torchmetrics.aggregation.MeanMetric):
     pass
 
+
 def stable_sigmoid_sum(a, b, dim=-1):
     """
     Computes sum(a * sigmoid(b)) stably, assuming a > 0.
@@ -34,6 +35,7 @@ def stable_sigmoid_sum(a, b, dim=-1):
     sum_in_log_space = torch.logsumexp(log_terms, dim=dim)
 
     return torch.exp(sum_in_log_space)
+
 
 class BPD(NLL):
     def compute(self) -> Tensor:
@@ -60,6 +62,12 @@ class EditFlowBase(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.config = config
+
+        # whether the model outputs the rate, or reparameterised time independant score
+        self.time_dependent = self.config.get('time_dependent', True)
+
+        # whether to include the scheduler term in the loss calculation
+        self.rate_scaling = self.config.get('rate_scaling', True)
 
         self.eval_model_tokenizer = transformers.AutoTokenizer. \
             from_pretrained(self.gen_ppl_eval_model_name_or_path)
@@ -101,7 +109,7 @@ class EditFlowBase(L.LightningModule):
 
         - z_t[i] = GAP_TOKEN & z_1[i] = c => u_mask[i, insert] = 1
         - z_t[i] = c & z_1[i] = GAP_TOKEN => u_mask[i, delete] = 1
-        - z_t[i] = c1 & z_1[i] = c2 => u_mask[i, substitute, c1, c2] = 1
+        - z_t[i] = c1 & z_1[i] = c2 => u_mask[i, substitute] = 1
         """
         batch_size, z_seq_len = z_t.shape
         # n_ops = vocab_size + 2  # substitute + delete + insert
@@ -112,7 +120,6 @@ class EditFlowBase(L.LightningModule):
         z_sub = z_neq & ~z_ins & ~z_del  # (batch_size, z_seq_len)
 
         # mask (batch_size, z_seq_len, u_ops) where 1 indicates operation that bring z_t closer to z_1
-        # u_mask = torch.zeros((batch_size, z_seq_len, n_ops), dtype=torch.bool, device=z_t.device)
         u_mask = torch.zeros((batch_size, z_seq_len, 3), dtype=torch.bool, device=z_t.device)
 
         u_mask[:, :, 0][z_sub] = True
@@ -123,6 +130,7 @@ class EditFlowBase(L.LightningModule):
         assert z_neq.sum() == u_mask.sum(), "Mismatch in number of edits in mask"
 
         return u_mask
+
     def on_load_checkpoint(self, checkpoint):
         # Copied from:
         # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py#L41
@@ -357,6 +365,7 @@ class EditFlowBase(L.LightningModule):
                 self.gen_ppl_metric.update(
                     nlls, first_eos[..., 1:] + token_mask[..., 1:])
 
+    # todo left padding?
     def rm_gap_tokens(self, z: torch.Tensor):
         """
         Remove gap tokens from a batched tensor and right-pad with PAD_TOKEN.
@@ -386,6 +395,7 @@ class EditFlowBase(L.LightningModule):
         assert ((~x_pad_mask).sum(1) + z_gap_mask.sum(1)).equal((~z_pad_mask).sum(1))
         return x, x_pad_mask, z_gap_mask, z_pad_mask
 
+
 # Unconditional Edit Flow model
 class EditFlow(EditFlowBase):
     def __init__(
@@ -393,12 +403,6 @@ class EditFlow(EditFlowBase):
             config,
             tokenizer: transformers.PreTrainedTokenizer):
         super().__init__(config, tokenizer)
-
-        self.time_dependent = self.config.get('time_dependent',
-                                              False)  # whether the model outputs the rate, or reparameterised time independant score
-
-        self.rate_scaling = self.config.get('rate_scaling',
-                                            True)  # whether to include the scheduler term in the loss calculation
 
         if (not hasattr(self.tokenizer, 'mask_token')
                 or self.tokenizer.mask_token is None):
@@ -436,13 +440,12 @@ class EditFlow(EditFlowBase):
 
         return sched_coeff
 
-
     def _compute_loss(self, batch):
         x_0, x_1, z_0, z_1, t = batch
 
         z_t = self.sample_zt_sparse(z_0, z_1, t)
 
-        x_t, x_pad_mask, z_gap_mask, z_pad_mask = self.rm_gap_tokens(z_t, pad_token=self.pad_token, gap_token=self.gap_token)
+        x_t, x_pad_mask, z_gap_mask, z_pad_mask = self.rm_gap_tokens(z_t)
 
         u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
@@ -482,7 +485,9 @@ class EditFlow(EditFlowBase):
             del_rates = del_rates.masked_fill(mask_expanded, -1e9)
 
             if self.rate_scaling:
-                u_tot = (ins_rates * sched_coeff).sum(dim=-1) + stable_sigmoid_sum(sched_coeff, sub_rates) + stable_sigmoid_sum(sched_coeff, del_rates)
+                u_tot = (ins_rates * sched_coeff).sum(dim=-1) + stable_sigmoid_sum(sched_coeff,
+                                                                                   sub_rates) + stable_sigmoid_sum(
+                    sched_coeff, del_rates)
             else:
                 u_tot = ins_rates.sum(dim=-1) + torch.sigmoid(sub_rates).sum(dim=-1) + torch.sigmoid(del_rates).sum(
                     dim=-1)
@@ -491,19 +496,24 @@ class EditFlow(EditFlowBase):
             u_t[:, :, 1] = torch.log(ins_rates + eps)
             u_t[:, :, 2] = F.logsigmoid(del_rates)
 
-            u_t = u_t
-
         uz_mask = self.make_uz_mask(z_t, z_1)
 
-        target_sub = uz_mask[:, :, 0]
-        target_ins = uz_mask[:, :, 1]
-        target_del = uz_mask[:, :, 2]
+        sub_mask = uz_mask[:, :, 0]
+        ins_mask = uz_mask[:, :, 1]
+        del_mask = uz_mask[:, :, 2]
 
-        log_sum_exp_x = sub_logits.logsumexp(dim=-1)
+        lse_sub_x = sub_logits.logsumexp(dim=-1, keepdim=True)
 
-        log_sum_exp_z = self.fill_gap_tokens_with_repeats(
-            log_sum_exp_x.unsqueeze(-1), z_gap_mask, z_pad_mask
-        ).squeeze(-1)
+        packed_features_x = torch.cat([u_t, lse_sub_x], dim=-1)
+
+        packed_features_z = self.fill_gap_tokens_with_repeats(
+            packed_features_x, z_gap_mask, z_pad_mask
+        )
+
+        log_rate_ins = packed_features_z[..., 0]
+        log_rate_sub = packed_features_z[..., 1]
+        log_rate_del = packed_features_z[..., 2]
+        lse_sub_z = packed_features_z[..., 3]
 
         non_gap_mask = ~z_gap_mask
         x_indices = non_gap_mask.cumsum(dim=1) - 1
@@ -511,23 +521,16 @@ class EditFlow(EditFlowBase):
 
         valid_vocab_limit = sub_logits.size(-1) - 1
         safe_z1 = z_1.clamp(min=0, max=valid_vocab_limit)
-
         batch_idx = torch.arange(x_t.shape[0], device=self.device).unsqueeze(1)
 
         target_logits_z = sub_logits[batch_idx, x_indices, safe_z1]
 
-        vocab_nll = log_sum_exp_z - target_logits_z
-
-        uz_log_rates = self.fill_gap_tokens_with_repeats(u_t, z_gap_mask, z_pad_mask)
-
-        log_rate_ins = uz_log_rates[:, :, 0]
-        log_rate_sub = uz_log_rates[:, :, 1]
-        log_rate_del = uz_log_rates[:, :, 2]
+        vocab_nll = lse_sub_z - target_logits_z
 
         selected_log_ll = (
-                (log_rate_ins * target_ins) +
-                (log_rate_del * target_del) +
-                ((log_rate_sub - vocab_nll) * target_sub)
+                (log_rate_ins * ins_mask) +
+                (log_rate_del * del_mask) +
+                ((log_rate_sub - vocab_nll) * sub_mask)
         )
 
         if self.rate_scaling:
@@ -537,12 +540,13 @@ class EditFlow(EditFlowBase):
 
         loss = u_tot - term2
 
-        u_ins = torch.exp(u_t[:, :, 0]).sum(dim=1).mean()
-        u_del = torch.exp(u_t[:, :, 2]).sum(dim=1).mean()
-        u_sub = torch.exp(u_t[:, :, 1]).sum(dim=1).mean()
+        # for logging
+        u_t = torch.exp(u_t)
+        u_ins = u_t[:, :, 0].sum(dim=1).mean()
+        u_del = u_t[:, :, 2].sum(dim=1).mean()
+        u_sub = u_t[:, :, 1].sum(dim=1).mean()
 
         return loss.mean(), u_tot, u_ins, u_del, u_sub, term2.mean()
-
 
     def sample_zt_sparse(self, z_0, z_1, t):
         t = t.reshape(-1, 1)  # [Batch, 1]

@@ -14,286 +14,112 @@ from tqdm import tqdm
 
 import dataloader
 import models
+from edit_flow import EditFlowBase, stable_sigmoid_sum
 from flow_utils import rm_gap_tokens
 from flows import CubicScheduler, x2prob, sample_p
 
-LOG2 = math.log(2)
 
-
-def fill_gap_tokens_with_repeats(
-        x_ut: torch.Tensor,
-        z_gap_mask: torch.Tensor,
-        z_pad_mask: torch.Tensor,
-):
-    batch_size, _ = z_gap_mask.shape
-    _, x_seq_len, _ = x_ut.shape
-
-    # Use cumsum on non-gap positions to point to the last valid non-gap position
-    non_gap_mask = ~z_gap_mask  # Invert mask to get non-gap positions
-    indices = non_gap_mask.cumsum(dim=1) - 1  # (batch_size, z_seq_len)
-    indices = indices.clamp(min=0, max=x_seq_len - 1)  # Ensure indices are within bounds
-
-    # Use indices to gather from x_ut
-    batch_indices = torch.arange(batch_size, device=x_ut.device).unsqueeze(1)
-    result = x_ut[batch_indices, indices]  # (batch_size, z_seq_len, vocab_size) (indexing with [b, 1], [b, z_len])
-    result[z_pad_mask] = 0  # Set pad positions to 0
-    return result
-
-
-def sample_zt(z_0, z_1, mask_scheduler, default_scheduler, t, V, pad_token, gap_token, mask_token):
-    z_neq = (z_0 != z_1) & (z_0 != pad_token) & (z_1 != pad_token)
-    z_ins = (z_0 == gap_token) & (z_1 != gap_token) & z_neq  # (batch_size, z_seq_len)
-
-    # t orig = (batch_size, 1) -> (batch_size, 1, 1)
-    t = t.reshape(-1, 1, 1)
-
-    mask_t = mask_scheduler(t)
-    default_t = default_scheduler(t)
-
-    # one-hot vecs (b, s, v)
-    p_0 = x2prob(z_0, V + 4)
-    p_1 = x2prob(z_1, V + 4)
-    p_mask = x2prob(torch.tensor([mask_token]).expand_as(z_0).to(z_0.device), V + 4)
-
-    # for insert
-    pt_ins = (1 - mask_t) * p_0 \
-             + mask_t * (1 - default_t) * p_mask \
-             + mask_t * default_t * p_1
-
-    # for delete/sub
-    pt = (1 - default_t) * p_0 + default_t * p_1
-
-    pt = torch.where(z_ins.unsqueeze(-1), pt_ins, pt)
-
-    return sample_p(pt)
-
-
-def make_uz_mask(
-        z_t: torch.Tensor,
-        z_1: torch.Tensor,
-        pad_token,
-        gap_token,
-) -> torch.Tensor:
-    """
-    Create a mask for u_cat for indexing the output rate tensor based on differences between z_t and z_1.
-    For each position i where z_t and z_1 differ, we index as follows:
-
-    - z_t[i] = GAP_TOKEN & z_1[i] = c => u_mask[i, insert] = 1
-    - z_t[i] = c & z_1[i] = GAP_TOKEN => u_mask[i, delete] = 1
-    - z_t[i] = c1 & z_1[i] = c2 => u_mask[i, substitute] = 1
-    """
-    batch_size, z_seq_len = z_t.shape
-
-    z_neq = (z_t != z_1) & (z_t != pad_token) & (z_1 != pad_token)
-    z_ins = (z_t == gap_token) & (z_1 != gap_token) & z_neq  # (batch_size, z_seq_len)
-    z_del = (z_t != gap_token) & (z_1 == gap_token) & z_neq  # (batch_size, z_seq_len)
-    z_sub = z_neq & ~z_ins & ~z_del  # (batch_size, z_seq_len)
-
-    u_mask = torch.zeros((batch_size, z_seq_len, 3), dtype=torch.bool, device=z_t.device)
-
-    u_mask[:, :, 0][z_sub] = True
-    u_mask[:, :, 1][z_ins] = True
-    u_mask[:, :, 2][z_del] = True
-
-    assert z_neq.sum() == (z_ins | z_del | z_sub).sum(), "Mismatch in number of edits"
-    assert z_neq.sum() == u_mask.sum(), "Mismatch in number of edits in mask"
-
-    return u_mask
-
-
-def _unsqueeze(x, reference):
-    return x.view(
-        *x.shape,
-        *((1,) * (len(reference.shape) - len(x.shape))))
-
-
-class NLL(torchmetrics.aggregation.MeanMetric):
-    pass
-
-
-class BPD(NLL):
-    def compute(self) -> Tensor:
-        """Computes the bits per dimension.
-
-        Returns:
-          bpd
-        """
-        return self.mean_value / self.weight / LOG2
-
-
-class Perplexity(NLL):
-    def compute(self) -> Tensor:
-        """Computes the Perplexity.
-
-        Returns:
-         Perplexity
-        """
-        return torch.exp(self.mean_value / self.weight)
-
-
-class EditFlowBaseline(L.LightningModule):
+class EditFlowBaseline(EditFlowBase):
     def __init__(
             self,
             config,
             tokenizer: transformers.PreTrainedTokenizer):
-        super().__init__()
-        self.save_hyperparameters()
-        self.config = config
-
-        self.tokenizer = tokenizer
-
-        self.V = self.tokenizer.vocab_size
-
-        self.gen_ppl_eval_model_name_or_path = self.config.eval. \
-            gen_ppl_eval_model_name_or_path
-
-        if (not hasattr(self.tokenizer, 'mask_token')
-                or self.tokenizer.mask_token is None):
-            self.mask_token = self.V
-            self.V += 1
-        else:
-            self.mask_token = self.tokenizer.mask_token_id
-
-        self.pad_token = self.tokenizer.pad_token_id
-
-        self.gap_token = 3  # todo hardcoded for now, use unused token or manually add one
+        super().__init__(config, tokenizer)
 
         self.backbone = models.dit_edit_flow_baseline.DITEditFlow(
             self.config, vocab_size=self.V)
 
-        # generative perplexity
-        self.gen_ppl_metric = Perplexity()
-
-        self.eval_model_tokenizer = transformers.AutoTokenizer. \
-            from_pretrained(self.gen_ppl_eval_model_name_or_path)
-
-        if self.eval_model_tokenizer.pad_token is None:
-            self.eval_model_tokenizer.pad_token = \
-                self.eval_model_tokenizer.eos_token
-            self.eval_model_tokenizer.pad_token_id = \
-                self.eval_model_tokenizer.eos_token_id
-
-        self.lr = self.config.optim.lr
-
         self.time_conditioning = self.config.time_conditioning
-
-        self.fast_forward_epochs = None
-        self.fast_forward_batches = None
 
         # linear for unmasking (matches up with log linear sigma  = linear alpha with time from t = 1 to t = 0)
         self.default_scheduler = CubicScheduler(a=1.0, b=1.0)
 
-    def on_load_checkpoint(self, checkpoint):
-        # Copied from:
-        # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py#L41
-        self.fast_forward_epochs = checkpoint['loops'][
-            'fit_loop']['epoch_progress']['current']['completed']
-        self.fast_forward_batches = checkpoint['loops'][
-            'fit_loop']['epoch_loop.batch_progress'][
-            'current']['completed']
-
-    def on_save_checkpoint(self, checkpoint):
-        # Copied from:
-        # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/tasks/seq.py
-        # ['epoch_loop.batch_progress']['total']['completed'] is 1 iteration
-        # behind, so we're using the optimizer's progress.
-        checkpoint['loops']['fit_loop'][
-            'epoch_loop.batch_progress']['total'][
-            'completed'] = checkpoint['loops']['fit_loop'][
-                               'epoch_loop.automatic_optimization.optim_progress'][
-                               'optimizer']['step']['total'][
-                               'completed'] * self.trainer.accumulate_grad_batches
-        checkpoint['loops']['fit_loop'][
-            'epoch_loop.batch_progress']['current'][
-            'completed'] = checkpoint['loops']['fit_loop'][
-                               'epoch_loop.automatic_optimization.optim_progress'][
-                               'optimizer']['step']['current'][
-                               'completed'] * self.trainer.accumulate_grad_batches
-        # _batches_that_stepped tracks the number of global steps, not the number
-        # of local steps, so we don't multiply with self.trainer.accumulate_grad_batches here.
-        checkpoint['loops']['fit_loop'][
-            'epoch_loop.state_dict'][
-            '_batches_that_stepped'] = checkpoint['loops']['fit_loop'][
-            'epoch_loop.automatic_optimization.optim_progress'][
-            'optimizer']['step']['total']['completed']
-
-    def on_train_start(self):
-        # Adapted from:
-        # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
-        distributed = (
-                self.trainer._accelerator_connector.use_distributed_sampler
-                and self.trainer._accelerator_connector.is_distributed)
-        if distributed:
-            sampler_cls = dataloader.FaultTolerantDistributedSampler
-        else:
-            sampler_cls = dataloader.RandomFaultTolerantSampler
-        updated_dls = []
-        for dl in self.trainer.fit_loop._combined_loader.flattened:
-            if hasattr(dl.sampler, 'shuffle'):
-                dl_sampler = sampler_cls(
-                    dl.dataset, shuffle=dl.sampler.shuffle)
-            else:
-                dl_sampler = sampler_cls(dl.dataset)
-            if (distributed
-                    and self.fast_forward_epochs is not None
-                    and self.fast_forward_batches is not None):
-                print('Loading Sampler Checkpoint...')
-                dl_sampler.load_state_dict({
-                    'epoch': self.fast_forward_epochs,
-                    'counter': (self.fast_forward_batches
-                                * self.config.loader.batch_size)})
-            updated_dls.append(
-                torch.utils.data.DataLoader(
-                    dl.dataset,
-                    batch_size=self.config.loader.batch_size,
-                    num_workers=self.config.loader.num_workers,
-                    pin_memory=self.config.loader.pin_memory,
-                    sampler=dl_sampler,
-                    shuffle=False,
-                    persistent_workers=True,
-                    collate_fn=dl.collate_fn
-                ))
-        self.trainer.fit_loop._combined_loader.flattened = updated_dls
-
-    def forward(self, x, sigma):  # sigma is just t for our case
-        with torch.cuda.amp.autocast(dtype=torch.float32):
-            logits = self.backbone(x, sigma)
-
-        return logits
-
-    def on_train_epoch_start(self):
-        self.backbone.train()
+    def get_sched_coeff(self, t, eps=1e-9):
+        return (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))
 
     def _compute_loss(self, batch):
         x_0, x_1, z_0, z_1, t = batch
 
         z_t = self.sample_zt_sparse(z_0, z_1, t)
 
-        x_t, x_pad_mask, z_gap_mask, z_pad_mask = rm_gap_tokens(z_t, pad_token=self.pad_token, gap_token=self.gap_token)
+        x_t, x_pad_mask, z_gap_mask, z_pad_mask = self.rm_gap_tokens(z_t)
 
         u_t, sub_logits, ins_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
-        u_tot = u_t.sum(dim=(1, 2))
+        # u_tot = u_t.sum(dim=(1, 2))
+        # eps = 1e-9
+
+        sub_rates = u_t[:, :, 0]
+        ins_rates = u_t[:, :, 1]
+        del_rates = u_t[:, :, 2]
+
+        mask_expanded = x_pad_mask.unsqueeze(-1).bool()
+
+        # Force padded/context logits to -Inf (so softmax=0)
+        sub_logits = sub_logits.masked_fill(mask_expanded, -1e9)
+        ins_logits = ins_logits.masked_fill(mask_expanded, -1e9)
 
         eps = 1e-9
+        sched_coeff = self.get_sched_coeff(t)
 
-        log_rates = torch.log(u_t + eps)
+        if self.time_dependent:
+            sub_rates = F.softplus(torch.clamp(sub_rates, max=1e6))
+            ins_rates = F.softplus(torch.clamp(ins_rates, max=1e6))
+            del_rates = F.softplus(torch.clamp(del_rates, max=1e6))
 
-        lse_sub_x = sub_logits.logsumexp(dim=-1, keepdim=True) # [B, Sx, 1]
-        lse_ins_x = ins_logits.logsumexp(dim=-1, keepdim=True) # [B, Sx, 1]
+            sub_rates = sub_rates.masked_fill(mask_expanded, 0.0)
+            ins_rates = ins_rates.masked_fill(mask_expanded, 0.0)
+            del_rates = del_rates.masked_fill(mask_expanded, 0.0)
 
-        packed_features_x = torch.cat([log_rates, lse_sub_x, lse_ins_x], dim=-1)
+            u_tot = u_t.sum(dim=(1, 2))
 
-        packed_features_z = fill_gap_tokens_with_repeats(
+            u_t[:, :, 0] = sub_rates
+            u_t[:, :, 1] = ins_rates
+            u_t[:, :, 2] = del_rates
+
+            u_t = torch.log(u_t + eps)
+
+        else:  # model outputs time independent logits for ins/sub/del
+            sub_rates = sub_rates.masked_fill(mask_expanded, -1e9)
+            ins_rates = ins_rates.masked_fill(mask_expanded, -1e9)
+            del_rates = del_rates.masked_fill(mask_expanded, -1e9)
+
+            u_t[:, :, 0] = sub_rates
+            u_t[:, :, 1] = ins_rates
+            u_t[:, :, 2] = del_rates
+
+            if self.rate_scaling:
+                # u_tot = stable_sigmoid_sum(sched_coeff, ins_rates) + stable_sigmoid_sum(sched_coeff, sub_rates) + stable_sigmoid_sum(sched_coeff, del_rates)
+                u_tot = stable_sigmoid_sum(sched_coeff, u_t, dim=1).sum(dim=-1)
+            else:
+                # u_tot = ins_rates.sum(dim=-1) + torch.sigmoid(sub_rates).sum(dim=-1) + torch.sigmoid(del_rates).sum(
+                #     dim=-1)
+                u_tot = torch.sigmoid(u_t).sum(dim=-1)
+
+
+            u_t = F.logsigmoid(u_t)
+
+
+        uz_mask = self.make_uz_mask(z_t, z_1)
+
+        sub_mask = uz_mask[:, :, 0]
+        ins_mask = uz_mask[:, :, 1]
+        del_mask = uz_mask[:, :, 2]
+
+        lse_sub_x = sub_logits.logsumexp(dim=-1, keepdim=True)  # [B, Sx, 1]
+        lse_ins_x = ins_logits.logsumexp(dim=-1, keepdim=True)  # [B, Sx, 1]
+
+        packed_features_x = torch.cat([u_t, lse_sub_x, lse_ins_x], dim=-1)
+
+        packed_features_z = self.fill_gap_tokens_with_repeats(
             packed_features_x, z_gap_mask, z_pad_mask
         )
 
         log_rate_ins = packed_features_z[..., 0]
         log_rate_sub = packed_features_z[..., 1]
         log_rate_del = packed_features_z[..., 2]
-        lse_sub_z    = packed_features_z[..., 3]
-        lse_ins_z    = packed_features_z[..., 4]
-
+        lse_sub_z = packed_features_z[..., 3]
+        lse_ins_z = packed_features_z[..., 4]
 
         non_gap_mask = ~z_gap_mask
         x_indices = non_gap_mask.cumsum(dim=1) - 1
@@ -306,24 +132,20 @@ class EditFlowBaseline(L.LightningModule):
         target_sub_logits = sub_logits[batch_idx, x_indices, safe_z1]
         target_ins_logits = ins_logits[batch_idx, x_indices, safe_z1]
 
-        uz_mask = make_uz_mask(z_t, z_1, self.pad_token, self.gap_token)
-
-        target_sub_mask = uz_mask[:, :, 0]
-        target_ins_mask = uz_mask[:, :, 1]
-        target_del_mask = uz_mask[:, :, 2]
-
-        term_ins = (log_rate_ins + target_ins_logits - lse_ins_z) * target_ins_mask
-        term_del = (log_rate_del) * target_del_mask
-        term_sub = (log_rate_sub + target_sub_logits - lse_sub_z) * target_sub_mask
+        term_ins = (log_rate_ins + target_ins_logits - lse_ins_z) * ins_mask
+        term_del = log_rate_del * del_mask
+        term_sub = (log_rate_sub + target_sub_logits - lse_sub_z) * sub_mask
 
         selected_log_ll = term_ins + term_del + term_sub
 
-        default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))#.squeeze()
-
-        term2 = (selected_log_ll * default_coeff).sum(dim=1)
+        if self.rate_scaling:
+            term2 = (selected_log_ll * sched_coeff).sum(dim=1)
+        else:
+            term2 = selected_log_ll.sum(dim=1)
 
         loss = u_tot - term2
 
+        u_t = torch.exp(u_t)
         u_ins = u_t[:, :, 0].sum(dim=1).mean()
         u_del = u_t[:, :, 2].sum(dim=1).mean()
         u_sub = u_t[:, :, 1].sum(dim=1).mean()
@@ -360,7 +182,6 @@ class EditFlowBaseline(L.LightningModule):
             z_t = torch.where(noise_mask, random_tokens, z_t)
 
         return z_t
-
 
     def training_step(self, batch, batch_idx):
         loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
@@ -504,8 +325,10 @@ class EditFlowBaseline(L.LightningModule):
                 non_pad_mask = ~x_pad_mask
 
                 if non_pad_mask.any():
-                    ins_sampled = torch.multinomial(ins_probs[non_pad_mask], num_samples=1, replacement=True).squeeze(-1)
-                    sub_sampled = torch.multinomial(sub_probs[non_pad_mask], num_samples=1, replacement=True).squeeze(-1)
+                    ins_sampled = torch.multinomial(ins_probs[non_pad_mask], num_samples=1, replacement=True).squeeze(
+                        -1)
+                    sub_sampled = torch.multinomial(sub_probs[non_pad_mask], num_samples=1, replacement=True).squeeze(
+                        -1)
                     ins_tokens[non_pad_mask] = ins_sampled
                     sub_tokens[non_pad_mask] = sub_sampled
 
@@ -637,6 +460,7 @@ class EditFlowBaseline(L.LightningModule):
                         != self.eval_model_tokenizer.eos_token_id)
                 self.gen_ppl_metric.update(
                     nlls, first_eos[..., 1:] + token_mask[..., 1:])
+
 
 def apply_ins_del_operations(
         x_t: torch.Tensor,
