@@ -1,6 +1,6 @@
 train: lm1b
 valid: lm1b
 tokenizer_name_or_path: bert-base-uncased
-cache_dir: /home/sean/edit-flows/data
+cache_dir: /home/sean/Documents/edit-flows/data
 wrap: False
 streaming: False

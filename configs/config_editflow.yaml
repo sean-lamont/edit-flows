@@ -1,6 +1,7 @@
 defaults:
   - _self_
-  - /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor]
+  #  - /callbacks: [ checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor ]
+  - /callbacks: [ learning_rate_monitor ]
   - /data: lm1b
   - /model: small
   - /strategy: ddp
@@ -10,10 +11,14 @@ defaults:
 mode: train  # train / ppl_eval / sample_eval
 time_conditioning: False
 
+time_dependent: False
+rate_scaling: False
+
+
 seed: 1
 
 loader:
-  global_batch_size: 256
+  global_batch_size: 64
   eval_global_batch_size: ${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**
   batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
@@ -53,15 +58,16 @@ trainer:
   max_steps: 1_000_000
   log_every_n_steps: 10
   limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
-  limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
-  val_check_interval: 5000
+#  limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
+  limit_val_batches: 0.05     # validate on full dataset, can be used to toggle quick run
+  val_check_interval: 500
 
 wandb:
   project: text-diffusion
-#  notes: Mulan for text
+  #  notes: Mulan for text
   group: null
   job_type: null
-#  offline: true
+  offline: true
   name: poisson_with_dels
   tags:
     - ${data.train}

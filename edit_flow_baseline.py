@@ -35,9 +35,6 @@ class EditFlowBaseline(EditFlowBase):
 
         u_t, sub_logits, ins_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
-        # u_tot = u_t.sum(dim=(1, 2))
-        # eps = 1e-9
-
         sub_rates = u_t[:, :, 0]
         ins_rates = u_t[:, :, 1]
         del_rates = u_t[:, :, 2]
@@ -56,9 +53,9 @@ class EditFlowBaseline(EditFlowBase):
             ins_rates = F.softplus(torch.clamp(ins_rates, max=1e6))
             del_rates = F.softplus(torch.clamp(del_rates, max=1e6))
 
-            sub_rates = sub_rates.masked_fill(mask_expanded, 0.0)
-            ins_rates = ins_rates.masked_fill(mask_expanded, 0.0)
-            del_rates = del_rates.masked_fill(mask_expanded, 0.0)
+            sub_rates = sub_rates.masked_fill(x_pad_mask, 0.0)
+            ins_rates = ins_rates.masked_fill(x_pad_mask, 0.0)
+            del_rates = del_rates.masked_fill(x_pad_mask, 0.0)
 
             u_tot = u_t.sum(dim=(1, 2))
 
@@ -69,9 +66,9 @@ class EditFlowBaseline(EditFlowBase):
             u_t = torch.log(u_t + eps)
 
         else:  # model outputs time independent logits for ins/sub/del
-            sub_rates = sub_rates.masked_fill(mask_expanded, -1e9)
-            ins_rates = ins_rates.masked_fill(mask_expanded, -1e9)
-            del_rates = del_rates.masked_fill(mask_expanded, -1e9)
+            sub_rates = sub_rates.masked_fill(x_pad_mask, -1e9)
+            ins_rates = ins_rates.masked_fill(x_pad_mask, -1e9)
+            del_rates = del_rates.masked_fill(x_pad_mask, -1e9)
 
             u_t[:, :, 0] = sub_rates
             u_t[:, :, 1] = ins_rates
@@ -99,9 +96,10 @@ class EditFlowBaseline(EditFlowBase):
             packed_features_x, z_gap_mask, z_pad_mask
         )
 
-        log_rate_ins = packed_features_z[..., 0]
-        log_rate_sub = packed_features_z[..., 1]
+        log_rate_sub = packed_features_z[..., 0]
+        log_rate_ins = packed_features_z[..., 1]
         log_rate_del = packed_features_z[..., 2]
+
         lse_sub_z = packed_features_z[..., 3]
         lse_ins_z = packed_features_z[..., 4]
 
@@ -130,9 +128,9 @@ class EditFlowBaseline(EditFlowBase):
         loss = u_tot - term2
 
         u_t = torch.exp(u_t)
-        u_ins = u_t[:, :, 0].sum(dim=1).mean()
+        u_sub = u_t[:, :, 0].sum(dim=1).mean()
+        u_ins = u_t[:, :, 1].sum(dim=1).mean()
         u_del = u_t[:, :, 2].sum(dim=1).mean()
-        u_sub = u_t[:, :, 1].sum(dim=1).mean()
 
         return loss.mean(), u_tot, u_ins, u_del, u_sub, term2.mean()
 
