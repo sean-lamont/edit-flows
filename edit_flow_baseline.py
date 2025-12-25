@@ -36,7 +36,7 @@ class EditFlowBaseline(EditFlowBase):
 
         u_t_logits, sub_vocab_logits, ins_vocab_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
-        sched_coeff_z = self.get_sched_coeff(t, z_0, z_1, z_t)
+        sched_coeff_z = self.get_sched_coeff(t)
 
         raw_sub = u_t_logits[:, :, 0]
         raw_ins = u_t_logits[:, :, 1]
@@ -124,7 +124,7 @@ class EditFlowBaseline(EditFlowBase):
         x_indices = x_indices.clamp(min=0, max=x_t.shape[1] - 1)
 
         valid_vocab_limit = sub_vocab_logits.size(-1) - 1
-        safe_z1 = z_1.clamp(min=0, ins_vocab_logitsmax=valid_vocab_limit)
+        safe_z1 = z_1.clamp(min=0, max=valid_vocab_limit)
         batch_idx = torch.arange(x_t.shape[0], device=self.device).unsqueeze(1)
 
         target_sub_logits = sub_vocab_logits[batch_idx, x_indices, safe_z1]
@@ -144,9 +144,9 @@ class EditFlowBaseline(EditFlowBase):
         loss = u_tot - term2
 
         with torch.no_grad():
-            u_ins_mean = r_ins.mean()
-            u_del_mean = r_del.mean()
-            u_sub_mean = r_sub.mean()
+            u_ins_mean = r_ins.sum(dim=1).mean()
+            u_del_mean = r_del.sum(dim=1).mean()
+            u_sub_mean = r_sub.sum(dim=1).mean()
 
         return loss.mean(), u_tot.mean(), u_ins_mean, u_del_mean, u_sub_mean, term2.mean()
 

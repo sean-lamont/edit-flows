@@ -54,7 +54,7 @@ trainer:
   gradient_clip_val: 1.0
   precision: 'bf16-mixed'
   num_sanity_val_steps: 2
-  max_steps: 100_000 #1_000_000
+  max_steps: 200_000 #1_000_000
   log_every_n_steps: 10
   limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
   limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
@@ -70,7 +70,7 @@ wandb:
   tags:
     - ${data.train}
     - ${data.valid}
-    - time_conditioning:${time_conditioning}
+    - time_dependent:${time_dependent}
     - rate_scaling:${rate_scaling}
 #    - ${noise.type}
 

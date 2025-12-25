@@ -550,28 +550,29 @@ class EditFlow(EditFlowBase):
             log_r_del = torch.log(r_del + eps)
 
         else:  # Time Independent
-            sched_coeff_x = torch.zeros_like(x_t, dtype=u_t_logits.dtype)
-
-            if sched_coeff_z.dim() > 1 and sched_coeff_z.shape[1] == z_t.shape[1]:
-                mask_z = ~z_gap_mask
-                ranks = mask_z.cumsum(dim=1) - 1
-                valid_z = mask_z & (ranks < x_t.shape[1])
-
-                values = sched_coeff_z[valid_z]
-                dest_cols = ranks[valid_z]
-                dest_rows = torch.arange(bsz, device=x_t.device).unsqueeze(1).expand_as(z_t)[valid_z]
-
-                values = values.to(dtype=sched_coeff_x.dtype)
-                sched_coeff_x[dest_rows, dest_cols] = values
-
-            else:
-                sched_coeff_x = sched_coeff_z.to(dtype=u_t_logits.dtype)
 
             r_ins = F.softplus(raw_ins).masked_fill(x_pad_mask, 0)
             r_sub = torch.sigmoid(raw_sub).masked_fill(x_pad_mask, 0)
             r_del = torch.sigmoid(raw_del).masked_fill(x_pad_mask, 0)
 
             if self.rate_scaling:
+                sched_coeff_x = torch.zeros_like(x_t, dtype=u_t_logits.dtype)
+
+                if sched_coeff_z.dim() > 1 and sched_coeff_z.shape[1] == z_t.shape[1]:
+                    mask_z = ~z_gap_mask
+                    ranks = mask_z.cumsum(dim=1) - 1
+                    valid_z = mask_z & (ranks < x_t.shape[1])
+
+                    values = sched_coeff_z[valid_z]
+                    dest_cols = ranks[valid_z]
+                    dest_rows = torch.arange(bsz, device=x_t.device).unsqueeze(1).expand_as(z_t)[valid_z]
+
+                    values = values.to(dtype=sched_coeff_x.dtype)
+                    sched_coeff_x[dest_rows, dest_cols] = values
+
+                else:
+                    sched_coeff_x = sched_coeff_z
+
                 u_tot = (r_ins * sched_coeff_x).sum(dim=-1) + \
                         (r_sub * sched_coeff_x).sum(dim=-1) + \
                         (r_del * sched_coeff_x).sum(dim=-1)
@@ -610,6 +611,7 @@ class EditFlow(EditFlowBase):
         batch_idx_seq = torch.arange(bsz, device=self.device).unsqueeze(1)
 
         target_logits_z = sub_vocab_logits[batch_idx_seq, x_indices, safe_z1]
+
         vocab_nll = lse_sub_z - target_logits_z
 
         selected_log_ll = (
@@ -626,9 +628,9 @@ class EditFlow(EditFlowBase):
         loss = u_tot - term2
 
         with torch.no_grad():
-            u_ins_mean = r_ins.mean()
-            u_del_mean = r_del.mean()
-            u_sub_mean = r_sub.mean()
+            u_ins_mean = r_ins.sum(dim=1).mean()
+            u_del_mean = r_del.sum(dim=1).mean()
+            u_sub_mean = r_sub.sum(dim=1).mean()
 
         return loss.mean(), u_tot.mean(), u_ins_mean, u_del_mean, u_sub_mean, term2.mean()
 
