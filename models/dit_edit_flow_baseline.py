@@ -387,14 +387,16 @@ class DITEditFlow(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             sub_logits = self.output_layer(x, c)  # bsz, seq_len, vocab
             ins_logits = self.output_layer_2(x, c)  # bsz, seq_len, vocab
 
-            rates = F.softplus(
-                torch.clamp(self.rate_layer(x), max=1e6))  # (batch_size, x_seq_len, 3) - ensure positive rates
+            rates = self.rate_layer(x)
 
-            if attention_mask is not None:
-                mask_expanded = attention_mask.unsqueeze(-1).bool()
-                rates = rates.masked_fill(mask_expanded, 0.0)
-                # Force padded logits to -Inf (so softmax=0)
-                sub_logits = sub_logits.masked_fill(mask_expanded, -1e9)
-                ins_logits = ins_logits.masked_fill(mask_expanded, -1e9)
+            # rates = F.softplus(
+            #     torch.clamp(self.rate_layer(x), max=1e6))  # (batch_size, x_seq_len, 3) - ensure positive rates
+            #
+            # if attention_mask is not None:
+            #     mask_expanded = attention_mask.unsqueeze(-1).bool()
+            #     rates = rates.masked_fill(mask_expanded, 0.0)
+            #     # Force padded logits to -Inf (so softmax=0)
+            #     sub_logits = sub_logits.masked_fill(mask_expanded, -1e9)
+            #     ins_logits = ins_logits.masked_fill(mask_expanded, -1e9)
 
         return rates, sub_logits, ins_logits
