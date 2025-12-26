@@ -65,28 +65,29 @@ class EditFlowBaseline(EditFlowBase):
             # u_t_logits = torch.log(u_t_logits + eps)
 
         else:  # model outputs time independent logits for ins/sub/del
-            sched_coeff_x = torch.zeros_like(x_t, dtype=u_t_logits.dtype)
-
-            if sched_coeff_z.dim() > 1 and sched_coeff_z.shape[1] == z_t.shape[1]:
-                mask_z = ~z_gap_mask
-                ranks = mask_z.cumsum(dim=1) - 1
-                valid_z = mask_z & (ranks < x_t.shape[1])
-
-                values = sched_coeff_z[valid_z]
-                dest_cols = ranks[valid_z]
-                dest_rows = torch.arange(bsz, device=x_t.device).unsqueeze(1).expand_as(z_t)[valid_z]
-
-                values = values.to(dtype=sched_coeff_x.dtype)
-                sched_coeff_x[dest_rows, dest_cols] = values
-
-            else:
-                sched_coeff_x = sched_coeff_z
-
-            r_ins = torch.sigmoid(raw_ins).masked_fill(x_pad_mask, 0)
+            r_ins = F.softplus(raw_ins).masked_fill(x_pad_mask, 0)
+            # r_ins = torch.sigmoid(raw_ins).masked_fill(x_pad_mask, 0)
             r_sub = torch.sigmoid(raw_sub).masked_fill(x_pad_mask, 0)
             r_del = torch.sigmoid(raw_del).masked_fill(x_pad_mask, 0)
 
             if self.rate_scaling:
+                sched_coeff_x = torch.zeros_like(x_t, dtype=u_t_logits.dtype)
+
+                if sched_coeff_z.dim() > 1 and sched_coeff_z.shape[1] == z_t.shape[1]:
+                    mask_z = ~z_gap_mask
+                    ranks = mask_z.cumsum(dim=1) - 1
+                    valid_z = mask_z & (ranks < x_t.shape[1])
+
+                    values = sched_coeff_z[valid_z]
+                    dest_cols = ranks[valid_z]
+                    dest_rows = torch.arange(bsz, device=x_t.device).unsqueeze(1).expand_as(z_t)[valid_z]
+
+                    values = values.to(dtype=sched_coeff_x.dtype)
+                    sched_coeff_x[dest_rows, dest_cols] = values
+
+                else:
+                    sched_coeff_x = sched_coeff_z
+
                 u_tot = (r_ins * sched_coeff_x).sum(dim=-1) + \
                         (r_sub * sched_coeff_x).sum(dim=-1) + \
                         (r_del * sched_coeff_x).sum(dim=-1)
@@ -94,7 +95,8 @@ class EditFlowBaseline(EditFlowBase):
                 u_tot = r_ins.sum(dim=-1) + r_sub.sum(dim=-1) + r_del.sum(dim=-1)
 
             # Log Rates
-            log_r_ins = F.logsigmoid(raw_ins)
+            # log_r_ins = F.logsigmoid(raw_ins)
+            log_r_ins = torch.log(r_ins + 1e-9)
             log_r_sub = F.logsigmoid(raw_sub)
             log_r_del = F.logsigmoid(raw_del)
 
@@ -220,7 +222,8 @@ class EditFlowBaseline(EditFlowBase):
 
                 if not self.time_dependent:  # move logits to probabilities
                     lambda_sub = torch.sigmoid(lambda_sub)
-                    lambda_ins = torch.sigmoid(lambda_ins)
+                    # lambda_ins = torch.sigmoid(lambda_ins)
+                    lambda_ins = F.softplus(torch.clamp(lambda_ins, max=1e6))
                     lambda_del = torch.sigmoid(lambda_del)
                 else:
                     lambda_sub = F.softplus(torch.clamp(lambda_sub, max=1e6))

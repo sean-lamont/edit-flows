@@ -1,7 +1,9 @@
 import datasets
 import torch
 import transformers
+import tokenizers
 from torch.utils.data import DataLoader, Dataset
+from dataloader import get_tokenizer
 
 LLADA_TEMPLATE = (
     "<BOS><start_id>user<end_id>\n{prompt}<eot_id>"
@@ -41,7 +43,7 @@ class AutoformalCollator:
         self.gap_token_id = gap_token_id
 
         # LLaDA uses Left Padding
-        self.tokenizer.padding_side = 'left'
+        self.tokenizer.padding_side = 'right'
 
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -87,7 +89,11 @@ class AutoformalCollator:
             "context_mask": context_masks
         }
 
-    def _collate_tef(self, prompts, codes):
+    def _collate_tef(self, prompts, codes, del_prob=0.05):
+        # Clean endpoints (different lengths)
+        x0_list, x1_list = [], []
+
+        # Aligned training trajectories (same length)
         z0_list, z1_list = [], []
         context_mask_list = []
 
@@ -95,14 +101,75 @@ class AutoformalCollator:
             p_ids = self.tokenizer.encode(p_str, add_special_tokens=False)
             c_ids = self.tokenizer.encode(c_str, add_special_tokens=False)
 
-            # Target: Prompt + Code
-            z1_seq = p_ids + c_ids
+            # --- 1. Construct Clean Endpoints ---
+            # x_0: Context + BOS
+            # x_1: Context + BOS + Code
 
-            # Source: Prompt + Gaps (Insertion Task)
-            z0_seq = p_ids + [self.gap_token_id] * len(c_ids)
+            # We treat BOS as the boundary. It is appended to Context.
+            curr_x0 = p_ids
+            curr_x1 = p_ids + c_ids
 
-            c_mask = [1] * len(p_ids) + [0] * len(c_ids)
+            x0_list.append(torch.tensor(curr_x0[:self.max_length], dtype=torch.long))
+            x1_list.append(torch.tensor(curr_x1[:self.max_length], dtype=torch.long))
 
+            # --- 2. Construct Aligned Trajectories (z0, z1) ---
+            # The immutable prefix includes the Prompt and the BOS token.
+            prefix = p_ids
+
+            # Prepare the mutable region (Code)
+            n_code_tokens = len(c_ids)
+            n_slots = n_code_tokens #+1
+
+            # Noise Logic: Only applied to the Code region
+            ins_mask = torch.rand(n_slots) < del_prob
+
+            z0_code_parts = []
+            z1_code_parts = []
+
+            if ins_mask.any():
+                num_ins = ins_mask.sum().item()
+
+                # Generate Garbage tokens (Sample from vocab, reject Pad/Gap/BOS)
+                noise_tokens = torch.randint(0, self.tokenizer.vocab_size, (num_ins,))
+                mask_invalid = (noise_tokens == self.tokenizer.pad_token_id) | \
+                               (noise_tokens == self.gap_token_id) | \
+                               (noise_tokens == self.tokenizer.bos_token_id)
+
+                while mask_invalid.any():
+                    num_invalid = mask_invalid.sum().item()
+                    new_tokens = torch.randint(0, self.tokenizer.vocab_size, (num_invalid,))
+                    noise_tokens[mask_invalid] = new_tokens
+                    mask_invalid = (noise_tokens == self.tokenizer.pad_token_id) | \
+                                   (noise_tokens == self.gap_token_id) | \
+                                   (noise_tokens == self.tokenizer.bos_token_id)
+
+                noise_tokens = noise_tokens.tolist()
+                noise_ptr = 0
+
+                for i in range(n_slots):
+                    # Insertion Logic (Garbage in z0, Gap in z1)
+                    if ins_mask[i]:
+                        z0_code_parts.append(noise_tokens[noise_ptr])
+                        z1_code_parts.append(self.gap_token_id)
+                        noise_ptr += 1
+
+                    # Standard Token Logic (Gap in z0, Code in z1)
+                    if i < n_code_tokens:
+                        z0_code_parts.append(self.gap_token_id)
+                        z1_code_parts.append(c_ids[i])
+            else:
+                # No noise path
+                z0_code_parts = [self.gap_token_id] * n_code_tokens
+                z1_code_parts = c_ids
+
+            # Combine Prefix + Mutable Region
+            z0_seq = prefix + z0_code_parts
+            z1_seq = prefix + z1_code_parts
+
+            # Mask: 1 for Immutable Prefix, 0 for Mutable Region (Code + Noise)
+            c_mask = [1] * len(prefix) + [0] * len(z0_code_parts)
+
+            # Truncation (applied to the aligned sequences)
             if len(z1_seq) > self.max_length:
                 z1_seq = z1_seq[:self.max_length]
                 z0_seq = z0_seq[:self.max_length]
@@ -112,17 +179,37 @@ class AutoformalCollator:
             z1_list.append(torch.tensor(z1_seq, dtype=torch.long))
             context_mask_list.append(torch.tensor(c_mask, dtype=torch.bool))
 
-        z0 = self._left_pad(z0_list, self.tokenizer.pad_token_id)
-        z1 = self._left_pad(z1_list, self.tokenizer.pad_token_id)
-        context_mask = self._left_pad(context_mask_list, 1)
+        # --- 3. Padding ---
+        # Pad each list independently to its own max length.
+        # x_0 = self._left_pad(x0_list, self.tokenizer.pad_token_id)
+        # x_1 = self._left_pad(x1_list, self.tokenizer.pad_token_id)
+        #
+        # z0 = self._left_pad(z0_list, self.tokenizer.pad_token_id)
+        # z1 = self._left_pad(z1_list, self.tokenizer.pad_token_id)
 
-        x_1 = z1.clone()
-        x_0 = z0.clone()
-        x_0[x_0 == self.gap_token_id] = self.tokenizer.pad_token_id
+        x_0 = self._right_pad(x0_list, self.tokenizer.pad_token_id)
+        x_1 = self._right_pad(x1_list, self.tokenizer.pad_token_id)
 
-        t = torch.rand(z0.shape[0], 1)
+        z0 = self._right_pad(z0_list, self.tokenizer.pad_token_id)
+        z1 = self._right_pad(z1_list, self.tokenizer.pad_token_id)
+
+
+        context_mask = self._right_pad(context_mask_list, 1)
+
+        t = torch.rand(x_1.shape[0], 1)
+        t = torch.clamp(t, min=0.01, max=0.99)
 
         return x_0, x_1, z0, z1, t, context_mask
+
+    # dataloader_af.py
+
+    # Rename/Modify this function
+    def _right_pad(self, tensor_list, padding_value):
+        # Standard pad_sequence is Right Padding by default for batch_first=True
+        return torch.nn.utils.rnn.pad_sequence(
+            tensor_list, batch_first=True, padding_value=padding_value
+        )
+
 
     def _left_pad(self, tensor_list, padding_value):
         reversed_tensors = [t.flip(0) for t in tensor_list]
@@ -133,10 +220,13 @@ class AutoformalCollator:
 
 
 def get_dataloaders(tokenizer, batch_size=4, mode='llada', max_length=1024):
+    if tokenizer.padding_side != 'right':
+        tokenizer.padding_side = 'right'
+
     train_ds = AutoformalizationDataset('train', tokenizer, max_length)
     val_ds = AutoformalizationDataset('test', tokenizer, max_length)
 
-    collator = AutoformalCollator(tokenizer, mode=mode, max_length=max_length)
+    collator = AutoformalCollator(tokenizer, mode=mode, max_length=max_length, gap_token_id=126084)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
@@ -146,9 +236,15 @@ def get_dataloaders(tokenizer, batch_size=4, mode='llada', max_length=1024):
         val_ds, batch_size=batch_size, shuffle=False,
         collate_fn=collator, num_workers=4
     )
+
+
+
+    train_loader.tokenizer = tokenizer
+    val_loader.tokenizer = tokenizer
+
     return train_loader, val_loader
 
-#
+
 # if __name__ == "__main__":
 #     print("Initializing Tokenizer...")
 #     tokenizer = transformers.AutoTokenizer.from_pretrained("GSAI-ML/LLaDA-8B-Instruct")
@@ -181,6 +277,11 @@ def get_dataloaders(tokenizer, batch_size=4, mode='llada', max_length=1024):
 #     print(f"z0 last tokens (sample 0): {z0[0, -10:].tolist()}")
 #     print(f"z1 last tokens (sample 0): {z1[0, -10:].tolist()}")
 #
-#     is_gap = (z0 == 999)
+#     print(f"decoded z0 (sample 0): {tokenizer.decode(z0[0])}\n\n")
+#     print(f"decoded z1 (sample 0): {tokenizer.decode(z1[0])}\n\n")
+#
+#
+#
+#     is_gap = (z0 == 126084)
 #     print(f"Number of Gaps inserted: {is_gap.sum().item()}")
 #     print("Test Complete.")

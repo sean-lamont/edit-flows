@@ -1,0 +1,6 @@
+train: autoformalization
+valid: autoformalization
+tokenizer_name_or_path: "GSAI-ML/LLaDA-8B-Instruct"
+cache_dir: /home/sean/Documents/edit-flows/data
+wrap: False
+streaming: False

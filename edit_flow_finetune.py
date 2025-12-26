@@ -1,12 +1,10 @@
 import torch
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
 from tqdm import tqdm
 
-from edit_flow import EditFlow, stable_sigmoid_sum
-from flow_utils import rm_gap_tokens
+from edit_flow import EditFlow
 
 
 class LLaDABackbone(nn.Module):
@@ -14,16 +12,32 @@ class LLaDABackbone(nn.Module):
         super().__init__()
         self.config = config
 
-        # Load LLaDA
-        print(f"Loading LLaDA Backbone: {config.model_name}")
-        self.base_model = transformers.AutoModel.from_pretrained(
-            config.model_name,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        print(f"Loading LLaDA Backbone")
+
+        bnb_config = transformers.BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",  # NormalFloat4 is best for pre-trained weights
+            bnb_4bit_use_double_quant=True,  # Compresses the quantization constants
+            bnb_4bit_compute_dtype=torch.bfloat16  # Compute in bf16 for stability
         )
+
+        print(f"Loading LLaDA Backbone (Quantized)")
+        self.base_model = transformers.AutoModel.from_pretrained(
+            "GSAI-ML/LLaDA-8B-Instruct",
+            trust_remote_code=True,
+            quantization_config=bnb_config,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+
+        # Freeze Backbone
+        for param in self.base_model.parameters():
+            param.requires_grad = False
+
         self.hidden_size = self.base_model.config.hidden_size
         self.vocab_size = vocab_size
 
+        # Heads for Edit Flow
         self.ins_head = nn.Sequential(
             nn.Linear(self.hidden_size, 1024),
             nn.GELU(),
@@ -42,22 +56,36 @@ class LLaDABackbone(nn.Module):
             nn.Linear(1024, 1)  # Output raw logits
         )
 
-        if hasattr(self.base_model, 'lm_head'):
-            self.content_head = self.base_model.lm_head
-        else:
-            self.content_head = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
+        # Re-use the LM Head
+        self.content_head = self.base_model.model.transformer.ff_out
+
+        # Unfreeze heads
+        for param in self.content_head.parameters():
+            param.requires_grad = True
 
     def forward(self, x, t=None, attention_mask=None):
-        outputs = self.base_model(x, attention_mask=attention_mask, output_hidden_states=True)
-        h = outputs.last_hidden_state
+        """
+        Forward pass assuming Right Padding.
+        attention_mask: Bool [B, L], True=Pad (Ignore), False=Content (Attend)
+        """
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
 
-        ins_pred = self.ins_head(h)
-        sub_pred = self.sub_head(h)
-        del_pred = self.del_head(h)
+            # Convert internal pad mask (True=Pad) to HF attention mask (1=Attend)
+            if attention_mask is not None:
+                hf_mask = (~attention_mask).long()
+            else:
+                hf_mask = None
 
-        sub_logits = self.content_head(h)
+            outputs = self.base_model(x, attention_mask=hf_mask, output_hidden_states=True)
+            h = outputs.hidden_states[-1]
 
-        rates = torch.cat([sub_pred, ins_pred, del_pred], dim=-1)
+            ins_pred = self.ins_head(h)
+            sub_pred = self.sub_head(h)
+            del_pred = self.del_head(h)
+
+            sub_logits = self.content_head(h)
+
+            rates = torch.cat([sub_pred, ins_pred, del_pred], dim=-1)
 
         return rates, sub_logits
 
@@ -69,146 +97,291 @@ class EditFlowFineTune(EditFlow):
             tokenizer: transformers.PreTrainedTokenizer):
         super().__init__(config, tokenizer)
 
-        self.backbone = LLaDABackbone(
-            self.config, vocab_size=self.V)
+        self.mask_token_id = 126336  # Not used in "No Gap Token" mode usually, but kept for legacy
+        self.backbone = LLaDABackbone(self.config, vocab_size=self.V)
+        self.gap_token = 126084  # Reserved token
 
-        self.gap_token = 126084  # for LLADA , reserved_token0
+        # Force Right Padding on Tokenizer just in case
+        self.tokenizer.padding_side = 'right'
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
 
     def _compute_loss(self, batch):
-        # context mask = (bsz, seq_len) where we keep original context (i.e. x0, z0, z1, x1 should all have context_ids the same)
+        """
+        Compute Loss Assuming RIGHT PADDING for all Inputs (x_0, x_1, z_0, z_1).
+        """
         x_0, x_1, z_0, z_1, t, context_mask = batch
+        bsz = x_0.shape[0]
 
-        z_t = self.sample_zt_sparse(z_0, z_1, t)
+        # 1. Sample Z_t (Aligned Space)
+        z_t = self.sample_zt(z_0, z_1, t)
 
-        x_t, x_pad_mask, z_gap_mask, z_pad_mask = rm_gap_tokens(z_t, pad_token=self.pad_token, gap_token=self.gap_token)
+        # Ensure context is preserved in z_t (Context is immutable)
+        # context_mask should be aligned with z-space
+        z_t = torch.where(context_mask, z_1, z_t)
 
-        # we set x_t to x_1 for context_ids (assumes x0, x1, z0, z1 all have context at same ids!)
+        # 2. Collapse to X_t (Model Input Space - Right Padded)
+        x_t, x_pad_mask, z_gap_mask, z_pad_mask = self.rm_gap_tokens(z_t)
 
-        x_t = torch.where(context_mask, x_1, x_t)
+        # 3. Forward Pass
+        u_t_logits, sub_vocab_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
-        u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
+        # 4. Schedulers & Rates
+        sched_coeff_z = self.get_sched_coeff(t, z_0, z_1, z_t)
+        ignore_mask = x_pad_mask  # True for Pad
 
-        sub_rates = u_t[:, :, 0]
-        ins_rates = u_t[:, :, 1]
-        del_rates = u_t[:, :, 2]
+        raw_sub = u_t_logits[:, :, 0]
+        raw_ins = u_t_logits[:, :, 1]
+        raw_del = u_t_logits[:, :, 2]
 
-        mask_expanded = (context_mask | x_pad_mask).unsqueeze(-1).bool()
+        # Mask padding logits (-inf for Softmax)
+        sub_vocab_logits = sub_vocab_logits.masked_fill(ignore_mask.unsqueeze(-1), -1e9)
 
-        # Force padded/context logits to -Inf (so softmax=0)
-        sub_logits = sub_logits.masked_fill(mask_expanded, -1e9)
+        if self.time_dependent:
+            r_sub = F.softplus(torch.clamp(raw_sub, max=1e6)).masked_fill(ignore_mask, 0)
+            r_ins = F.softplus(torch.clamp(raw_ins, max=1e6)).masked_fill(ignore_mask, 0)
+            r_del = F.softplus(torch.clamp(raw_del, max=1e6)).masked_fill(ignore_mask, 0)
 
-        # rates always positive for insert (time dependent = full rate, time independent = predicted # inserts)
-        ins_rates = F.softplus(torch.clamp(ins_rates, max=1e6))
-        ins_rates = ins_rates.masked_fill(mask_expanded, 0.0)
+            u_tot = (r_ins + r_sub + r_del).sum(dim=-1)
 
-        eps = 1e-9
-        sched_coeff = self.get_sched_coeff(t, z_0, z_1, z_t)
+            eps = 1e-9
+            log_r_sub = torch.log(r_sub + eps)
+            log_r_ins = torch.log(r_ins + eps)
+            log_r_del = torch.log(r_del + eps)
 
-        if self.time_dependent:  # model outputs the full rate prediction
-            sub_rates = F.softplus(torch.clamp(sub_rates, max=1e6))
-            sub_rates = sub_rates.masked_fill(mask_expanded, 0.0)
-
-            del_rates = F.softplus(torch.clamp(del_rates, max=1e6))
-            del_rates = del_rates.masked_fill(mask_expanded, 0.0)
-
-            u_tot = u_t.sum(dim=(1, 2))
-
-            u_t[:, :, 0] = sub_rates
-            u_t[:, :, 1] = ins_rates
-            u_t[:, :, 2] = del_rates
-
-            u_t = torch.log(u_t + eps)
-
-        else:  # model outputs time independent logit for a sub/delete
-            sub_rates = sub_rates.masked_fill(mask_expanded, -1e9)
-            del_rates = del_rates.masked_fill(mask_expanded, -1e9)
+        else:  # Time Independent
+            r_ins = F.softplus(raw_ins).masked_fill(ignore_mask, 0)
+            r_sub = torch.sigmoid(raw_sub).masked_fill(ignore_mask, 0)
+            r_del = torch.sigmoid(raw_del).masked_fill(ignore_mask, 0)
 
             if self.rate_scaling:
-                u_tot = (ins_rates * sched_coeff).sum(dim=-1) + stable_sigmoid_sum(sched_coeff,
-                                                                                   sub_rates) + stable_sigmoid_sum(
-                    sched_coeff, del_rates)
+                # Map Z-space sched_coeff to X-space (Right Padded mapping is simple)
+                sched_coeff_x = torch.zeros_like(r_ins)
+
+                if sched_coeff_z.dim() > 1:
+                    mask_z = ~z_gap_mask
+                    # Ranks in Z map directly to indices in X (Right Pad)
+                    ranks = mask_z.cumsum(dim=1) - 1
+                    valid_z = mask_z & (ranks < x_t.shape[1])
+
+                    values = sched_coeff_z[valid_z]
+                    dest_cols = ranks[valid_z]
+                    dest_rows = torch.arange(bsz, device=x_t.device).unsqueeze(1).expand_as(z_t)[valid_z]
+
+                    sched_coeff_x[dest_rows, dest_cols] = values.to(dtype=sched_coeff_x.dtype)
+                else:
+                    sched_coeff_x = sched_coeff_z
+
+                u_tot = (r_ins * sched_coeff_x).sum(dim=-1) + \
+                        (r_sub * sched_coeff_x).sum(dim=-1) + \
+                        (r_del * sched_coeff_x).sum(dim=-1)
             else:
-                u_tot = ins_rates.sum(dim=-1) + torch.sigmoid(sub_rates).sum(dim=-1) + torch.sigmoid(del_rates).sum(
-                    dim=-1)
+                u_tot = r_ins.sum(dim=-1) + r_sub.sum(dim=-1) + r_del.sum(dim=-1)
 
-            u_t[:, :, 0] = F.logsigmoid(sub_rates)
-            u_t[:, :, 1] = torch.log(ins_rates + eps)
-            u_t[:, :, 2] = F.logsigmoid(del_rates)
+            log_r_ins = torch.log(r_ins + 1e-9)
+            log_r_sub = F.logsigmoid(raw_sub).masked_fill(ignore_mask, -1e9)
+            log_r_del = F.logsigmoid(raw_del).masked_fill(ignore_mask, -1e9)
 
-        uz_mask = self.make_uz_mask(z_t, z_1)
-
-        sub_mask = uz_mask[:, :, 0] & ~context_mask
-        ins_mask = uz_mask[:, :, 1] & ~context_mask
-        del_mask = uz_mask[:, :, 2] & ~context_mask
-
-        lse_sub_x = sub_logits.logsumexp(dim=-1)
-
-        packed_features_x = torch.cat([u_t, lse_sub_x], dim=-1)
+        # 5. Map Predictions back to Z-Space for Loss
+        lse_sub_x = sub_vocab_logits.logsumexp(dim=-1)
+        packed_features_x = torch.stack([log_r_sub, log_r_ins, log_r_del, lse_sub_x], dim=-1)
 
         packed_features_z = self.fill_gap_tokens_with_repeats(
             packed_features_x, z_gap_mask, z_pad_mask
         )
 
-        log_rate_ins = packed_features_z[..., 0]
-        log_rate_sub = packed_features_z[..., 1]
-        log_rate_del = packed_features_z[..., 2]
+        log_rate_sub_z = packed_features_z[..., 0]
+        log_rate_ins_z = packed_features_z[..., 1]
+        log_rate_del_z = packed_features_z[..., 2]
         lse_sub_z = packed_features_z[..., 3]
 
+        uz_mask = self.make_uz_mask(z_t, z_1)
+        sub_mask = uz_mask[:, :, 0] & ~context_mask
+        ins_mask = uz_mask[:, :, 1] & ~context_mask
+        del_mask = uz_mask[:, :, 2] & ~context_mask
+
+        # 6. Gather Targets (Z -> X indices)
+        # Right Padded: Index in X = Rank of non-gap token in Z
         non_gap_mask = ~z_gap_mask
         x_indices = non_gap_mask.cumsum(dim=1) - 1
         x_indices = x_indices.clamp(min=0, max=x_t.shape[1] - 1)
 
-        valid_vocab_limit = sub_logits.size(-1) - 1
+        valid_vocab_limit = sub_vocab_logits.size(-1) - 1
         safe_z1 = z_1.clamp(min=0, max=valid_vocab_limit)
+        batch_idx_seq = torch.arange(bsz, device=self.device).unsqueeze(1)
 
-        batch_idx = torch.arange(x_t.shape[0], device=self.device).unsqueeze(1)
-
-        target_logits_z = sub_logits[batch_idx, x_indices, safe_z1]
-
+        target_logits_z = sub_vocab_logits[batch_idx_seq, x_indices, safe_z1]
         vocab_nll = lse_sub_z - target_logits_z
 
         selected_log_ll = (
-                (log_rate_ins * ins_mask) +
-                (log_rate_del * del_mask) +
-                ((log_rate_sub - vocab_nll) * sub_mask)
+                (log_rate_ins_z * ins_mask) +
+                (log_rate_del_z * del_mask) +
+                ((log_rate_sub_z - vocab_nll) * sub_mask)
         )
 
         if self.rate_scaling:
-            term2 = (selected_log_ll * sched_coeff).sum(dim=1)
+            term2 = (selected_log_ll * sched_coeff_z).sum(dim=1)
         else:
             term2 = selected_log_ll.sum(dim=1)
 
         loss = u_tot - term2
 
-        u_t = torch.exp(u_t)
-        u_ins = u_t[:, :, 0].sum(dim=1).mean()
-        u_del = u_t[:, :, 2].sum(dim=1).mean()
-        u_sub = u_t[:, :, 1].sum(dim=1).mean()
+        with torch.no_grad():
+            u_ins_mean = r_ins.sum(dim=1).mean()
+            u_del_mean = r_del.sum(dim=1).mean()
+            u_sub_mean = r_sub.sum(dim=1).mean()
 
-        return loss.mean(), u_tot, u_ins, u_del, u_sub, term2.mean()
+        return loss.mean(), u_tot.mean(), u_ins_mean, u_del_mean, u_sub_mean, term2.mean()
 
-    # todo setup validation steps for conditional sampling, set up dataloader/dataset
+    @torch.no_grad()
+    def _sample_conditional(self, batch, n_steps=None, eps=1e-5):
+        """
+        Conditional Sampling assuming RIGHT PADDING everywhere.
+        """
+        # 1. Setup
+        x_0_in, _, _, _, _, _ = batch
+        bsz = x_0_in.shape[0]
+
+        # Use Model Config length for max capacity, not just input batch length
+        max_capacity = self.config.model.length
+        device = self.device
+
+        # Fix Left Padding if detected (Robustness check)
+        if (x_0_in[:, 0] == self.pad_token).all() and (x_0_in[:, -1] != self.pad_token).any():
+            x_0_right = torch.full_like(x_0_in, self.pad_token)
+            lens = (x_0_in != self.pad_token).sum(dim=1)
+            for i in range(bsz):
+                l = lens[i].item()
+                if l > 0: x_0_right[i, :l] = x_0_in[i, -l:]
+            x_0_in = x_0_right
+
+        if n_steps is None: n_steps = self.config.sampling.steps
+        default_h = 1 / n_steps
+        t = torch.ones(bsz, 1, device=device) * 0.01
+
+        # Initialize State
+        x_t = x_0_in.clone()
+        context_lens = (x_0_in != self.pad_token).sum(dim=1)
+        valid_seq_lens = context_lens.clone()
+
+        with tqdm(desc="Euler Sampling", total=n_steps) as pbar:
+            while t.max() <= 1:
+                # 2. Forward (Right Padded)
+                # GET CURRENT LENGTH
+                current_len = x_t.shape[1]
+
+                x_pad_mask = (x_t == self.pad_token)
+
+                # Construct precise attention mask using CURRENT length
+                seq_range = torch.arange(current_len, device=device).unsqueeze(0)
+                is_valid_range = seq_range < valid_seq_lens.unsqueeze(1)
+
+                # Pad Mask for Model: True=Pad/Ignore.
+                model_pad_mask = ~is_valid_range
+
+                # Forward (Shapes now match: x_t [B, L], mask [B, L])
+                u_t, sub_logits = self.backbone.forward(x_t, t, model_pad_mask)
+
+                # 3. Compute Rates
+                if model_pad_mask.any():
+                    sub_logits[model_pad_mask] = 0.0
+
+                sub_probs = F.softmax(sub_logits, dim=-1)
+
+                lambda_sub = u_t[:, :, 0]
+                lambda_ins = u_t[:, :, 1]
+                lambda_del = u_t[:, :, 2]
+
+                if not self.time_dependent:
+                    lambda_sub = torch.sigmoid(lambda_sub)
+                    lambda_del = torch.sigmoid(lambda_del)
+                    lambda_ins = F.softplus(torch.clamp(lambda_ins, max=1e6))
+                else:
+                    lambda_ins = F.softplus(torch.clamp(lambda_ins, max=1e6))
+                    lambda_sub = F.softplus(torch.clamp(lambda_sub, max=1e6))
+                    lambda_del = F.softplus(torch.clamp(lambda_del, max=1e6))
+
+                # 4. Apply Masks (Logic of Growth)
+                # Ensure mask logic uses current seq_range
+                is_context = seq_range < context_lens.unsqueeze(1)
+
+                # FIXED: Allow last token of context to predict insertions
+                is_last_context = seq_range == (context_lens.unsqueeze(1) - 1)
+
+                is_gen = is_valid_range & ~is_context
+                # is_boundary = (seq_range == valid_seq_lens.unsqueeze(1)) # Removed
+
+                lambda_sub = torch.where(is_gen, lambda_sub, 0.0)
+                lambda_del = torch.where(is_gen, lambda_del, 0.0)
+
+                # FIXED: Enable context tip to insert
+                lambda_ins = torch.where(is_gen | is_last_context, lambda_ins, 0.0)
+
+                # 5. Sampling
+                adapt_h = default_h
+                ins_vals = torch.poisson(adapt_h * lambda_ins).long()
+
+                denom = lambda_sub + lambda_del
+                prob_transition = 1 - torch.exp(-adapt_h * denom)
+                has_transition = torch.rand_like(prob_transition) < prob_transition
+
+                prob_del_cond = lambda_del / (denom + 1e-9)
+                is_del = torch.bernoulli(prob_del_cond).bool() & has_transition
+                is_sub = has_transition & ~is_del
+
+                # Sample Substitutions
+                new_tokens = torch.distributions.Categorical(probs=sub_probs).sample()
+                x_t[is_sub] = new_tokens[is_sub]
+
+                # Apply Ins/Del (This changes x_t shape!)
+                x_t = self.apply_ins_del_ops(x_t, ins_vals, is_del)
+
+                # 6. Update Valid Lengths
+                total_ins = ins_vals.sum(dim=1)
+                total_del = is_del.long().sum(dim=1)
+                valid_seq_lens = valid_seq_lens + total_ins - total_del
+
+                # FIXED: Clamp to MODEL capacity, not initial batch length
+                valid_seq_lens = valid_seq_lens.clamp(min=context_lens, max=torch.tensor(max_capacity, device=device))
+
+                t += adapt_h
+                pbar.update(1)
+
+        return x_t
+
     def validation_step(self, batch, batch_idx):
+        if batch_idx == 0:
+            self.sample_batches = []
+        if batch_idx < self.config.sampling.num_sample_batches:
+            self.sample_batches.append(batch)
+
         loss, u_tot, u_ins, u_del, u_sub, term2 = self._compute_loss(batch)
-        self.log_dict(
-            {
-                "val_loss": loss,
-                "val_u_tot": u_tot.mean(),
-                "val_u_ins": u_ins,
-                "val_u_del": u_del,
-                "val_u_sub": u_sub,
-                "val_term2": term2,
-            }, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log_dict({
+            "val_loss": loss,
+            "val_u_tot": u_tot,
+            "val_u_ins": u_ins,
+            "val_u_del": u_del,
+            "val_u_sub": u_sub,
+        }, prog_bar=True, on_epoch=True, sync_dist=True)
         return loss
 
     def on_validation_epoch_end(self):
+        # Keeps original logging
         if ((self.config.eval.compute_perplexity_on_sanity
              or not self.trainer.sanity_checking)
                 and self.config.eval.generate_samples):
 
+            all_gen_lens = []
             samples, text_samples = None, None
-            for _ in range(self.config.sampling.num_sample_batches):
-                samples = self._sample()
+            for i in range(len(self.sample_batches)):
+                samples = self._sample_conditional(self.sample_batches[i])
+
+                # Calculate non-padded lengths
+                batch_lens = (samples != self.tokenizer.pad_token_id).sum(dim=1).float()
+                all_gen_lens.append(batch_lens)
+
+                samples = [s[s != self.tokenizer.pad_token_id] for s in samples]
 
                 # Decode the samples to be re-tokenized by eval model
                 text_samples = self.tokenizer.batch_decode(samples)
@@ -216,109 +389,24 @@ class EditFlowFineTune(EditFlow):
                 if self.config.eval.compute_generative_perplexity:
                     self.compute_generative_perplexity(text_samples)
 
+            if all_gen_lens:
+                all_gen_lens = torch.cat(all_gen_lens)
+                self.log_dict({
+                    "val/gen_len_mean": all_gen_lens.mean(),
+                    "val/gen_len_std": all_gen_lens.std(),
+                }, prog_bar=True, on_epoch=True, sync_dist=True)
+
             if self.trainer.global_rank == 0 and hasattr(self.trainer.logger, 'log_table'):
                 # Log the last generated samples
                 text_samples = text_samples[:self.config.sampling.num_sample_log]
+
+                for sample in text_samples:
+                    print('Sample: ')
+                    print(sample)
+                    print('\n')
 
                 self.trainer.logger.log_table(
                     key=f'samples@global_step{self.global_step}',
                     columns=['Generated Samples'],
                     data=[[s] for s in text_samples])
 
-            if self.config.eval.compute_generative_perplexity:
-                self.log('val/gen_ppl',
-                         self.gen_ppl_metric,
-                         on_epoch=True,
-                         on_step=False,
-                         sync_dist=True,
-                         prog_bar=True)
-
-    @torch.no_grad()
-    def _sample_conditional(self, x_0, context_mask, n_steps=None, eps=1e-5):
-        batch_size_per_gpu = self.config.loader.eval_batch_size
-
-        # Lightning auto-casting is not working in this method for some reason
-        if n_steps is None:
-            n_steps = self.config.sampling.steps
-
-        default_h = 1 / n_steps
-
-        t_min = 0.01
-
-        t = t_min * torch.ones(batch_size_per_gpu, 1, device=self.device)
-
-        x_t = x_0.clone().to(self.device)
-
-        x_pad_mask = (x_t == self.pad_token)
-        # x_ts = [x_t.clone()]
-
-        with tqdm(desc="Euler Sampling") as pbar:
-            # while t.max() <= 1 - default_h:
-            while t.max() <= 1:
-                u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
-
-                mask_expanded = context_mask.unsqueeze(-1).bool()
-                u_t = u_t.masked_fill(mask_expanded, 0.0)
-                # Force padded logits to -Inf (so softmax=0)
-                sub_logits = sub_logits.masked_fill(mask_expanded, -1e9)
-
-                sub_probs = F.softmax(sub_logits, dim=-1)
-
-                lambda_ins = u_t[:, :, 0]  # Insertion rate        (n_samples, x_seq_len)
-                lambda_sub = u_t[:, :, 1]  # Substitution rate     (n_samples, x_seq_len)
-                lambda_del = u_t[:, :, 2]  # Deletion rate         (n_samples, x_seq_len)
-
-                # zero out rates for context tokens or pad tokens
-                valid_token_mask = (~x_pad_mask & ~context_mask).float()
-
-                lambda_ins = lambda_ins * valid_token_mask
-                lambda_sub = lambda_sub * valid_token_mask
-                lambda_del = lambda_del * valid_token_mask
-
-                adapt_h = default_h
-
-                ins_vals = torch.poisson(adapt_h * lambda_ins).long()
-
-                del_sub_mask = torch.rand(
-                    size=lambda_sub.shape, device=lambda_sub.device
-                ) < 1 - torch.exp(-adapt_h * (lambda_sub + lambda_del))
-
-                # For deletion/substitution, sample based on the relative rates
-                prob_del = torch.where(
-                    del_sub_mask, lambda_del / (lambda_sub + lambda_del), torch.zeros_like(lambda_del))
-
-                del_mask = torch.bernoulli(prob_del).bool()
-
-                sub_mask = del_sub_mask & ~del_mask
-
-                assert sub_mask.sum() + del_mask.sum() == del_sub_mask.sum()
-
-                # Only sample tokens for non-pad positions, fill pad positions with PAD_TOKEN
-                sub_tokens = torch.full(sub_probs.shape[:2], self.pad_token, dtype=torch.long, device=self.device)
-
-                non_pad_mask = ~x_pad_mask
-
-                if non_pad_mask.any():
-                    sub_sampled = torch.multinomial(sub_probs[non_pad_mask], num_samples=1, replacement=True).squeeze(
-                        -1)
-                    sub_tokens[non_pad_mask] = sub_sampled
-
-                # Apply operations based on masks
-                x_t[sub_mask] = sub_tokens[sub_mask]
-
-                x_t = self.apply_ins_del_ops(
-                    x_t,
-                    ins_vals,
-                    del_mask,
-                )
-                x_pad_mask = (x_t == self.pad_token)  # Update padding mask after operations
-
-                t = t + adapt_h
-                # x_ts.append(x_t.clone())
-
-                # ensure that context is constant
-                x_t = torch.where(context_mask, x_0, x_t)
-
-                pbar.update(1)
-
-        return x_t
