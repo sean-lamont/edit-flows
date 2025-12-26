@@ -94,7 +94,7 @@ class EditFlowBaseline(EditFlowBase):
                 u_tot = r_ins.sum(dim=-1) + r_sub.sum(dim=-1) + r_del.sum(dim=-1)
 
             # Log Rates
-            log_r_ins = F.logsigmoid(r_ins)
+            log_r_ins = F.logsigmoid(raw_ins)
             log_r_sub = F.logsigmoid(raw_sub)
             log_r_del = F.logsigmoid(raw_del)
 
