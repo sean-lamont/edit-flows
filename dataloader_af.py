@@ -36,7 +36,7 @@ class AutoformalizationDataset(Dataset):
 
 
 class AutoformalCollator:
-    def __init__(self, tokenizer, mode='llada', max_length=1024, gap_token_id=3):
+    def __init__(self, tokenizer, mode='llada', max_length=1024, gap_token_id=126084, pad_token_id=126085):
         self.tokenizer = tokenizer
         self.mode = mode
         self.max_length = max_length
@@ -45,15 +45,23 @@ class AutoformalCollator:
         # LLaDA uses Left Padding
         self.tokenizer.padding_side = 'right'
 
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        # for llada, set padding token to something else than eos_token_id to avoid issues from rainbow padding paper
+
+        self.tokenizer.pad_token_id = pad_token_id
+        # if self.tokenizer.pad_token_id is None:
+        #     self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        self.min_code_len = self.max_length // 2
 
     def _apply_chat_template(self, prompt):
         return LLADA_TEMPLATE.format(prompt=prompt)
 
     def __call__(self, batch):
         prompts = [self._apply_chat_template(b['prompt']) for b in batch]
-        codes = [b['code'] + self.tokenizer.eos_token for b in batch]
+        # codes = [b['code'] + self.tokenizer.eos_token for b in batch]
+
+        # do not add eos, let the model learn this naturally
+        codes = [b['code'] for b in batch]
 
         if self.mode == 'llada':
             return self._collate_llada(prompts, codes)
@@ -101,24 +109,22 @@ class AutoformalCollator:
             p_ids = self.tokenizer.encode(p_str, add_special_tokens=False)
             c_ids = self.tokenizer.encode(c_str, add_special_tokens=False)
 
-            # --- 1. Construct Clean Endpoints ---
-            # x_0: Context + BOS
-            # x_1: Context + BOS + Code
+            if p_ids.shape[0] + c_ids.shape[0] > self.max_length:
+                # ensure at least min(c_ids.shape[0], min_code_len) of code is preserved
+                code_len = min(c_ids.shape[0], self.min_code_len)
+                p_ids = p_ids[:(self.max_length - code_len)]
+                c_ids = c_ids[:code_len]
 
-            # We treat BOS as the boundary. It is appended to Context.
             curr_x0 = p_ids
             curr_x1 = p_ids + c_ids
 
-            x0_list.append(torch.tensor(curr_x0[:self.max_length], dtype=torch.long))
-            x1_list.append(torch.tensor(curr_x1[:self.max_length], dtype=torch.long))
+            x0_list.append(torch.tensor(curr_x0, dtype=torch.long))
+            x1_list.append(torch.tensor(curr_x1, dtype=torch.long))
 
-            # --- 2. Construct Aligned Trajectories (z0, z1) ---
-            # The immutable prefix includes the Prompt and the BOS token.
             prefix = p_ids
 
-            # Prepare the mutable region (Code)
             n_code_tokens = len(c_ids)
-            n_slots = n_code_tokens #+1
+            n_slots = n_code_tokens  # +1
 
             # Noise Logic: Only applied to the Code region
             ins_mask = torch.rand(n_slots) < del_prob
@@ -154,7 +160,8 @@ class AutoformalCollator:
                         noise_ptr += 1
 
                     # Standard Token Logic (Gap in z0, Code in z1)
-                    if i < n_code_tokens:
+                    # if i < n_code_tokens:
+                    else:
                         z0_code_parts.append(self.gap_token_id)
                         z1_code_parts.append(c_ids[i])
             else:
@@ -169,17 +176,16 @@ class AutoformalCollator:
             # Mask: 1 for Immutable Prefix, 0 for Mutable Region (Code + Noise)
             c_mask = [1] * len(prefix) + [0] * len(z0_code_parts)
 
-            # Truncation (applied to the aligned sequences)
-            if len(z1_seq) > self.max_length:
-                z1_seq = z1_seq[:self.max_length]
-                z0_seq = z0_seq[:self.max_length]
-                c_mask = c_mask[:self.max_length]
+            # # Truncation (applied to the aligned sequences)
+            # if len(z1_seq) > self.max_length:
+            #     z1_seq = z1_seq[:self.max_length]
+            #     z0_seq = z0_seq[:self.max_length]
+            #     c_mask = c_mask[:self.max_length]
 
             z0_list.append(torch.tensor(z0_seq, dtype=torch.long))
             z1_list.append(torch.tensor(z1_seq, dtype=torch.long))
             context_mask_list.append(torch.tensor(c_mask, dtype=torch.bool))
 
-        # --- 3. Padding ---
         # Pad each list independently to its own max length.
         # x_0 = self._left_pad(x0_list, self.tokenizer.pad_token_id)
         # x_1 = self._left_pad(x1_list, self.tokenizer.pad_token_id)
@@ -189,12 +195,10 @@ class AutoformalCollator:
 
         x_0 = self._right_pad(x0_list, self.tokenizer.pad_token_id)
         x_1 = self._right_pad(x1_list, self.tokenizer.pad_token_id)
-
         z0 = self._right_pad(z0_list, self.tokenizer.pad_token_id)
         z1 = self._right_pad(z1_list, self.tokenizer.pad_token_id)
 
-
-        context_mask = self._right_pad(context_mask_list, 1)
+        context_mask = self._right_pad(context_mask_list, 0)
 
         t = torch.rand(x_1.shape[0], 1)
         t = torch.clamp(t, min=0.01, max=0.99)
@@ -209,7 +213,6 @@ class AutoformalCollator:
         return torch.nn.utils.rnn.pad_sequence(
             tensor_list, batch_first=True, padding_value=padding_value
         )
-
 
     def _left_pad(self, tensor_list, padding_value):
         reversed_tensors = [t.flip(0) for t in tensor_list]
@@ -237,13 +240,10 @@ def get_dataloaders(tokenizer, batch_size=4, mode='llada', max_length=1024):
         collate_fn=collator, num_workers=4
     )
 
-
-
     train_loader.tokenizer = tokenizer
     val_loader.tokenizer = tokenizer
 
     return train_loader, val_loader
-
 
 # if __name__ == "__main__":
 #     print("Initializing Tokenizer...")

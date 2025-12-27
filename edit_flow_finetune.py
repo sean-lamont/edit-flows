@@ -63,6 +63,7 @@ class LLaDABackbone(nn.Module):
         for param in self.content_head.parameters():
             param.requires_grad = True
 
+    # todo add time conditioning?
     def forward(self, x, t=None, attention_mask=None):
         """
         Forward pass assuming Right Padding.
@@ -97,45 +98,39 @@ class EditFlowFineTune(EditFlow):
             tokenizer: transformers.PreTrainedTokenizer):
         super().__init__(config, tokenizer)
 
-        self.mask_token_id = 126336  # Not used in "No Gap Token" mode usually, but kept for legacy
+        self.mask_token_id = 126336
         self.backbone = LLaDABackbone(self.config, vocab_size=self.V)
-        self.gap_token = 126084  # Reserved token
+        self.gap_token = 126084
 
-        # Force Right Padding on Tokenizer just in case
         self.tokenizer.padding_side = 'right'
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        # safety check
+        self.tokenizer.pad_token_id = 126085
+        self.pad_token = 126085
+        # if self.tokenizer.pad_token_id is None:
+        #     self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
 
     def _compute_loss(self, batch):
-        """
-        Compute Loss Assuming RIGHT PADDING for all Inputs (x_0, x_1, z_0, z_1).
-        """
         x_0, x_1, z_0, z_1, t, context_mask = batch
         bsz = x_0.shape[0]
 
-        # 1. Sample Z_t (Aligned Space)
         z_t = self.sample_zt(z_0, z_1, t)
 
-        # Ensure context is preserved in z_t (Context is immutable)
-        # context_mask should be aligned with z-space
         z_t = torch.where(context_mask, z_1, z_t)
 
-        # 2. Collapse to X_t (Model Input Space - Right Padded)
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = self.rm_gap_tokens(z_t)
 
-        # 3. Forward Pass
         u_t_logits, sub_vocab_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
-        # 4. Schedulers & Rates
         sched_coeff_z = self.get_sched_coeff(t, z_0, z_1, z_t)
-        ignore_mask = x_pad_mask  # True for Pad
+
+        ignore_mask = (x_pad_mask | context_mask) # True for Pad
 
         raw_sub = u_t_logits[:, :, 0]
         raw_ins = u_t_logits[:, :, 1]
         raw_del = u_t_logits[:, :, 2]
 
-        # Mask padding logits (-inf for Softmax)
         sub_vocab_logits = sub_vocab_logits.masked_fill(ignore_mask.unsqueeze(-1), -1e9)
 
         if self.time_dependent:
@@ -156,12 +151,10 @@ class EditFlowFineTune(EditFlow):
             r_del = torch.sigmoid(raw_del).masked_fill(ignore_mask, 0)
 
             if self.rate_scaling:
-                # Map Z-space sched_coeff to X-space (Right Padded mapping is simple)
                 sched_coeff_x = torch.zeros_like(r_ins)
 
                 if sched_coeff_z.dim() > 1:
                     mask_z = ~z_gap_mask
-                    # Ranks in Z map directly to indices in X (Right Pad)
                     ranks = mask_z.cumsum(dim=1) - 1
                     valid_z = mask_z & (ranks < x_t.shape[1])
 
@@ -239,11 +232,9 @@ class EditFlowFineTune(EditFlow):
         """
         Conditional Sampling assuming RIGHT PADDING everywhere.
         """
-        # 1. Setup
         x_0_in, _, _, _, _, _ = batch
         bsz = x_0_in.shape[0]
 
-        # Use Model Config length for max capacity, not just input batch length
         max_capacity = self.config.model.length
         device = self.device
 
@@ -267,6 +258,7 @@ class EditFlowFineTune(EditFlow):
 
         with tqdm(desc="Euler Sampling", total=n_steps) as pbar:
             while t.max() <= 1:
+
                 # 2. Forward (Right Padded)
                 # GET CURRENT LENGTH
                 current_len = x_t.shape[1]
