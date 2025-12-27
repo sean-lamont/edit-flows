@@ -259,8 +259,6 @@ class EditFlowFineTune(EditFlow):
         with tqdm(desc="Euler Sampling", total=n_steps) as pbar:
             while t.max() <= 1:
 
-                # 2. Forward (Right Padded)
-                # GET CURRENT LENGTH
                 current_len = x_t.shape[1]
 
                 x_pad_mask = (x_t == self.pad_token)
@@ -273,13 +271,14 @@ class EditFlowFineTune(EditFlow):
                 model_pad_mask = ~is_valid_range
 
                 # Forward (Shapes now match: x_t [B, L], mask [B, L])
-                u_t, sub_logits = self.backbone.forward(x_t, t, model_pad_mask)
+                u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
                 # 3. Compute Rates
                 if model_pad_mask.any():
                     sub_logits[model_pad_mask] = 0.0
 
                 sub_probs = F.softmax(sub_logits, dim=-1)
+                sub_probs = sub_probs.masked_fill(model_pad_mask, 0)
 
                 lambda_sub = u_t[:, :, 0]
                 lambda_ins = u_t[:, :, 1]
@@ -294,47 +293,78 @@ class EditFlowFineTune(EditFlow):
                     lambda_sub = F.softplus(torch.clamp(lambda_sub, max=1e6))
                     lambda_del = F.softplus(torch.clamp(lambda_del, max=1e6))
 
-                # 4. Apply Masks (Logic of Growth)
-                # Ensure mask logic uses current seq_range
-                is_context = seq_range < context_lens.unsqueeze(1)
 
-                # FIXED: Allow last token of context to predict insertions
-                is_last_context = seq_range == (context_lens.unsqueeze(1) - 1)
+                if not self.time_dependent:  # scale raw count/bernoulli predictions by sampler rate
+                    default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))
+                    ins_coeff = (self.mask_scheduler.derivative(t) / (1 - self.mask_scheduler(t) + eps))
+
+                    mask_sub_coeff = (self.mask_scheduler.derivative(t) * self.default_scheduler(t)
+                                      + self.mask_scheduler(t) * self.default_scheduler.derivative(t)) / (
+                                             self.mask_scheduler(t) * (1 - self.default_scheduler(t)) + eps)
+
+                    mask_ids = (x_t == self.mask_token)
+
+                    sub_coeff = torch.where(mask_ids, mask_sub_coeff, default_coeff)
+
+                    lambda_sub = lambda_sub * sub_coeff
+                    lambda_ins = lambda_ins * ins_coeff
+                    lambda_del = lambda_del * default_coeff
+
+                # subtract 1 to keep single token for gen
+                is_context = seq_range < context_lens.unsqueeze(1) - 1
 
                 is_gen = is_valid_range & ~is_context
                 # is_boundary = (seq_range == valid_seq_lens.unsqueeze(1)) # Removed
 
                 lambda_sub = torch.where(is_gen, lambda_sub, 0.0)
                 lambda_del = torch.where(is_gen, lambda_del, 0.0)
+                lambda_ins = torch.where(is_gen, lambda_ins, 0.0)
 
-                # FIXED: Enable context tip to insert
-                lambda_ins = torch.where(is_gen | is_last_context, lambda_ins, 0.0)
 
-                # 5. Sampling
+
+
                 adapt_h = default_h
+
                 ins_vals = torch.poisson(adapt_h * lambda_ins).long()
 
-                denom = lambda_sub + lambda_del
-                prob_transition = 1 - torch.exp(-adapt_h * denom)
-                has_transition = torch.rand_like(prob_transition) < prob_transition
+                del_sub_mask = torch.rand(
+                    size=lambda_sub.shape, device=lambda_sub.device
+                ) < 1 - torch.exp(-adapt_h * (lambda_sub + lambda_del))
 
-                prob_del_cond = lambda_del / (denom + 1e-9)
-                is_del = torch.bernoulli(prob_del_cond).bool() & has_transition
-                is_sub = has_transition & ~is_del
+                # For deletion/substitution, sample based on the relative rates
+                prob_del = torch.where(
+                    del_sub_mask, lambda_del / (lambda_sub + lambda_del), torch.zeros_like(lambda_del))
 
-                # Sample Substitutions
-                new_tokens = torch.distributions.Categorical(probs=sub_probs).sample()
-                x_t[is_sub] = new_tokens[is_sub]
+                del_mask = torch.bernoulli(prob_del).bool()
 
-                # Apply Ins/Del (This changes x_t shape!)
-                x_t = self.apply_ins_del_ops(x_t, ins_vals, is_del)
+                sub_mask = del_sub_mask & ~del_mask
+
+                assert sub_mask.sum() + del_mask.sum() == del_sub_mask.sum()
+
+                # Only sample tokens for non-pad positions, fill pad positions with PAD_TOKEN
+                sub_tokens = torch.full(sub_probs.shape[:2], self.pad_token, dtype=torch.long, device=self.device)
+
+                non_pad_mask = ~x_pad_mask
+
+                if non_pad_mask.any():
+                    sub_sampled = torch.multinomial(sub_probs[non_pad_mask], num_samples=1, replacement=True).squeeze(
+                        -1)
+                    sub_tokens[non_pad_mask] = sub_sampled
+
+                # Apply operations based on masks
+                x_t[sub_mask] = sub_tokens[sub_mask]
+
+                x_t = self.apply_ins_del_ops(
+                    x_t,
+                    ins_vals,
+                    del_mask,
+                )
 
                 # 6. Update Valid Lengths
                 total_ins = ins_vals.sum(dim=1)
-                total_del = is_del.long().sum(dim=1)
+                total_del = del_mask.long().sum(dim=1)
                 valid_seq_lens = valid_seq_lens + total_ins - total_del
 
-                # FIXED: Clamp to MODEL capacity, not initial batch length
                 valid_seq_lens = valid_seq_lens.clamp(min=context_lens, max=torch.tensor(max_capacity, device=device))
 
                 t += adapt_h

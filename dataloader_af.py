@@ -109,9 +109,9 @@ class AutoformalCollator:
             p_ids = self.tokenizer.encode(p_str, add_special_tokens=False)
             c_ids = self.tokenizer.encode(c_str, add_special_tokens=False)
 
-            if p_ids.shape[0] + c_ids.shape[0] > self.max_length:
+            if len(p_ids) + len(c_ids) > self.max_length:
                 # ensure at least min(c_ids.shape[0], min_code_len) of code is preserved
-                code_len = min(c_ids.shape[0], self.min_code_len)
+                code_len = min(len(c_ids), self.min_code_len)
                 p_ids = p_ids[:(self.max_length - code_len)]
                 c_ids = c_ids[:code_len]
 
