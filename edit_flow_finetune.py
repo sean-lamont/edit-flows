@@ -1,6 +1,7 @@
 import torch
 # set up lora with all linear layers:
 from peft import LoraConfig, get_peft_model
+from sacrebleu import corpus_bleu
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
@@ -413,15 +414,24 @@ class EditFlowFineTune(EditFlow):
                 # Decode the samples to be re-tokenized by eval model
                 text_samples = self.tokenizer.batch_decode(samples)
 
-                if self.config.eval.compute_generative_perplexity:
-                    self.compute_generative_perplexity(text_samples)
+                # rather than old ppl eval, just check bleu score to ground truth x1
+                x_1_batch = self.sample_batches[i][1]
+                x_1_batch = [s[s != self.tokenizer.pad_token_id] for s in x_1_batch]
+                text_x_1_batch = self.tokenizer.batch_decode(x_1_batch)
 
-            if all_gen_lens:
-                all_gen_lens = torch.cat(all_gen_lens)
-                self.log_dict({
-                    "val/gen_len_mean": all_gen_lens.mean(),
-                    "val/gen_len_std": all_gen_lens.std(),
-                }, prog_bar=True, on_epoch=True, sync_dist=True)
+                # Compute BLEU score
+                bleu_score = self.compute_bleu_score(text_samples, text_x_1_batch)
+                self.log("val_bleu_score", bleu_score, on_epoch=True, prog_bar=True, sync_dist=True)
+
+            #     if self.config.eval.compute_generative_perplexity:
+            #         self.compute_generative_perplexity(text_samples)
+            #
+            # if all_gen_lens:
+            #     all_gen_lens = torch.cat(all_gen_lens)
+            #     self.log_dict({
+            #         "val/gen_len_mean": all_gen_lens.mean(),
+            #         "val/gen_len_std": all_gen_lens.std(),
+            #     }, prog_bar=True, on_epoch=True, sync_dist=True)
 
             if self.trainer.global_rank == 0 and hasattr(self.trainer.logger, 'log_table'):
                 # Log the last generated samples
@@ -436,3 +446,9 @@ class EditFlowFineTune(EditFlow):
                     key=f'samples@global_step{self.global_step}',
                     columns=['Generated Samples'],
                     data=[[s] for s in text_samples])
+
+    def compute_bleu_score(self, samples, ground_truth):
+        # sacrebleu expects a list of references for each hypothesis, so wrap each ground truth in a list
+        references = [[gt] for gt in ground_truth]
+        bleu = corpus_bleu(samples, references)
+        return bleu.score
