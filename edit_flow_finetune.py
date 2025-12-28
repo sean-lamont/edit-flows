@@ -1,4 +1,6 @@
 import torch
+# set up lora with all linear layers:
+from peft import LoraConfig, get_peft_model
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
@@ -14,25 +16,33 @@ class LLaDABackbone(nn.Module):
 
         print(f"Loading LLaDA Backbone")
 
-        bnb_config = transformers.BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",  # NormalFloat4 is best for pre-trained weights
-            bnb_4bit_use_double_quant=True,  # Compresses the quantization constants
-            bnb_4bit_compute_dtype=torch.bfloat16  # Compute in bf16 for stability
-        )
+        # bnb_config = transformers.BitsAndBytesConfig(
+        #     load_in_4bit=True,
+        #     bnb_4bit_quant_type="nf4",  # NormalFloat4 is best for pre-trained weights
+        #     bnb_4bit_use_double_quant=True,  # Compresses the quantization constants
+        #     bnb_4bit_compute_dtype=torch.bfloat16  # Compute in bf16 for stability
+        # )
 
-        print(f"Loading LLaDA Backbone (Quantized)")
         self.base_model = transformers.AutoModel.from_pretrained(
             "GSAI-ML/LLaDA-8B-Instruct",
             trust_remote_code=True,
-            quantization_config=bnb_config,
+            # quantization_config=bnb_config,
             torch_dtype=torch.bfloat16,
             device_map="auto",
         )
 
-        # Freeze Backbone
-        for param in self.base_model.parameters():
-            param.requires_grad = False
+        lora_config = LoraConfig(
+            r=64,
+            lora_alpha=128,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+
+        self.base_model = get_peft_model(self.base_model, lora_config)
+        self.base_model.print_trainable_parameters()
 
         self.hidden_size = self.base_model.config.hidden_size
         self.vocab_size = vocab_size
@@ -110,7 +120,6 @@ class EditFlowFineTune(EditFlow):
         # if self.tokenizer.pad_token_id is None:
         #     self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-
     def _compute_loss(self, batch):
         x_0, x_1, z_0, z_1, t, context_mask = batch
         bsz = x_0.shape[0]
@@ -125,7 +134,7 @@ class EditFlowFineTune(EditFlow):
 
         sched_coeff_z = self.get_sched_coeff(t, z_0, z_1, z_t)
 
-        ignore_mask = (x_pad_mask | context_mask) # True for Pad
+        ignore_mask = (x_pad_mask | context_mask)  # True for Pad
 
         raw_sub = u_t_logits[:, :, 0]
         raw_ins = u_t_logits[:, :, 1]
@@ -293,7 +302,6 @@ class EditFlowFineTune(EditFlow):
                     lambda_sub = F.softplus(torch.clamp(lambda_sub, max=1e6))
                     lambda_del = F.softplus(torch.clamp(lambda_del, max=1e6))
 
-
                 if not self.time_dependent:  # scale raw count/bernoulli predictions by sampler rate
                     default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))
                     ins_coeff = (self.mask_scheduler.derivative(t) / (1 - self.mask_scheduler(t) + eps))
@@ -319,9 +327,6 @@ class EditFlowFineTune(EditFlow):
                 lambda_sub = torch.where(is_gen, lambda_sub, 0.0)
                 lambda_del = torch.where(is_gen, lambda_del, 0.0)
                 lambda_ins = torch.where(is_gen, lambda_ins, 0.0)
-
-
-
 
                 adapt_h = default_h
 
@@ -431,4 +436,3 @@ class EditFlowFineTune(EditFlow):
                     key=f'samples@global_step{self.global_step}',
                     columns=['Generated Samples'],
                     data=[[s] for s in text_samples])
-
