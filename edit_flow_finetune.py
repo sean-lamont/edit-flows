@@ -68,11 +68,13 @@ class LLaDABackbone(nn.Module):
         )
 
         # Re-use the LM Head
-        self.content_head = self.base_model.model.transformer.ff_out
+        self.content_head = self.base_model.model.model.transformer.ff_out
 
         # Unfreeze heads
         for param in self.content_head.parameters():
             param.requires_grad = True
+
+        print (self.base_model, self.content_head)
 
     # todo add time conditioning?
     def forward(self, x, t=None, attention_mask=None):
@@ -135,7 +137,8 @@ class EditFlowFineTune(EditFlow):
 
         sched_coeff_z = self.get_sched_coeff(t, z_0, z_1, z_t)
 
-        ignore_mask = (x_pad_mask | context_mask)  # True for Pad
+        # ignore_mask = (x_pad_mask | context_mask)  # True for Pad
+        ignore_mask = x_pad_mask 
 
         raw_sub = u_t_logits[:, :, 0]
         raw_ins = u_t_logits[:, :, 1]
@@ -288,7 +291,7 @@ class EditFlowFineTune(EditFlow):
                     sub_logits[model_pad_mask] = 0.0
 
                 sub_probs = F.softmax(sub_logits, dim=-1)
-                sub_probs = sub_probs.masked_fill(model_pad_mask, 0)
+                sub_probs = sub_probs.masked_fill(model_pad_mask.unsqueeze(-1), 0)
 
                 lambda_sub = u_t[:, :, 0]
                 lambda_ins = u_t[:, :, 1]
@@ -350,7 +353,8 @@ class EditFlowFineTune(EditFlow):
                 # Only sample tokens for non-pad positions, fill pad positions with PAD_TOKEN
                 sub_tokens = torch.full(sub_probs.shape[:2], self.pad_token, dtype=torch.long, device=self.device)
 
-                non_pad_mask = ~x_pad_mask
+                #non_pad_mask = ~x_pad_mask
+                non_pad_mask = ~model_pad_mask
 
                 if non_pad_mask.any():
                     sub_sampled = torch.multinomial(sub_probs[non_pad_mask], num_samples=1, replacement=True).squeeze(

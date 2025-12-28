@@ -5,5 +5,5 @@ checkpoint_every_n_steps:
   dirpath: ${checkpointing.save_dir}/checkpoints
   verbose: True
   auto_insert_metric_name: False
-  every_n_train_steps: 10000
+  every_n_train_steps: 100000
   save_on_train_epoch_end: True

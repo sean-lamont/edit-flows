@@ -11,6 +11,12 @@ import torch
 import dataloader_af as dataloader
 import edit_flow_finetune
 import utils
+import os
+os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+
+#torch.serialization.add_safe_globals([omegaconf.dictconfig.DictConfig])
+#torch.serialization.add_safe_globals([omegaconf.base.ContainerMetadata])
+
 
 omegaconf.OmegaConf.register_new_resolver(
     'cwd', os.getcwd)

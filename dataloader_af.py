@@ -233,11 +233,15 @@ def get_dataloaders(tokenizer, batch_size=4, mode='llada', max_length=1024):
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        collate_fn=collator, num_workers=4
+        collate_fn=collator, num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        collate_fn=collator, num_workers=4
+        collate_fn=collator, num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
     )
 
     train_loader.tokenizer = tokenizer

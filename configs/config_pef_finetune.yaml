@@ -1,6 +1,7 @@
 defaults:
   - _self_
-#  - /callbacks: [ checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor ]
+    #- /callbacks: [ checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor ]
+  - /callbacks: [ checkpoint_every_n_steps, learning_rate_monitor ]
   - /callbacks: [ learning_rate_monitor ]
   - /data: autoformalization
   - /model: small
@@ -17,7 +18,7 @@ rate_scaling: False
 seed: 1
 
 loader:
-  global_batch_size: 4
+  global_batch_size: 8
   eval_global_batch_size: ${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**
   batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
@@ -57,15 +58,16 @@ trainer:
   max_steps: 200_000 #1_000_000
   log_every_n_steps: 10
   limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
-  limit_val_batches: 5 #1.0     # validate on full dataset, can be used to toggle quick run
+  limit_val_batches: 0.5 #1.0     # validate on full dataset, can be used to toggle quick run
   val_check_interval: 500
 
 wandb:
   project: text-diffusion
   #  notes: Mulan for text
   group: null
+  id: wcvdox74
   job_type: null
-  offline: true
+    #offline: true
   name: pef_finetune_af
   tags:
     - ${data.train}
@@ -82,7 +84,9 @@ hydra:
 
 checkpointing:
   # Use custom `save_dir` if, e.g., saving to S3 bucket, otherwise leave this parameter as is
-  save_dir: ${cwd:}
+  # save_dir: ${cwd:}
+  save_dir: '/workspace/edit-flows/outputs/autoformalization/2025.12.28/052111'
+
   # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt
