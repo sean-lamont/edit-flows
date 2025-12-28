@@ -38,7 +38,7 @@ class LLaDABackbone(nn.Module):
                             "gate_proj", "up_proj", "down_proj"],
             lora_dropout=0.05,
             bias="none",
-            task_type="CAUSAL_LM"
+            task_type=None
         )
 
         self.base_model = get_peft_model(self.base_model, lora_config)
