@@ -137,8 +137,7 @@ class EditFlowFineTune(EditFlow):
 
         sched_coeff_z = self.get_sched_coeff(t, z_0, z_1, z_t)
 
-        # ignore_mask = (x_pad_mask | context_mask)  # True for Pad
-        ignore_mask = x_pad_mask 
+        ignore_mask = (x_pad_mask | context_mask)  # True for Pad
 
         raw_sub = u_t_logits[:, :, 0]
         raw_ins = u_t_logits[:, :, 1]
@@ -291,7 +290,7 @@ class EditFlowFineTune(EditFlow):
                     sub_logits[model_pad_mask] = 0.0
 
                 sub_probs = F.softmax(sub_logits, dim=-1)
-                sub_probs = sub_probs.masked_fill(model_pad_mask.unsqueeze(-1), 0)
+                sub_probs = sub_probs.masked_fill(model_pad_mask, 0)
 
                 lambda_sub = u_t[:, :, 0]
                 lambda_ins = u_t[:, :, 1]
@@ -353,8 +352,7 @@ class EditFlowFineTune(EditFlow):
                 # Only sample tokens for non-pad positions, fill pad positions with PAD_TOKEN
                 sub_tokens = torch.full(sub_probs.shape[:2], self.pad_token, dtype=torch.long, device=self.device)
 
-                #non_pad_mask = ~x_pad_mask
-                non_pad_mask = ~model_pad_mask
+                non_pad_mask = ~x_pad_mask
 
                 if non_pad_mask.any():
                     sub_sampled = torch.multinomial(sub_probs[non_pad_mask], num_samples=1, replacement=True).squeeze(
@@ -398,58 +396,55 @@ class EditFlowFineTune(EditFlow):
         }, prog_bar=True, on_epoch=True, sync_dist=True)
         return loss
 
-    def on_validation_epoch_end(self):
-        # Keeps original logging
-        if ((self.config.eval.compute_perplexity_on_sanity
-             or not self.trainer.sanity_checking)
-                and self.config.eval.generate_samples):
+    def sample_and_log(self, n_steps):
+        all_gen_lens = []
+        samples = []
+        text_x_1_batch = []
+        for i in range(len(self.sample_batches)):
+            samples = self._sample_conditional(self.sample_batches[i], n_steps=n_steps)
 
-            all_gen_lens = []
-            samples, text_samples = None, None
-            for i in range(len(self.sample_batches)):
-                samples = self._sample_conditional(self.sample_batches[i])
+            # Calculate non-padded lengths
+            batch_lens = (samples != self.tokenizer.pad_token_id).sum(dim=1).float()
+            all_gen_lens.append(batch_lens)
 
-                # Calculate non-padded lengths
-                batch_lens = (samples != self.tokenizer.pad_token_id).sum(dim=1).float()
-                all_gen_lens.append(batch_lens)
+            samples.extend([s[s != self.tokenizer.pad_token_id] for s in samples])
 
-                samples = [s[s != self.tokenizer.pad_token_id] for s in samples]
+            # Decode the samples to be re-tokenized by eval model
 
-                # Decode the samples to be re-tokenized by eval model
-                text_samples = self.tokenizer.batch_decode(samples)
+            # rather than old ppl eval, just check bleu score to ground truth x1
+            x_1_batch = self.sample_batches[i][1]
+            x_1_batch = [s[s != self.tokenizer.pad_token_id] for s in x_1_batch]
+            text_x_1_batch.extend(self.tokenizer.batch_decode(x_1_batch))
 
-                # rather than old ppl eval, just check bleu score to ground truth x1
-                x_1_batch = self.sample_batches[i][1]
-                x_1_batch = [s[s != self.tokenizer.pad_token_id] for s in x_1_batch]
-                text_x_1_batch = self.tokenizer.batch_decode(x_1_batch)
+        text_samples = self.tokenizer.batch_decode(samples)
 
-                # Compute BLEU score
-                bleu_score = self.compute_bleu_score(text_samples, text_x_1_batch)
-                self.log("val_bleu_score", bleu_score, on_epoch=True, prog_bar=True, sync_dist=True)
+        # Compute BLEU score
+        bleu_score = self.compute_bleu_score(text_samples, text_x_1_batch)
+        self.log(f"val_bleu_{n_steps}_steps", bleu_score, on_epoch=True, sync_dist=True)
 
-            #     if self.config.eval.compute_generative_perplexity:
-            #         self.compute_generative_perplexity(text_samples)
-            #
-            # if all_gen_lens:
-            #     all_gen_lens = torch.cat(all_gen_lens)
-            #     self.log_dict({
-            #         "val/gen_len_mean": all_gen_lens.mean(),
-            #         "val/gen_len_std": all_gen_lens.std(),
-            #     }, prog_bar=True, on_epoch=True, sync_dist=True)
+        #     if self.config.eval.compute_generative_perplexity:
+        #         self.compute_generative_perplexity(text_samples)
+        #
+        # if all_gen_lens:
+        #     all_gen_lens = torch.cat(all_gen_lens)
+        #     self.log_dict({
+        #         "val/gen_len_mean": all_gen_lens.mean(),
+        #         "val/gen_len_std": all_gen_lens.std(),
+        #     }, prog_bar=True, on_epoch=True, sync_dist=True)
 
-            if self.trainer.global_rank == 0 and hasattr(self.trainer.logger, 'log_table'):
-                # Log the last generated samples
-                text_samples = text_samples[:self.config.sampling.num_sample_log]
+        if self.trainer.global_rank == 0 and hasattr(self.trainer.logger, 'log_table'):
+            # Log the last generated samples
+            text_samples = text_samples[:self.config.sampling.num_sample_log]
 
-                for sample in text_samples:
-                    print('Sample: ')
-                    print(sample)
-                    print('\n')
+            for sample in text_samples[:min(2, self.config.sampling.num_sample_log)]:
+                print(f'Sample ({n_steps}): ')
+                print(sample)
+                print('\n')
 
-                self.trainer.logger.log_table(
-                    key=f'samples@global_step{self.global_step}',
-                    columns=['Generated Samples'],
-                    data=[[s] for s in text_samples])
+            self.trainer.logger.log_table(
+                key=f'samples_{n_steps}_steps@global_step{self.global_step}',
+                columns=['Generated Samples'],
+                data=[[s] for s in text_samples])
 
     def compute_bleu_score(self, samples, ground_truth):
         # sacrebleu expects a list of references for each hypothesis, so wrap each ground truth in a list
