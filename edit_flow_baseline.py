@@ -192,6 +192,8 @@ class EditFlowBaseline(EditFlowBase):
         if n_steps is None:
             n_steps = self.config.sampling.steps
 
+        n_steps = n_steps - 1
+
         default_h = 1 / n_steps
 
         t_min = 0.01

@@ -1,6 +1,7 @@
 defaults:
   - _self_
-  - /callbacks: [ checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor ]
+#  - /callbacks: [ checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor ]
+  - /callbacks: [ checkpoint_monitor, learning_rate_monitor ]
   - /callbacks: [ learning_rate_monitor ]
   - /data: lm1b
   - /model: small
@@ -11,8 +12,8 @@ defaults:
 mode: train  # train / ppl_eval / sample_eval
 time_conditioning: False
 
-time_dependent: False
-rate_scaling: False
+time_dependent: True
+rate_scaling: True
 
 seed: 1
 
@@ -28,7 +29,7 @@ loader:
 sampling:
   steps: 128
   num_sample_batches: 2  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
-  num_sample_log: 8
+  num_sample_log: 64
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
@@ -66,7 +67,7 @@ wandb:
   group: null
   job_type: null
   offline: false
-  name: pef_time_indep_no_scaling
+  name: pef_linear_sched
   tags:
     - ${data.train}
     - ${data.valid}

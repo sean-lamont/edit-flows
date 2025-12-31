@@ -502,7 +502,8 @@ class EditFlow(EditFlowBase):
         self.time_conditioning = self.config.time_conditioning
 
         # higher mass earlier for structure prediction, giving more time for unmasking
-        self.mask_scheduler = CubicScheduler(a=3.0, b=0.0)
+        # self.mask_scheduler = CubicScheduler(a=3.0, b=0.0)
+        self.mask_scheduler = CubicScheduler(a=1.0, b=1.0)
 
         # linear for unmasking (matches up with log linear sigma  = linear alpha with time from t = 1 to t = 0)
         self.default_scheduler = CubicScheduler(a=1.0, b=1.0)
@@ -694,6 +695,8 @@ class EditFlow(EditFlowBase):
         # Lightning auto-casting is not working in this method for some reason
         if n_steps is None:
             n_steps = self.config.sampling.steps
+
+        n_steps = n_steps - 1
 
         default_h = 1 / n_steps
 
