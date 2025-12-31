@@ -408,6 +408,7 @@ class EditFlowBase(L.LightningModule):
         text_samples = self.tokenizer.batch_decode(samples)
 
         if self.config.eval.compute_generative_perplexity:
+            self.gen_ppl_metric.reset()
             self.compute_generative_perplexity(text_samples)
 
         if all_gen_lens:
