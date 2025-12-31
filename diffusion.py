@@ -413,38 +413,98 @@ class Diffusion(L.LightningModule):
         return self._compute_loss(batch, prefix='val')
 
     def on_validation_epoch_end(self):
+        # Keeps original logging
         if ((self.config.eval.compute_perplexity_on_sanity
              or not self.trainer.sanity_checking)
-                and self.config.eval.generate_samples
-                and not self.parameterization == 'ar'):
-            # TODO(justin): implement sampling and kv cache for AR
-            samples, text_samples = None, None
-            for _ in range(
-                    self.config.sampling.num_sample_batches):
-                samples = self._sample()
-                # Decode the samples to be re-tokenized by eval model
-                text_samples = self.tokenizer.batch_decode(samples)
-                if self.config.eval.compute_generative_perplexity:
-                    self.compute_generative_perplexity(text_samples)
-            if self.trainer.global_rank == 0 and hasattr(
-                    self.trainer.logger, 'log_table'):
-                # Log the last generated samples
-                text_samples = text_samples[
-                    : self.config.sampling.num_sample_log]
-                self.trainer.logger.log_table(
-                    key=f'samples@global_step{self.global_step}',
-                    columns=['Generated Samples'],
-                    data=[[s] for s in text_samples])
-            if self.config.eval.compute_generative_perplexity:
-                self.log('val/gen_ppl',
-                         self.gen_ppl_metric,
-                         on_epoch=True,
-                         on_step=False,
-                         sync_dist=True)
-        if self.ema:
-            self.ema.restore(
-                itertools.chain(self.backbone.parameters(),
-                                self.noise.parameters()))
+                and self.config.eval.generate_samples):
+
+            steps = [2, 4, 8, 16, 32, 64, 128]
+            for step in steps:
+                self.sample_and_log(step)
+
+    def sample_and_log(self, n_steps):
+        all_gen_lens = []
+        # samples, text_samples = None, None
+        samples = []
+        for _ in range(self.config.sampling.num_sample_batches):
+            samples_ = self._sample(num_steps=n_steps)
+
+            # Calculate non-padded lengths
+            batch_lens = (samples_ != self.tokenizer.pad_token_id).sum(dim=1).float()
+            all_gen_lens.append(batch_lens)
+
+            samples.extend([s[s != self.tokenizer.pad_token_id] for s in
+                            samples_])  # = input_ids[input_ids != tokenizer.pad_token_id]
+
+        # Decode the samples to be re-tokenized by eval model
+        text_samples = self.tokenizer.batch_decode(samples)
+
+        if self.config.eval.compute_generative_perplexity:
+            self.compute_generative_perplexity(text_samples)
+
+        if all_gen_lens:
+            all_gen_lens = torch.cat(all_gen_lens)
+            self.log_dict({
+                f"val/gen_len_mean_{n_steps}": all_gen_lens.mean(),
+                f"val/gen_len_std_{n_steps}": all_gen_lens.std(),
+            }, prog_bar=True, on_epoch=True, sync_dist=True)
+
+        if self.trainer.global_rank == 0 and hasattr(self.trainer.logger, 'log_table'):
+            # Log the last generated samples
+            text_samples = text_samples[:self.config.sampling.num_sample_log]
+
+            for sample in text_samples[:min(self.config.sampling.num_sample_log, 2)]:
+                print('Sample: ')
+                print(sample)
+                print('\n')
+
+            self.trainer.logger.log_table(
+                key=f'samples_{n_steps}_steps@global_step{self.global_step}',
+                columns=['Generated Samples'],
+                data=[[s] for s in text_samples])
+
+        if self.config.eval.compute_generative_perplexity:
+            # print (f'{self.gen_ppl_metric.compute()}')
+            self.log(f'val/gen_ppl_{n_steps}',
+                     self.gen_ppl_metric.compute(),
+                     on_epoch=True,
+                     on_step=False,
+                     sync_dist=True,
+                     prog_bar=True)
+
+    # def on_validation_epoch_end(self):
+    #     if ((self.config.eval.compute_perplexity_on_sanity
+    #          or not self.trainer.sanity_checking)
+    #             and self.config.eval.generate_samples
+    #             and not self.parameterization == 'ar'):
+    #         # TODO(justin): implement sampling and kv cache for AR
+    #         samples, text_samples = None, None
+    #         for _ in range(
+    #                 self.config.sampling.num_sample_batches):
+    #             samples = self._sample()
+    #             # Decode the samples to be re-tokenized by eval model
+    #             text_samples = self.tokenizer.batch_decode(samples)
+    #             if self.config.eval.compute_generative_perplexity:
+    #                 self.compute_generative_perplexity(text_samples)
+    #         if self.trainer.global_rank == 0 and hasattr(
+    #                 self.trainer.logger, 'log_table'):
+    #             # Log the last generated samples
+    #             text_samples = text_samples[
+    #                 : self.config.sampling.num_sample_log]
+    #             self.trainer.logger.log_table(
+    #                 key=f'samples@global_step{self.global_step}',
+    #                 columns=['Generated Samples'],
+    #                 data=[[s] for s in text_samples])
+    #         if self.config.eval.compute_generative_perplexity:
+    #             self.log('val/gen_ppl',
+    #                      self.gen_ppl_metric,
+    #                      on_epoch=True,
+    #                      on_step=False,
+    #                      sync_dist=True)
+    #     if self.ema:
+    #         self.ema.restore(
+    #             itertools.chain(self.backbone.parameters(),
+    #                             self.noise.parameters()))
 
     def configure_optimizers(self):
         # TODO(yair): Lightning currently giving this warning when using `fp16`:
@@ -655,7 +715,7 @@ class Diffusion(L.LightningModule):
         return x
 
     @torch.no_grad()
-    def _sample(self, num_steps=None, eps=1e-5):
+    def _sample(self, num_steps=None, eps=1e-5, length=None):
         """Generate samples from the model."""
         batch_size_per_gpu = self.config.loader.eval_batch_size
         if self.parameterization == 'ar':
@@ -663,9 +723,13 @@ class Diffusion(L.LightningModule):
         # Lightning auto-casting is not working in this method for some reason
         if num_steps is None:
             num_steps = self.config.sampling.steps
+
+        length = length if length else self.config.model.length
+
         x = self._sample_prior(
             batch_size_per_gpu,
-            self.config.model.length).to(self.device)
+            length).to(self.device)
+
         timesteps = torch.linspace(
             1, eps, num_steps + 1, device=self.device)
         dt = (1 - eps) / num_steps

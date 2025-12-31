@@ -210,7 +210,8 @@ class EditFlowBaseline(EditFlowBase):
         # x_ts = [x_t.clone()]
 
         with tqdm(desc="Euler Sampling") as pbar:
-            while t.max() <= 1:
+            for _ in range(n_steps + 1):
+            # while t.max() <= 1:
                 u_t, sub_logits, ins_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
                 sub_probs = F.softmax(sub_logits, dim=-1)
@@ -284,7 +285,8 @@ class EditFlowBaseline(EditFlowBase):
 
                 x_pad_mask = (x_t == self.pad_token)  # Update padding mask after operations
 
-                t = t + adapt_h
+                t = torch.where(t + adapt_h > 1, 1, t + adapt_h)
+                # t = t + adapt_h
                 # x_ts.append(x_t.clone())
                 pbar.update(1)
 

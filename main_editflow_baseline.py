@@ -22,6 +22,8 @@ omegaconf.OmegaConf.register_new_resolver(
     'div_up', lambda x, y: (x + y - 1) // y)
 
 
+import os
+os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 def _load_from_checkpoint(config, tokenizer):
     if 'hf' in config.backbone:
         return edit_flow_baseline.EditFlowBaseline(
@@ -182,8 +184,50 @@ def _train(config, logger, tokenizer):
     trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
 
 
+def _eval(config, logger, tokenizer):
+    logger.info('Starting Eval.')
+    wandb_logger = None
+    if config.get('wandb', None) is not None:
+        wandb_logger = L.pytorch.loggers.WandbLogger(
+            config=omegaconf.OmegaConf.to_object(config),
+            **config.wandb)
+
+    if (config.checkpointing.resume_from_ckpt
+            and config.checkpointing.resume_ckpt_path is not None
+            and utils.fsspec_exists(
+                config.checkpointing.resume_ckpt_path)):
+        ckpt_path = config.checkpointing.resume_ckpt_path
+    else:
+        ckpt_path = None
+
+    # Lightning callbacks
+    callbacks = []
+    if 'callbacks' in config:
+        for _, callback in config.callbacks.items():
+            callbacks.append(hydra.utils.instantiate(callback))
+
+    train_ds, valid_ds = dataloader.get_dataloaders(
+        config, tokenizer)
+    _print_batch(train_ds, valid_ds, tokenizer)
+
+    model = edit_flow_baseline.EditFlowBaseline(
+        config, tokenizer=valid_ds.tokenizer)
+
+    trainer = hydra.utils.instantiate(
+        config.trainer,
+        default_root_dir=os.getcwd(),
+        callbacks=callbacks,
+        strategy=hydra.utils.instantiate(config.strategy),
+        logger=wandb_logger)
+    # trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
+
+    trainer.validate(model=model, dataloaders=valid_ds, ckpt_path=ckpt_path)
+
+
 @hydra.main(version_base=None, config_path='configs',
-            config_name='config_editflow_baseline')
+            config_name='config_editflow_baseline_eval')
+# config_name = 'config_editflow_baseline')
+
 def main(config):
     """Main entry point for training."""
     L.seed_everything(config.seed)
@@ -196,6 +240,8 @@ def main(config):
         generate_samples(config, logger, tokenizer)
     elif config.mode == 'ppl_eval':
         _ppl_eval(config, logger, tokenizer)
+    elif config.mode == 'eval':
+        _eval(config, logger, tokenizer)
     else:
         _train(config, logger, tokenizer)
 

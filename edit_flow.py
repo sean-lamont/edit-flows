@@ -390,21 +390,19 @@ class EditFlowBase(L.LightningModule):
             }, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         return loss
 
-
-
     def sample_and_log(self, n_steps):
         all_gen_lens = []
         # samples, text_samples = None, None
         samples = []
         for _ in range(self.config.sampling.num_sample_batches):
-            samples = self._sample()
+            samples_ = self._sample(n_steps=n_steps)
 
             # Calculate non-padded lengths
-            batch_lens = (samples != self.tokenizer.pad_token_id).sum(dim=1).float()
+            batch_lens = (samples_ != self.tokenizer.pad_token_id).sum(dim=1).float()
             all_gen_lens.append(batch_lens)
 
             samples.extend([s[s != self.tokenizer.pad_token_id] for s in
-                       samples]) # = input_ids[input_ids != tokenizer.pad_token_id]
+                            samples_])  # = input_ids[input_ids != tokenizer.pad_token_id]
 
         # Decode the samples to be re-tokenized by eval model
         text_samples = self.tokenizer.batch_decode(samples)
@@ -415,8 +413,8 @@ class EditFlowBase(L.LightningModule):
         if all_gen_lens:
             all_gen_lens = torch.cat(all_gen_lens)
             self.log_dict({
-                "val/gen_len_mean": all_gen_lens.mean(),
-                "val/gen_len_std": all_gen_lens.std(),
+                f"val/gen_len_mean_{n_steps}": all_gen_lens.mean(),
+                f"val/gen_len_std_{n_steps}": all_gen_lens.std(),
             }, prog_bar=True, on_epoch=True, sync_dist=True)
 
         if self.trainer.global_rank == 0 and hasattr(self.trainer.logger, 'log_table'):
@@ -434,13 +432,13 @@ class EditFlowBase(L.LightningModule):
                 data=[[s] for s in text_samples])
 
         if self.config.eval.compute_generative_perplexity:
-            self.log('val/gen_ppl',
-                     self.gen_ppl_metric,
+            # print (f'{self.gen_ppl_metric.compute()}')
+            self.log(f'val/gen_ppl_{n_steps}',
+                     self.gen_ppl_metric.compute(),
                      on_epoch=True,
                      on_step=False,
                      sync_dist=True,
                      prog_bar=True)
-
 
     def on_validation_epoch_end(self):
         # Keeps original logging
@@ -448,12 +446,11 @@ class EditFlowBase(L.LightningModule):
              or not self.trainer.sanity_checking)
                 and self.config.eval.generate_samples):
 
-            steps = [2, 4, 8, 16, 32, 64, 128]
+            #steps = [1, 2, 4, 8, 16, 32, 64, 128, 1024]
+            steps = [ 2, 4, 8, 16, 32, 64, 128]
             for step in steps:
                 self.sample_and_log(step)
 
-
-    # todo left padding?
     def rm_gap_tokens(self, z: torch.Tensor):
         """
         Remove gap tokens from a batched tensor and right-pad with PAD_TOKEN.
@@ -706,8 +703,6 @@ class EditFlow(EditFlowBase):
 
         x_0 = torch.full((batch_size_per_gpu, 1), 101,
                          device=self.device).long()  # todo parameterise, currently BOS token
-        # x_0 = torch.empty((batch_size_per_gpu, 0),
-        #                   device=self.device).long()  # todo sample from coupling optionally given x1
 
         x_t = x_0.clone().to(self.device)
 
@@ -716,7 +711,8 @@ class EditFlow(EditFlowBase):
 
         with tqdm(desc="Euler Sampling") as pbar:
             # while t.max() <= 1 - default_h:
-            while t.max() <= 1:
+            # while t.max() <= 1:
+            for _ in range(n_steps + 1):
                 u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
                 sub_probs = F.softmax(sub_logits, dim=-1)
@@ -794,7 +790,7 @@ class EditFlow(EditFlowBase):
                 )
                 x_pad_mask = (x_t == self.pad_token)  # Update padding mask after operations
 
-                t = t + adapt_h
+                t = torch.where(t + adapt_h > 1, 1, t + adapt_h)
                 # x_ts.append(x_t.clone())
                 pbar.update(1)
 

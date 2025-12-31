@@ -12,6 +12,9 @@ import dataloader_editflow as dataloader
 import edit_flow
 import utils
 
+import os
+os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+
 omegaconf.OmegaConf.register_new_resolver(
     'cwd', os.getcwd)
 omegaconf.OmegaConf.register_new_resolver(
@@ -97,25 +100,25 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
         print(f'Last {k} tokens:', tokenizer.decode(last))
         print('ids:', last)
 
+
 def generate_samples(config, logger, tokenizer):
     logger.info('Generating samples.')
     model = _load_from_checkpoint(config=config,
                                   tokenizer=tokenizer)
     model.gen_ppl_metric.reset()
 
-
     text_samples_ = []
     for _ in range(config.sampling.num_sample_batches):
-            samples = model.restore_model_and_sample(
-                num_steps=config.sampling.steps)
-            text_samples = model.tokenizer.batch_decode(samples)
-            model.compute_generative_perplexity(text_samples)
-            print('Text samples:', text_samples)
-            if not config.sampling.semi_ar:
-                print('Generative perplexity:',
-                      model.gen_ppl_metric.compute())
+        samples = model.restore_model_and_sample(
+            num_steps=config.sampling.steps)
+        text_samples = model.tokenizer.batch_decode(samples)
+        model.compute_generative_perplexity(text_samples)
+        print('Text samples:', text_samples)
+        if not config.sampling.semi_ar:
+            print('Generative perplexity:',
+                  model.gen_ppl_metric.compute())
 
-            text_samples_.extend(text_samples)
+        text_samples_.extend(text_samples)
     return text_samples_
 
 
@@ -142,6 +145,46 @@ def _ppl_eval(config, logger, tokenizer):
     _, valid_ds = dataloader.get_dataloaders(
         config, tokenizer, skip_train=True, valid_seed=config.seed)
     trainer.validate(model, valid_ds)
+
+
+def _eval(config, logger, tokenizer):
+    logger.info('Starting Eval.')
+    wandb_logger = None
+    if config.get('wandb', None) is not None:
+        wandb_logger = L.pytorch.loggers.WandbLogger(
+            config=omegaconf.OmegaConf.to_object(config),
+            **config.wandb)
+
+    if (config.checkpointing.resume_from_ckpt
+            and config.checkpointing.resume_ckpt_path is not None
+            and utils.fsspec_exists(
+                config.checkpointing.resume_ckpt_path)):
+        ckpt_path = config.checkpointing.resume_ckpt_path
+    else:
+        ckpt_path = None
+
+    # Lightning callbacks
+    callbacks = []
+    if 'callbacks' in config:
+        for _, callback in config.callbacks.items():
+            callbacks.append(hydra.utils.instantiate(callback))
+
+    train_ds, valid_ds = dataloader.get_dataloaders(
+        config, tokenizer)
+    _print_batch(train_ds, valid_ds, tokenizer)
+
+    model = edit_flow.EditFlow(
+        config, tokenizer=valid_ds.tokenizer)
+
+    trainer = hydra.utils.instantiate(
+        config.trainer,
+        default_root_dir=os.getcwd(),
+        callbacks=callbacks,
+        strategy=hydra.utils.instantiate(config.strategy),
+        logger=wandb_logger)
+    # trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
+
+    trainer.validate(model=model, dataloaders=valid_ds, ckpt_path=ckpt_path)
 
 
 def _train(config, logger, tokenizer):
@@ -183,7 +226,7 @@ def _train(config, logger, tokenizer):
 
 
 @hydra.main(version_base=None, config_path='configs',
-            config_name='config_editflow')
+            config_name='config_editflow_eval')
 def main(config):
     """Main entry point for training."""
     L.seed_everything(config.seed)
@@ -196,6 +239,8 @@ def main(config):
         generate_samples(config, logger, tokenizer)
     elif config.mode == 'ppl_eval':
         _ppl_eval(config, logger, tokenizer)
+    elif config.mode == 'eval':
+        _eval(config, logger, tokenizer)
     else:
         _train(config, logger, tokenizer)
 
