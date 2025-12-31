@@ -505,6 +505,8 @@ class EditFlow(EditFlowBase):
         # higher mass earlier for structure prediction, giving more time for unmasking
         # self.mask_scheduler = CubicScheduler(a=3.0, b=0.0)
         self.mask_scheduler = CubicScheduler(a=1.0, b=1.0)
+        # self.mask_scheduler = CubicScheduler(a=1.0, b=1.0)
+
 
         # linear for unmasking (matches up with log linear sigma  = linear alpha with time from t = 1 to t = 0)
         self.default_scheduler = CubicScheduler(a=1.0, b=1.0)
@@ -716,7 +718,7 @@ class EditFlow(EditFlowBase):
         with tqdm(desc="Euler Sampling") as pbar:
             # while t.max() <= 1 - default_h:
             # while t.max() <= 1:
-            for _ in range(n_steps + 1):
+            for step_i in range(n_steps + 1):
                 u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
                 sub_probs = F.softmax(sub_logits, dim=-1)
@@ -772,7 +774,17 @@ class EditFlow(EditFlowBase):
 
                 sub_mask = del_sub_mask & ~del_mask
 
-                assert sub_mask.sum() + del_mask.sum() == del_sub_mask.sum()
+                # --- NEW LOGIC: FORCE MASK SUBSTITUTION ---
+                if step_i == n_steps:
+                    # Identify all current mask tokens
+                    mask_token_locs = (x_t == self.mask_token)
+
+                    # Force substitution on these tokens
+                    sub_mask = sub_mask | mask_token_locs
+
+                    ins_vals.zero_()
+
+                # assert sub_mask.sum() + del_mask.sum() == del_sub_mask.sum()
 
                 # Only sample tokens for non-pad positions, fill pad positions with PAD_TOKEN
                 sub_tokens = torch.full(sub_probs.shape[:2], self.pad_token, dtype=torch.long, device=self.device)
