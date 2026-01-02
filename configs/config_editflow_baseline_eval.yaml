@@ -10,13 +10,13 @@ defaults:
 mode: eval
 time_conditioning: False
 
-seed: 2
+seed: 1
 
-#time_dependent: False
-#rate_scaling: False
+time_dependent: False
+rate_scaling: False
 
-time_dependent: True
-rate_scaling: True
+  #time_dependent: True
+  #rate_scaling: True
 
 
 
@@ -69,7 +69,7 @@ wandb:
   group: null
   job_type: null
 #  offline: true
-  name: ef_eval
+  name: ef_eval_time_indep
   tags:
     - ${data.train}
     - ${data.valid}
@@ -83,7 +83,8 @@ hydra:
     chdir: true
 
 checkpointing:
-  save_dir: "/home/sean/Documents/edit-flows/outputs/lm1b/2025.12.27/115634"
+  save_dir: "/home/sean/Documents/edit-flows/outputs/lm1b/2025.12.26/225905"
+  # save_dir: "/home/sean/Documents/edit-flows/outputs/lm1b/2025.12.27/115634"
 #  save_dir: "/home/sean/Documents/edit-flows/outputs/lm1b/2025.12.26/225905"
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt

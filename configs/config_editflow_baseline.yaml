@@ -67,7 +67,6 @@ wandb:
   job_type: null
 #  offline: true
   name: ef
-#  id: cs6o8cg5
   tags:
     - ${data.train}
     - ${data.valid}

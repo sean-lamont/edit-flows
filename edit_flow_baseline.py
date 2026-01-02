@@ -187,6 +187,7 @@ class EditFlowBaseline(EditFlowBase):
     def _sample(self, n_steps=None, eps=1e-5):
         """Generate samples from the model."""
         batch_size_per_gpu = self.config.loader.eval_batch_size
+        print (self.time_dependent)
 
         # Lightning auto-casting is not working in this method for some reason
         if n_steps is None:
@@ -287,7 +288,7 @@ class EditFlowBaseline(EditFlowBase):
 
                 x_pad_mask = (x_t == self.pad_token)  # Update padding mask after operations
 
-                t = torch.where(t + adapt_h > 1, 1, t + adapt_h)
+                t = torch.where(t + adapt_h > 0.99, 0.99, t + adapt_h)
                 # t = t + adapt_h
                 # x_ts.append(x_t.clone())
                 pbar.update(1)

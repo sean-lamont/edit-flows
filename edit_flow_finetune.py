@@ -74,7 +74,7 @@ class LLaDABackbone(nn.Module):
         for param in self.content_head.parameters():
             param.requires_grad = True
 
-        print (self.base_model, self.content_head)
+        print(self.base_model, self.content_head)
 
     # todo add time conditioning?
     def forward(self, x, t=None, attention_mask=None):
@@ -133,6 +133,9 @@ class EditFlowFineTune(EditFlow):
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = self.rm_gap_tokens(z_t)
 
+        if not self.time_dependent:
+            t = torch.ones_like(t).to(self.device)
+
         u_t_logits, sub_vocab_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
         sched_coeff_z = self.get_sched_coeff(t, z_0, z_1, z_t)
@@ -188,7 +191,6 @@ class EditFlowFineTune(EditFlow):
             log_r_sub = F.logsigmoid(raw_sub).masked_fill(ignore_mask, -1e9)
             log_r_del = F.logsigmoid(raw_del).masked_fill(ignore_mask, -1e9)
 
-        # 5. Map Predictions back to Z-Space for Loss
         lse_sub_x = sub_vocab_logits.logsumexp(dim=-1)
         packed_features_x = torch.stack([log_r_sub, log_r_ins, log_r_del, lse_sub_x], dim=-1)
 
@@ -240,7 +242,7 @@ class EditFlowFineTune(EditFlow):
         return loss.mean(), u_tot.mean(), u_ins_mean, u_del_mean, u_sub_mean, term2.mean()
 
     @torch.no_grad()
-    def _sample_conditional(self, batch, n_steps=None, eps=1e-5):
+    def _sample_conditional(self, batch, n_steps=None, eps=1e-5, one_shot=True):
         """
         Conditional Sampling assuming RIGHT PADDING everywhere.
         """
@@ -260,6 +262,7 @@ class EditFlowFineTune(EditFlow):
             x_0_in = x_0_right
 
         if n_steps is None: n_steps = self.config.sampling.steps
+        n_steps = n_steps - 1
         default_h = 1 / n_steps
         t = torch.ones(bsz, 1, device=device) * 0.01
 
@@ -269,8 +272,8 @@ class EditFlowFineTune(EditFlow):
         valid_seq_lens = context_lens.clone()
 
         with tqdm(desc="Euler Sampling", total=n_steps) as pbar:
-            while t.max() <= 1:
-
+            for step_i in range(n_steps + 1):
+                # while t.max() <= 1:
                 current_len = x_t.shape[1]
 
                 x_pad_mask = (x_t == self.pad_token)
@@ -279,18 +282,19 @@ class EditFlowFineTune(EditFlow):
                 seq_range = torch.arange(current_len, device=device).unsqueeze(0)
                 is_valid_range = seq_range < valid_seq_lens.unsqueeze(1)
 
-                # Pad Mask for Model: True=Pad/Ignore.
-                model_pad_mask = ~is_valid_range
+                # subtract 1 to keep single token for gen
+                is_context = seq_range < context_lens.unsqueeze(1) - 1
+
+                is_gen = is_valid_range & ~is_context
 
                 # Forward (Shapes now match: x_t [B, L], mask [B, L])
-                u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
-
-                # 3. Compute Rates
-                if model_pad_mask.any():
-                    sub_logits[model_pad_mask] = 0.0
+                if not self.time_dependent:
+                    u_t, sub_logits = self.backbone.forward(x_t, torch.ones_like(t).to(self.device), x_pad_mask)
+                else:
+                    u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
                 sub_probs = F.softmax(sub_logits, dim=-1)
-                sub_probs = sub_probs.masked_fill(model_pad_mask, 0)
+                sub_probs = sub_probs.masked_fill(~is_gen, 0)
 
                 lambda_sub = u_t[:, :, 0]
                 lambda_ins = u_t[:, :, 1]
@@ -321,17 +325,14 @@ class EditFlowFineTune(EditFlow):
                     lambda_ins = lambda_ins * ins_coeff
                     lambda_del = lambda_del * default_coeff
 
-                # subtract 1 to keep single token for gen
-                is_context = seq_range < context_lens.unsqueeze(1) - 1
-
-                is_gen = is_valid_range & ~is_context
-                # is_boundary = (seq_range == valid_seq_lens.unsqueeze(1)) # Removed
-
                 lambda_sub = torch.where(is_gen, lambda_sub, 0.0)
                 lambda_del = torch.where(is_gen, lambda_del, 0.0)
                 lambda_ins = torch.where(is_gen, lambda_ins, 0.0)
 
-                adapt_h = default_h
+                if one_shot:
+                    adapt_h = 1
+                else:
+                    adapt_h = default_h
 
                 ins_vals = torch.poisson(adapt_h * lambda_ins).long()
 
@@ -346,18 +347,26 @@ class EditFlowFineTune(EditFlow):
                 del_mask = torch.bernoulli(prob_del).bool()
 
                 sub_mask = del_sub_mask & ~del_mask
+                # --- NEW LOGIC: FORCE MASK SUBSTITUTION ---
 
-                assert sub_mask.sum() + del_mask.sum() == del_sub_mask.sum()
+                if step_i == n_steps:
+                    # Identify all current mask tokens
+                    mask_token_locs = (x_t == self.mask_token)
+
+                    # Force substitution on these tokens
+                    sub_mask = sub_mask | mask_token_locs
+
+                    ins_vals.zero_()
+
+                # assert sub_mask.sum() + del_mask.sum() == del_sub_mask.sum()
 
                 # Only sample tokens for non-pad positions, fill pad positions with PAD_TOKEN
                 sub_tokens = torch.full(sub_probs.shape[:2], self.pad_token, dtype=torch.long, device=self.device)
 
-                non_pad_mask = ~x_pad_mask
-
-                if non_pad_mask.any():
-                    sub_sampled = torch.multinomial(sub_probs[non_pad_mask], num_samples=1, replacement=True).squeeze(
+                if is_gen.any():
+                    sub_sampled = torch.multinomial(sub_probs[is_gen], num_samples=1, replacement=True).squeeze(
                         -1)
-                    sub_tokens[non_pad_mask] = sub_sampled
+                    sub_tokens[is_gen] = sub_sampled
 
                 # Apply operations based on masks
                 x_t[sub_mask] = sub_tokens[sub_mask]
@@ -375,7 +384,8 @@ class EditFlowFineTune(EditFlow):
 
                 valid_seq_lens = valid_seq_lens.clamp(min=context_lens, max=torch.tensor(max_capacity, device=device))
 
-                t += adapt_h
+                t = torch.where(t + adapt_h > 0.99, 0.99, t + adapt_h)
+                # t += adapt_h
                 pbar.update(1)
 
         return x_t

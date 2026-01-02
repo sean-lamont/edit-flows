@@ -10,12 +10,11 @@ defaults:
 mode: eval
 time_conditioning: False
 
-#time_dependent: False
-#rate_scaling: False
+time_dependent: False
+rate_scaling: False
 
-time_dependent: True
-rate_scaling: True
-
+  #time_dependent: True
+  #rate_scaling: True
 
 seed: 2
 
@@ -69,7 +68,7 @@ wandb:
   group: null
   job_type: null
 #  offline: true
-  name: pef_eval
+  name: pef_eval_time_indep_one_shot
   tags:
     - ${data.train}
     - ${data.valid}
@@ -85,7 +84,8 @@ hydra:
 
 checkpointing:
 #  save_dir: "/home/sean/Documents/edit-flows/outputs/lm1b/2025.12.24/182020"
+  save_dir: "/home/sean/Documents/edit-flows/outputs/lm1b/2025.12.31/171732/" #
 #  save_dir: '/home/sean/Documents/edit-flows/outputs/750k_pef'
-  save_dir: "/home/sean/Documents/edit-flows/outputs/lm1b/2025.12.25/060841"
+# save_dir: "/home/sean/Documents/edit-flows/outputs/lm1b/2025.12.25/060841"
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt

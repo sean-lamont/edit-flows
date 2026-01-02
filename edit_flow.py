@@ -401,8 +401,8 @@ class EditFlowBase(L.LightningModule):
             batch_lens = (samples_ != self.tokenizer.pad_token_id).sum(dim=1).float()
             all_gen_lens.append(batch_lens)
 
-            samples.extend([s[s != self.tokenizer.pad_token_id] for s in
-                            samples_])  # = input_ids[input_ids != tokenizer.pad_token_id]
+            sample = [s[s != self.tokenizer.pad_token_id] for s in samples_]
+            samples.extend([s[s != self.tokenizer.bos_token_id] for s in sample])  # = input_ids[input_ids != tokenizer.pad_token_id]
 
         # Decode the samples to be re-tokenized by eval model
         text_samples = self.tokenizer.batch_decode(samples)
@@ -503,10 +503,7 @@ class EditFlow(EditFlowBase):
         self.time_conditioning = self.config.time_conditioning
 
         # higher mass earlier for structure prediction, giving more time for unmasking
-        # self.mask_scheduler = CubicScheduler(a=3.0, b=0.0)
-        self.mask_scheduler = CubicScheduler(a=1.0, b=1.0)
-        # self.mask_scheduler = CubicScheduler(a=1.0, b=1.0)
-
+        self.mask_scheduler = CubicScheduler(a=3.0, b=0.0)
 
         # linear for unmasking (matches up with log linear sigma  = linear alpha with time from t = 1 to t = 0)
         self.default_scheduler = CubicScheduler(a=1.0, b=1.0)
@@ -536,9 +533,13 @@ class EditFlow(EditFlowBase):
         z_t = self.sample_zt(z_0, z_1, t)
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = self.rm_gap_tokens(z_t)
 
-        u_t_logits, sub_vocab_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
         sched_coeff_z = self.get_sched_coeff(t, z_0, z_1, z_t)
+
+        if not self.time_dependent:
+            t = torch.ones_like(t).to(self.device)
+
+        u_t_logits, sub_vocab_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
         raw_sub = u_t_logits[:, :, 0]
         raw_ins = u_t_logits[:, :, 1]
@@ -691,7 +692,7 @@ class EditFlow(EditFlowBase):
         return z_t
 
     @torch.no_grad()
-    def _sample(self, n_steps=None, eps=1e-5):
+    def _sample(self, n_steps=None, eps=1e-5, one_shot=True):
         """Generate samples from the model."""
         batch_size_per_gpu = self.config.loader.eval_batch_size
 
@@ -719,7 +720,10 @@ class EditFlow(EditFlowBase):
             # while t.max() <= 1 - default_h:
             # while t.max() <= 1:
             for step_i in range(n_steps + 1):
-                u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
+                if not self.time_dependent:
+                    u_t, sub_logits = self.backbone.forward(x_t, torch.ones_like(t).to(self.device), x_pad_mask)
+                else:
+                    u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
                 sub_probs = F.softmax(sub_logits, dim=-1)
 
@@ -742,7 +746,7 @@ class EditFlow(EditFlowBase):
                 lambda_sub = torch.where(valid_token_mask, lambda_sub, 0.0)
                 lambda_del = torch.where(valid_token_mask, lambda_del, 0.0)
 
-                if not self.time_dependent:  # scale raw count/bernoulli predictions by sampler rate
+                if not self.time_dependent and not one_shot:  # scale raw count/bernoulli predictions by sampler rate
                     default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))
                     ins_coeff = (self.mask_scheduler.derivative(t) / (1 - self.mask_scheduler(t) + eps))
 
@@ -758,7 +762,10 @@ class EditFlow(EditFlowBase):
                     lambda_ins = lambda_ins * ins_coeff
                     lambda_del = lambda_del * default_coeff
 
-                adapt_h = default_h
+                if one_shot: # samples full completion each step (only makes sense for time independent)
+                    adapt_h = 1
+                else:
+                    adapt_h = default_h
 
                 ins_vals = torch.poisson(adapt_h * lambda_ins).long()
 
@@ -806,7 +813,7 @@ class EditFlow(EditFlowBase):
                 )
                 x_pad_mask = (x_t == self.pad_token)  # Update padding mask after operations
 
-                t = torch.where(t + adapt_h > 1, 1, t + adapt_h)
+                t = torch.where(t + adapt_h > 0.99, 0.99, t + adapt_h)
                 # x_ts.append(x_t.clone())
                 pbar.update(1)
 

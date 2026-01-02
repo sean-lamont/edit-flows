@@ -12,8 +12,8 @@ defaults:
 mode: train  # train / ppl_eval / sample_eval
 time_conditioning: False
 
-time_dependent: True
-rate_scaling: True
+time_dependent: False
+rate_scaling: False
 
 seed: 1
 
@@ -55,11 +55,11 @@ trainer:
   gradient_clip_val: 1.0
   precision: 'bf16-mixed'
   num_sanity_val_steps: 2
-  max_steps: 200_000 #1_000_000
+  max_steps: 1_000_000
   log_every_n_steps: 10
   limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
   limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
-  val_check_interval: 5000
+  val_check_interval: 20_000
 
 wandb:
   project: text-diffusion
@@ -67,7 +67,9 @@ wandb:
   group: null
   job_type: null
   offline: false
-  name: pef_linear_sched
+  id: ed4nahm3
+#  id: a07yd5u9
+  name: pef_time_indep_one_shot
   tags:
     - ${data.train}
     - ${data.valid}
@@ -82,8 +84,8 @@ hydra:
     chdir: true
 
 checkpointing:
-  # Use custom `save_dir` if, e.g., saving to S3 bucket, otherwise leave this parameter as is
-  save_dir: ${cwd:}
-  # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
+#  save_dir: '/home/sean/Documents/edit-flows/outputs/lm1b/2025.12.31/171732/'
+  save_dir: "/home/sean/Documents/edit-flows/outputs/lm1b/2026.01.02/123509"
+#  save_dir: ${cwd:}
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt
