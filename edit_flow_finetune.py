@@ -34,13 +34,15 @@ class LLaDABackbone(nn.Module):
 
         lora_config = LoraConfig(
             r=64,
-            lora_alpha=128,
+            lora_alpha=32,
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                             "gate_proj", "up_proj", "down_proj"],
             lora_dropout=0.05,
             bias="none",
-            task_type=None
+            task_type=None,
+            modules_to_save = ["embed_tokens"]
         )
+        print (self.base_model)
 
         self.base_model = get_peft_model(self.base_model, lora_config)
         self.base_model.print_trainable_parameters()
