@@ -11,7 +11,7 @@ from edit_flow import EditFlow
 
 
 class LLaDABackbone(nn.Module):
-    def __init__(self, config, vocab_size, device):
+    def __init__(self, config, vocab_size, device, time_dependent):
         super().__init__()
         self.config = config
 
@@ -40,7 +40,7 @@ class LLaDABackbone(nn.Module):
             lora_dropout=0.05,
             bias="none",
             task_type=None,
-            modules_to_save = ["embed_tokens"]
+            modules_to_save=["embed_tokens"]
         )
 
         self.base_model = get_peft_model(self.base_model, lora_config)
@@ -71,6 +71,13 @@ class LLaDABackbone(nn.Module):
         # Re-use the LM Head
         self.content_head = self.base_model.model.model.transformer.ff_out
 
+        self.time_dependent = time_dependent
+
+        if self.time_dependent:
+            self.time_mlp = nn.Sequential(nn.Linear(1, 1024),
+                                          nn.GELU(),
+                                          nn.Linear(1024, self.hidden_size))
+
         # Unfreeze heads
         for param in self.content_head.parameters():
             param.requires_grad = True
@@ -78,7 +85,7 @@ class LLaDABackbone(nn.Module):
         print(self.base_model, self.content_head)
 
     # todo add time conditioning?
-    def forward(self, x, t=None, attention_mask=None):
+    def forward(self, x, t, attention_mask=None):
         """
         Forward pass assuming Right Padding.
         attention_mask: Bool [B, L], True=Pad (Ignore), False=Content (Attend)
@@ -92,7 +99,11 @@ class LLaDABackbone(nn.Module):
                 hf_mask = None
 
             outputs = self.base_model(x, attention_mask=hf_mask, output_hidden_states=True)
+
             h = outputs.hidden_states[-1]
+
+            if self.time_dependent:
+                h = h + self.time_mlp(t).unsqueeze(1)
 
             ins_pred = self.ins_head(h)
             sub_pred = self.sub_head(h)
@@ -113,7 +124,8 @@ class EditFlowFineTune(EditFlow):
         super().__init__(config, tokenizer)
 
         self.mask_token_id = 126336
-        self.backbone = LLaDABackbone(self.config, vocab_size=self.V, device=self.device)
+        self.backbone = LLaDABackbone(self.config, vocab_size=self.V, device=self.device,
+                                      time_dependent=self.time_dependent)
         self.gap_token = 126084
 
         self.tokenizer.padding_side = 'right'
@@ -143,7 +155,9 @@ class EditFlowFineTune(EditFlow):
 
         sched_coeff_z = self.get_sched_coeff(t, z_0, z_1, z_t)
 
-        ignore_mask = x_pad_mask #(x_pad_mask | context_mask)  # True for Pad
+        # ignore_masksymotion-prefix)x0 = x_pad_mask #(x_pad_mask | context_mask)  # True for Pad
+        # assumes context is fully on left
+        ignore_mask = x_pad_mask  # | context_mask[:, :x_pad_mask.shape[1]]#reduces loss???
 
         raw_sub = u_t_logits[:, :, 0]
         raw_ins = u_t_logits[:, :, 1]
@@ -245,7 +259,7 @@ class EditFlowFineTune(EditFlow):
         return loss.mean(), u_tot.mean(), u_ins_mean, u_del_mean, u_sub_mean, term2.mean()
 
     @torch.no_grad()
-    def _sample_conditional(self, batch, n_steps=None, eps=1e-5, one_shot=True):
+    def _sample_conditional(self, batch, n_steps=None, eps=1e-5, one_shot=False):
         """
         Conditional Sampling assuming RIGHT PADDING everywhere.
         """
@@ -286,7 +300,6 @@ class EditFlowFineTune(EditFlow):
                 is_valid_range = seq_range < valid_seq_lens.unsqueeze(1)
 
                 model_pad_mask = ~is_valid_range
-
 
                 # Forward (Shapes now match: x_t [B, L], mask [B, L])
                 if not self.time_dependent:

@@ -475,9 +475,12 @@ class EditFlowBase(L.LightningModule):
         # Calculate new positions and scatter into a new tensor
         new_lengths = keep_mask.sum(dim=1)
         max_len = new_lengths.max().item()
+
         x = torch.full((batch_size, max_len), self.pad_token, dtype=z.dtype, device=device)
+
         new_pos = torch.arange(z_len, device=device).unsqueeze(0).expand(batch_size, -1)[keep_mask] - \
                   z_gap_mask.cumsum(dim=1)[keep_mask]
+
         x[batch_indices, new_pos] = kept_values
 
         x_pad_mask = (x == self.pad_token)

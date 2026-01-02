@@ -211,5 +211,10 @@ def main(config):
         _train(config, logger, tokenizer)
 
 
+
 if __name__ == '__main__':
+    import torch.multiprocessing
+
+    torch.multiprocessing.set_sharing_strategy('file_system')
+
     main()
