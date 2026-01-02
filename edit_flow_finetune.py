@@ -11,7 +11,7 @@ from edit_flow import EditFlow
 
 
 class LLaDABackbone(nn.Module):
-    def __init__(self, config, vocab_size):
+    def __init__(self, config, vocab_size, device):
         super().__init__()
         self.config = config
 
@@ -29,8 +29,8 @@ class LLaDABackbone(nn.Module):
             trust_remote_code=True,
             # quantization_config=bnb_config,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
-        )
+            # device_map="auto",
+        ).to(device)
 
         lora_config = LoraConfig(
             r=64,
@@ -42,7 +42,6 @@ class LLaDABackbone(nn.Module):
             task_type=None,
             modules_to_save = ["embed_tokens"]
         )
-        print (self.base_model)
 
         self.base_model = get_peft_model(self.base_model, lora_config)
         self.base_model.print_trainable_parameters()
@@ -114,7 +113,7 @@ class EditFlowFineTune(EditFlow):
         super().__init__(config, tokenizer)
 
         self.mask_token_id = 126336
-        self.backbone = LLaDABackbone(self.config, vocab_size=self.V)
+        self.backbone = LLaDABackbone(self.config, vocab_size=self.V, device=self.device)
         self.gap_token = 126084
 
         self.tokenizer.padding_side = 'right'
@@ -138,11 +137,13 @@ class EditFlowFineTune(EditFlow):
         if not self.time_dependent:
             t = torch.ones_like(t).to(self.device)
 
+        # print (x_t.device, self.device, t.device, x_pad_mask.device, self.backbone.base_model.device)
+
         u_t_logits, sub_vocab_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
         sched_coeff_z = self.get_sched_coeff(t, z_0, z_1, z_t)
 
-        ignore_mask = (x_pad_mask | context_mask)  # True for Pad
+        ignore_mask = x_pad_mask #(x_pad_mask | context_mask)  # True for Pad
 
         raw_sub = u_t_logits[:, :, 0]
         raw_ins = u_t_logits[:, :, 1]
@@ -284,10 +285,8 @@ class EditFlowFineTune(EditFlow):
                 seq_range = torch.arange(current_len, device=device).unsqueeze(0)
                 is_valid_range = seq_range < valid_seq_lens.unsqueeze(1)
 
-                # subtract 1 to keep single token for gen
-                is_context = seq_range < context_lens.unsqueeze(1) - 1
+                model_pad_mask = ~is_valid_range
 
-                is_gen = is_valid_range & ~is_context
 
                 # Forward (Shapes now match: x_t [B, L], mask [B, L])
                 if not self.time_dependent:
@@ -295,8 +294,11 @@ class EditFlowFineTune(EditFlow):
                 else:
                     u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
+                if model_pad_mask.any():
+                    sub_logits[model_pad_mask] = 0.0
+
                 sub_probs = F.softmax(sub_logits, dim=-1)
-                sub_probs = sub_probs.masked_fill(~is_gen, 0)
+                sub_probs = sub_probs.masked_fill(model_pad_mask.unsqueeze(-1), 0)
 
                 lambda_sub = u_t[:, :, 0]
                 lambda_ins = u_t[:, :, 1]
@@ -311,7 +313,7 @@ class EditFlowFineTune(EditFlow):
                     lambda_sub = F.softplus(torch.clamp(lambda_sub, max=1e6))
                     lambda_del = F.softplus(torch.clamp(lambda_del, max=1e6))
 
-                if not self.time_dependent:  # scale raw count/bernoulli predictions by sampler rate
+                if not self.time_dependent and not one_shot:  # scale raw count/bernoulli predictions by sampler rate
                     default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))
                     ins_coeff = (self.mask_scheduler.derivative(t) / (1 - self.mask_scheduler(t) + eps))
 
@@ -326,6 +328,11 @@ class EditFlowFineTune(EditFlow):
                     lambda_sub = lambda_sub * sub_coeff
                     lambda_ins = lambda_ins * ins_coeff
                     lambda_del = lambda_del * default_coeff
+
+                is_context = seq_range < context_lens.unsqueeze(1) - 1
+
+                is_gen = is_valid_range & ~is_context
+                # is_boundary = (seq_range == valid_seq_lens.unsqueeze(1)) # Removed
 
                 lambda_sub = torch.where(is_gen, lambda_sub, 0.0)
                 lambda_del = torch.where(is_gen, lambda_del, 0.0)
@@ -365,10 +372,12 @@ class EditFlowFineTune(EditFlow):
                 # Only sample tokens for non-pad positions, fill pad positions with PAD_TOKEN
                 sub_tokens = torch.full(sub_probs.shape[:2], self.pad_token, dtype=torch.long, device=self.device)
 
-                if is_gen.any():
-                    sub_sampled = torch.multinomial(sub_probs[is_gen], num_samples=1, replacement=True).squeeze(
+                non_pad_mask = ~model_pad_mask
+
+                if non_pad_mask.any():
+                    sub_sampled = torch.multinomial(sub_probs[non_pad_mask], num_samples=1, replacement=True).squeeze(
                         -1)
-                    sub_tokens[is_gen] = sub_sampled
+                    sub_tokens[non_pad_mask] = sub_sampled
 
                 # Apply operations based on masks
                 x_t[sub_mask] = sub_tokens[sub_mask]
@@ -413,13 +422,13 @@ class EditFlowFineTune(EditFlow):
         samples = []
         text_x_1_batch = []
         for i in range(len(self.sample_batches)):
-            samples = self._sample_conditional(self.sample_batches[i], n_steps=n_steps)
+            samples_ = self._sample_conditional(self.sample_batches[i], n_steps=n_steps)
 
             # Calculate non-padded lengths
-            batch_lens = (samples != self.tokenizer.pad_token_id).sum(dim=1).float()
+            batch_lens = (samples_ != self.tokenizer.pad_token_id).sum(dim=1).float()
             all_gen_lens.append(batch_lens)
 
-            samples.extend([s[s != self.tokenizer.pad_token_id] for s in samples])
+            samples.extend([s[s != self.tokenizer.pad_token_id] for s in samples_])
 
             # Decode the samples to be re-tokenized by eval model
 
