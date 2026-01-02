@@ -1,8 +1,8 @@
 defaults:
   - _self_
-    #- /callbacks: [ checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor ]
-  - /callbacks: [ checkpoint_every_n_steps, learning_rate_monitor ]
-  - /callbacks: [ learning_rate_monitor ]
+#    - /callbacks: [ checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor ]
+  - /callbacks: [ checkpoint_monitor, learning_rate_monitor ]
+#  - /callbacks: [ learning_rate_monitor ]
   - /data: autoformalization
   - /model: small
   - /strategy: ddp
@@ -18,7 +18,7 @@ rate_scaling: False
 seed: 1
 
 loader:
-  global_batch_size: 8
+  global_batch_size: 16
   eval_global_batch_size: ${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**
   batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
@@ -29,7 +29,7 @@ loader:
 sampling:
   steps: 128
   num_sample_batches: 2  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
-  num_sample_log: 8
+  num_sample_log: 16
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
@@ -65,7 +65,7 @@ wandb:
   project: text-diffusion
   #  notes: Mulan for text
   group: null
-  id: wcvdox74
+#  id: wcvdox74
   job_type: null
     #offline: true
   name: pef_finetune_af

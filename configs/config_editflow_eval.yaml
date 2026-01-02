@@ -67,7 +67,7 @@ wandb:
   #  notes: Mulan for text
   group: null
   job_type: null
-#  offline: true
+  offline: true
   name: pef_eval_time_indep_one_shot
   tags:
     - ${data.train}

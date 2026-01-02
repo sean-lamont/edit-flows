@@ -1,3 +1,5 @@
+import datetime
+import html
 import math
 import os
 import typing
@@ -402,7 +404,8 @@ class EditFlowBase(L.LightningModule):
             all_gen_lens.append(batch_lens)
 
             sample = [s[s != self.tokenizer.pad_token_id] for s in samples_]
-            samples.extend([s[s != self.tokenizer.bos_token_id] for s in sample])  # = input_ids[input_ids != tokenizer.pad_token_id]
+            samples.extend([s[s != self.tokenizer.bos_token_id] for s in
+                            sample])  # = input_ids[input_ids != tokenizer.pad_token_id]
 
         # Decode the samples to be re-tokenized by eval model
         text_samples = self.tokenizer.batch_decode(samples)
@@ -447,8 +450,8 @@ class EditFlowBase(L.LightningModule):
              or not self.trainer.sanity_checking)
                 and self.config.eval.generate_samples):
 
-            #steps = [1, 2, 4, 8, 16, 32, 64, 128, 1024]
-            steps = [ 2, 4, 8, 16, 32, 64, 128]
+            # steps = [1, 2, 4, 8, 16, 32, 64, 128, 1024]
+            steps = [2, 4, 8, 16, 32, 64, 128]
             for step in steps:
                 self.sample_and_log(step)
 
@@ -532,7 +535,6 @@ class EditFlow(EditFlowBase):
 
         z_t = self.sample_zt(z_0, z_1, t)
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = self.rm_gap_tokens(z_t)
-
 
         sched_coeff_z = self.get_sched_coeff(t, z_0, z_1, z_t)
 
@@ -692,7 +694,8 @@ class EditFlow(EditFlowBase):
         return z_t
 
     @torch.no_grad()
-    def _sample(self, n_steps=None, eps=1e-5, one_shot=True):
+    def _sample(self, n_steps=None, eps=1e-5, one_shot=False, vis=True,
+                viz_path='/home/sean/Documents/edit-flows/sample_vis/samples'):
         """Generate samples from the model."""
         batch_size_per_gpu = self.config.loader.eval_batch_size
 
@@ -715,21 +718,23 @@ class EditFlow(EditFlowBase):
 
         x_pad_mask = (x_t == self.pad_token)  # Create padding mask for x_t
         # x_ts = [x_t.clone()]
-
+        history = []
         with tqdm(desc="Euler Sampling") as pbar:
             # while t.max() <= 1 - default_h:
             # while t.max() <= 1:
             for step_i in range(n_steps + 1):
-                if not self.time_dependent:
-                    u_t, sub_logits = self.backbone.forward(x_t, torch.ones_like(t).to(self.device), x_pad_mask)
-                else:
-                    u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
+                # if not self.time_dependent:
+                #     u_t, sub_logits = self.backbone.forward(x_t, torch.ones_like(t).to(self.device), x_pad_mask)
+                # else:
+                u_t, sub_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
-                sub_probs = F.softmax(sub_logits, dim=-1)
+                sub_probs = F.softmax(sub_logits.float(), dim=-1)
 
-                lambda_sub = u_t[:, :, 0]
-                lambda_ins = u_t[:, :, 1]
-                lambda_del = u_t[:, :, 2]
+                lambda_sub = u_t[:, :, 0].float()
+                lambda_ins = u_t[:, :, 1].float()
+                lambda_del = u_t[:, :, 2].float()
+
+                # --- CAPTURE VIZ DATA ---
 
                 if not self.time_dependent:  # move logits to probabilities
                     lambda_sub = torch.sigmoid(lambda_sub)
@@ -762,10 +767,26 @@ class EditFlow(EditFlowBase):
                     lambda_ins = lambda_ins * ins_coeff
                     lambda_del = lambda_del * default_coeff
 
-                if one_shot: # samples full completion each step (only makes sense for time independent)
+                if one_shot:  # samples full completion each step (only makes sense for time independent)
                     adapt_h = 1
                 else:
                     adapt_h = default_h
+
+                if vis:
+                    step_data = {
+                        "step": step_i,
+                        "t": t[0].item(),
+                        "tokens": self.tokenizer.convert_ids_to_tokens(
+                            [a for a in x_t[0].cpu().numpy() if a != self.tokenizer.pad_token_id]),
+                        "rates": {
+                            "ins": lambda_ins[0].float().cpu().numpy(),
+                            "del": lambda_del[0].float().cpu().numpy(),
+                            "sub": lambda_sub[0].float().cpu().numpy()
+                        },
+                        "adapt_h": adapt_h,
+                        'is_gen': valid_token_mask[0].cpu().numpy()
+                    }
+                    history.append(step_data)
 
                 ins_vals = torch.poisson(adapt_h * lambda_ins).long()
 
@@ -817,7 +838,99 @@ class EditFlow(EditFlowBase):
                 # x_ts.append(x_t.clone())
                 pbar.update(1)
 
+        if vis and len(history) > 0:
+            self._export_to_html(history, viz_path + f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.html"
+                                 )  # add datetime
+            print(f"Visualization saved to {viz_path}")
         return x_t
+
+    def _export_to_html(self, history, output_path):
+        html_content = [
+            """
+            <html>
+            <head>
+                <style>
+                    body { font-family: monospace; background: #f5f5f5; padding: 20px; }
+                    .step-container { background: white; margin-bottom: 20px; padding: 15px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+                    .step-header { font-weight: bold; margin-bottom: 10px; color: #333; }
+                    .sequence { display: flex; flex-wrap: wrap; gap: 4px; }
+                    .token-box { 
+                        display: inline-flex; flex-direction: column; align-items: center; 
+                        border: 1px solid #ddd; padding: 2px; border-radius: 4px; 
+                        position: relative; min-width: 20px; text-align: center;
+                    }
+                    .token-text { font-size: 14px; padding: 2px 4px; z-index: 2; }
+
+                    /* Visual Indicators */
+                    .indicator-bar { height: 4px; width: 100%; margin-top: 2px; display: flex; }
+                    .rate-ins { background-color: #4CAF50; height: 100%; } /* Green for Insert */
+
+                    .overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; opacity: 0.3; pointer-events: none; z-index: 1; }
+
+                    /* Tooltip */
+                    .token-box:hover .tooltip { visibility: visible; }
+                    .tooltip {
+                        visibility: hidden; width: 200px; background-color: #333; color: #fff; text-align: left;
+                        border-radius: 6px; padding: 5px; position: absolute; z-index: 10;
+                        bottom: 100%; left: 50%; margin-left: -100px; font-size: 11px;
+                        white-space: pre-wrap;
+                    }
+                </style>
+            </head>
+            <body>
+            <h1>Targeted Edit Flow Generation Process</h1>
+            """
+        ]
+
+        for step in history:
+            html_content.append(f'<div class="step-container">')
+            html_content.append(f'<div class="step-header">Step {step["step"]} (t={step["t"]:.3f})</div>')
+            html_content.append('<div class="sequence">')
+
+            tokens = step["tokens"]
+            is_gen = step["is_gen"]
+
+            r_ins = step["rates"]["ins"]
+            r_del = step["rates"]["del"]
+            r_sub = step["rates"]["sub"]
+
+            for i, token_str in enumerate(tokens):
+                safe_token = html.escape(token_str).replace('Ġ', ' ').replace('Ċ', '⏎')
+
+                if is_gen[i]:
+                    val_ins = r_ins[i]
+                    val_del = r_del[i]
+                    val_sub = r_sub[i]
+
+                    bg_color = f"rgba(255, 0, 0, {min(val_del * 2, 0.5)})"
+                    border_style = f"2px solid rgba(0, 0, 255, {min(val_sub * 2, 1.0)})"
+                    ins_width = f"{min(val_ins * 50, 100)}%"
+
+                    tooltip = (f"Token: {safe_token}\n"
+                               f"Ins Rate: {val_ins:.4f}\n"
+                               f"Del Rate: {val_del:.4f}\n"
+                               f"Sub Rate: {val_sub:.4f}")
+                else:
+                    bg_color = "#eee"
+                    border_style = "1px solid #ccc"
+                    ins_width = "0%"
+                    tooltip = "Context (Fixed)"
+
+                block = f"""
+                <div class="token-box" style="background: {bg_color}; border-bottom: {border_style}">
+                    <span class="token-text">{safe_token}</span>
+                    <div class="indicator-bar"><div class="rate-ins" style="width: {ins_width}"></div></div>
+                    <span class="tooltip">{tooltip}</span>
+                </div>
+                """
+                html_content.append(block)
+
+            html_content.append('</div></div>')
+
+        html_content.append("</body></html>")
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(html_content))
 
     def apply_ins_del_ops(self,
                           x_t: torch.Tensor,
