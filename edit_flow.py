@@ -697,7 +697,7 @@ class EditFlow(EditFlowBase):
         return z_t
 
     @torch.no_grad()
-    def _sample(self, n_steps=None, eps=1e-5, one_shot=False, vis=True,
+    def _sample(self, n_steps=None, eps=1e-5, one_shot=False, vis=False,
                 viz_path='/home/sean/Documents/edit-flows/sample_vis/samples'):
         """Generate samples from the model."""
         batch_size_per_gpu = self.config.loader.eval_batch_size

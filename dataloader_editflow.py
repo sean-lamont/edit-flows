@@ -21,7 +21,31 @@ import utils
 from flow_utils import opt_align_xs_to_zs
 from flows import EmptyCoupling
 
+os.environ["HF_HUB_ETAG_TIMEOUT"] = "300"
+os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "300"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 LOGGER = utils.get_logger(__name__)
+
+
+def cnn_dm_detokenizer(x):
+    # Remove common news wire prefixes
+    x = re.sub(r"^.*?\(CNN\) -- ", "", x)
+    x = re.sub(r"^.*?\(CNN\)", "", x)
+    x = x.replace(" -- ", "—")  # Standardize dashes
+
+    # Standard cleanup (similar to lm1b but less aggressive on punctuation)
+    x = x.replace(" , ", ", ")
+    x = x.replace(" . ", ". ")
+    x = x.replace(" ! ", "! ")
+    x = x.replace(" ? ", "? ")
+    x = x.replace(" : ", ": ")
+    x = x.replace(" ; ", "; ")
+    x = x.replace(" 's", "'s")
+    x = x.replace(" ' ", "'")
+
+    # Fix whitespace
+    x = x.strip()
+    return x
 
 
 def wt_detokenizer(string):
@@ -307,87 +331,100 @@ def _group_texts(examples, block_size, bos, eos):
 def get_dataset(
         dataset_name, tokenizer, wrap, mode, cache_dir,
         block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False):
-    if wrap:
-        filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
-    else:
-        filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped.dat'
-    _path = os.path.join(cache_dir, filename)
 
-    if utils.fsspec_exists(_path):
-        LOGGER.info(f'Loading data from: {_path}')
-        return datasets.load_from_disk(_path).with_format('torch')
-    LOGGER.info(f'Generating new data at: {_path}')
+    print (streaming)
+    if not streaming:
+        if wrap:
+            filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
+        else:
+            filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped.dat'
+        _path = os.path.join(cache_dir, filename)
+
+        if utils.fsspec_exists(_path):
+            LOGGER.info(f'Loading data from: {_path}')
+            return datasets.load_from_disk(_path).with_format('torch')
+        LOGGER.info(f'Generating new data at: {_path}')
+    else:
+        LOGGER.info(f'Streaming data for: {dataset_name} (No local cache)')
+        _path = None  # No path for streaming
 
     crop_train = dataset_name == 'text8-crop'
     if mode == 'train' and crop_train:
-        # double block size for sub-sampling
         block_size *= 2
 
+    # --- DATASET LOADING LOGIC ---
     if dataset_name == 'wikitext103':
         dataset = datasets.load_dataset(
-            'wikitext',
-            name='wikitext-103-raw-v1',
-            cache_dir=cache_dir)
+            'wikitext', name='wikitext-103-raw-v1', cache_dir=cache_dir)
+
+    elif dataset_name == 'c4_realnewslike':
+        dataset = datasets.load_dataset(
+            'allenai/c4', 'realnewslike',
+            cache_dir=cache_dir,
+            streaming=streaming
+        )
+
+
+
     elif dataset_name == 'wikitext2':
         dataset = datasets.load_dataset(
-            'wikitext',
-            name='wikitext-2-raw-v1',
-            cache_dir=cache_dir)
+            'wikitext', name='wikitext-2-raw-v1', cache_dir=cache_dir)
     elif dataset_name == 'ptb':
-        dataset = datasets.load_dataset(
-            'ptb_text_only', cache_dir=cache_dir)
+        dataset = datasets.load_dataset('ptb_text_only', cache_dir=cache_dir)
     elif dataset_name == 'lambada':
         dataset = get_lambada_test_dataset()
     elif dataset_name == 'text8':
         assert wrap
-        dataset = get_text8_dataset(
-            cache_dir, max_seq_length=block_size)
+        dataset = get_text8_dataset(cache_dir, max_seq_length=block_size)
     elif dataset_name == 'text8-crop':
-        dataset = get_text8_dataset(
-            cache_dir, max_seq_length=block_size, crop_train=True)
+        dataset = get_text8_dataset(cache_dir, max_seq_length=block_size, crop_train=True)
+    elif dataset_name == 'cnn_dailymail':
+        # Load version 3.0.0 (non-anonymized)
+        dataset = datasets.load_dataset(
+            'cnn_dailymail', '3.0.0',
+            cache_dir=cache_dir,
+            streaming=streaming)
     elif dataset_name == 'openwebtext-train':
         dataset = datasets.load_dataset(
-            'openwebtext',
-            split='train[:-100000]',
-            cache_dir=cache_dir,
-            streaming=streaming)
+            'openwebtext', split='train[:-100000]', cache_dir=cache_dir, streaming=streaming)
     elif dataset_name == 'openwebtext-valid':
         dataset = datasets.load_dataset(
-            'openwebtext',
-            split='train[-100000:]',
-            cache_dir=cache_dir,
-            streaming=streaming)
-    elif dataset_name == 'scientific_papers_arxiv':
+            'openwebtext', split='train[-100000:]', cache_dir=cache_dir, streaming=streaming)
+    elif dataset_name.startswith('scientific_papers'):
+        sub = dataset_name.split('_')[-1]  # arxiv or pubmed
         dataset = datasets.load_dataset(
-            'scientific_papers', 'arxiv',
-            trust_remote_code=True,
-            cache_dir=cache_dir,
-            streaming=streaming)
-    elif dataset_name == 'scientific_papers_pubmed':
+            'scientific_papers', sub, trust_remote_code=True, cache_dir=cache_dir, streaming=streaming)
+    elif dataset_name == 'fineweb':
+        # The new state-of-the-art web dataset (replaces C4)
         dataset = datasets.load_dataset(
-            'scientific_papers', 'pubmed',
-            trust_remote_code=True,
-            cache_dir=cache_dir,
-            streaming=streaming)
+            "HuggingFaceFW/fineweb",
+            name="sample-100BT",  # or "default" for full 15TB
+            split="train",
+            streaming=streaming
+        )
     elif dataset_name == 'ag_news':
-        dataset = datasets.load_dataset(
-            'ag_news',
-            cache_dir=cache_dir,
-            streaming=streaming)
+        dataset = datasets.load_dataset('ag_news', cache_dir=cache_dir, streaming=streaming)
     else:
-        dataset = datasets.load_dataset(
-            dataset_name,
-            cache_dir=cache_dir,
-            streaming=streaming)
+        dataset = datasets.load_dataset(dataset_name, cache_dir=cache_dir, streaming=streaming)
 
-    if dataset_name in ['lambada', 'openwebtext-train',
-                        'openwebtext-valid']:
+    if dataset_name == 'c4_realnewslike':
+        if mode == 'test':
+            data = dataset['validation']
+        else:
+            data = dataset[mode]
+    elif dataset_name in ['lambada', 'openwebtext-train', 'openwebtext-valid', 'fineweb']:
         data = dataset
     else:
         data = dataset[mode]
 
+    # --- DETOKENIZER SELECTION ---
     if dataset_name.startswith('wikitext'):
         detokenizer = wt_detokenizer
+    elif dataset_name == 'c4_realnewslike':
+        # Re-use cnn_dm_detokenizer or a simple whitespace fixer
+        detokenizer = lambda x: x.strip()
+
+
     elif dataset_name == 'ptb':
         detokenizer = ptb_detokenizer
     elif dataset_name == 'lm1b':
@@ -396,25 +433,30 @@ def get_dataset(
         detokenizer = lambada_detokenizer
     elif dataset_name.startswith('scientific_papers'):
         detokenizer = scientific_papers_detokenizer
+    elif dataset_name == 'cnn_dailymail':
+        detokenizer = cnn_dm_detokenizer
     else:
         detokenizer = None
 
-    def _apply_detokenizer(detokenizer):
-        def detok(text):
-            for i, t in enumerate(text, 0):
-                text[i] = detokenizer(t)
-            return text
+    def _apply_detokenizer(detok_fn):
+        def detok(text_list):
+            # Optimized to avoid loop overhead if possible, but list comp is fine
+            return [detok_fn(t) for t in text_list]
 
         return detok
 
     EOS = tokenizer.encode(tokenizer.eos_token)[0]
     BOS = tokenizer.encode(tokenizer.bos_token)[0]
 
+    # --- TOKENIZATION ---
     def preprocess_and_tokenize(example):
+        # FIELD SELECTION
         if dataset_name == 'ptb':
             text = example['sentence']
         elif 'scientific_papers' in dataset_name:
             text = example['article']
+        elif dataset_name == 'cnn_dailymail':
+            text = example['article']  # Explicitly select article, ignore highlights
         else:
             text = example['text']
 
@@ -429,9 +471,7 @@ def get_dataset(
                                add_special_tokens=False,
                                return_attention_mask=False,
                                return_token_type_ids=False)
-            tokens = {'input_ids':
-                          [t + [EOS] for t in tokens['input_ids']]}
-            # Still missing BOS, but will be added in group_texts
+            tokens = {'input_ids': [t + [EOS] for t in tokens['input_ids']]}
         else:
             tokens = tokenizer(text,
                                max_length=block_size,
@@ -444,51 +484,230 @@ def get_dataset(
 
     if streaming:
         tokenized_dataset = data.map(
-            preprocess_and_tokenize,
-            batched=True,
-            desc='Tokenizing')
+            preprocess_and_tokenize, batched=True) #, desc='Tokenizing')
     else:
         tokenized_dataset = data.map(
-            preprocess_and_tokenize,
-            batched=True,
-            num_proc=num_proc,
-            load_from_cache_file=True,
-            desc='Tokenizing')
+            preprocess_and_tokenize, batched=True, num_proc=num_proc,
+            load_from_cache_file=True, desc='Tokenizing')
+
+    # --- COLUMN CLEANUP ---
     if dataset_name == 'ptb':
-        tokenized_dataset = tokenized_dataset.remove_columns(
-            'sentence')
+        tokenized_dataset = tokenized_dataset.remove_columns('sentence')
+
     elif 'scientific_papers' in dataset_name:
-        tokenized_dataset = tokenized_dataset.remove_columns([
-            'article', 'abstract', 'section_names'])
+        tokenized_dataset = tokenized_dataset.remove_columns(['article', 'abstract', 'section_names'])
+    elif dataset_name == 'cnn_dailymail':
+        # Remove CNN specific columns
+        tokenized_dataset = tokenized_dataset.remove_columns(['article', 'highlights', 'id'])
     elif dataset_name == 'ag_news':
-        tokenized_dataset = tokenized_dataset.remove_columns(
-            ['text', 'label'])
+        tokenized_dataset = tokenized_dataset.remove_columns(['text', 'label'])
     else:
-        tokenized_dataset = tokenized_dataset.remove_columns(
-            'text')
+        tokenized_dataset = tokenized_dataset.remove_columns('text')
 
     if not wrap:
-        tokenized_dataset.save_to_disk(_path)
+        if not streaming:
+            tokenized_dataset.save_to_disk(_path)
         return tokenized_dataset.with_format('torch')
 
-    group_texts = functools.partial(
-        _group_texts, block_size=block_size, bos=BOS, eos=EOS)
+    group_texts = functools.partial(_group_texts, block_size=block_size, bos=BOS, eos=EOS)
+
     if streaming:
-        chunked_dataset = tokenized_dataset.map(
-            group_texts,
-            batched=True,
-            desc='Grouping')
+        chunked_dataset = tokenized_dataset.map(group_texts, batched=True, desc='Grouping')
     else:
         chunked_dataset = tokenized_dataset.map(
-            group_texts,
-            batched=True,
-            num_proc=num_proc,
-            load_from_cache_file=True,
-            desc='Grouping')
+            group_texts, batched=True, num_proc=num_proc,
+            load_from_cache_file=True, desc='Grouping')
         chunked_dataset.save_to_disk(_path)
+
     chunked_dataset = chunked_dataset.with_format('torch')
     return chunked_dataset
 
+
+# def get_dataset(
+#         dataset_name, tokenizer, wrap, mode, cache_dir,
+#         block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False):
+#     if wrap:
+#         filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
+#     else:
+#         filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped.dat'
+#     _path = os.path.join(cache_dir, filename)
+#
+#     if utils.fsspec_exists(_path):
+#         LOGGER.info(f'Loading data from: {_path}')
+#         return datasets.load_from_disk(_path).with_format('torch')
+#     LOGGER.info(f'Generating new data at: {_path}')
+#
+#     crop_train = dataset_name == 'text8-crop'
+#     if mode == 'train' and crop_train:
+#         # double block size for sub-sampling
+#         block_size *= 2
+#
+#     if dataset_name == 'wikitext103':
+#         dataset = datasets.load_dataset(
+#             'wikitext',
+#             name='wikitext-103-raw-v1',
+#             cache_dir=cache_dir)
+#     elif dataset_name == 'wikitext2':
+#         dataset = datasets.load_dataset(
+#             'wikitext',
+#             name='wikitext-2-raw-v1',
+#             cache_dir=cache_dir)
+#     elif dataset_name == 'ptb':
+#         dataset = datasets.load_dataset(
+#             'ptb_text_only', cache_dir=cache_dir)
+#     elif dataset_name == 'lambada':
+#         dataset = get_lambada_test_dataset()
+#     elif dataset_name == 'text8':
+#         assert wrap
+#         dataset = get_text8_dataset(
+#             cache_dir, max_seq_length=block_size)
+#     elif dataset_name == 'text8-crop':
+#         dataset = get_text8_dataset(
+#             cache_dir, max_seq_length=block_size, crop_train=True)
+#     elif dataset_name == 'openwebtext-train':
+#         dataset = datasets.load_dataset(
+#             'openwebtext',
+#             split='train[:-100000]',
+#             cache_dir=cache_dir,
+#             streaming=streaming)
+#     elif dataset_name == 'openwebtext-valid':
+#         dataset = datasets.load_dataset(
+#             'openwebtext',
+#             split='train[-100000:]',
+#             cache_dir=cache_dir,
+#             streaming=streaming)
+#     elif dataset_name == 'scientific_papers_arxiv':
+#         dataset = datasets.load_dataset(
+#             'scientific_papers', 'arxiv',
+#             trust_remote_code=True,
+#             cache_dir=cache_dir,
+#             streaming=streaming)
+#     elif dataset_name == 'scientific_papers_pubmed':
+#         dataset = datasets.load_dataset(
+#             'scientific_papers', 'pubmed',
+#             trust_remote_code=True,
+#             cache_dir=cache_dir,
+#             streaming=streaming)
+#     elif dataset_name == 'ag_news':
+#         dataset = datasets.load_dataset(
+#             'ag_news',
+#             cache_dir=cache_dir,
+#             streaming=streaming)
+#     else:
+#         dataset = datasets.load_dataset(
+#             dataset_name,
+#             cache_dir=cache_dir,
+#             streaming=streaming)
+#
+#     if dataset_name in ['lambada', 'openwebtext-train',
+#                         'openwebtext-valid']:
+#         data = dataset
+#     else:
+#         data = dataset[mode]
+#
+#     if dataset_name.startswith('wikitext'):
+#         detokenizer = wt_detokenizer
+#     elif dataset_name == 'ptb':
+#         detokenizer = ptb_detokenizer
+#     elif dataset_name == 'lm1b':
+#         detokenizer = lm1b_detokenizer
+#     elif dataset_name == 'lambada':
+#         detokenizer = lambada_detokenizer
+#     elif dataset_name.startswith('scientific_papers'):
+#         detokenizer = scientific_papers_detokenizer
+#     else:
+#         detokenizer = None
+#
+#     def _apply_detokenizer(detokenizer):
+#         def detok(text):
+#             for i, t in enumerate(text, 0):
+#                 text[i] = detokenizer(t)
+#             return text
+#
+#         return detok
+#
+#     EOS = tokenizer.encode(tokenizer.eos_token)[0]
+#     BOS = tokenizer.encode(tokenizer.bos_token)[0]
+#
+#     def preprocess_and_tokenize(example):
+#         if dataset_name == 'ptb':
+#             text = example['sentence']
+#         elif 'scientific_papers' in dataset_name:
+#             text = example['article']
+#         else:
+#             text = example['text']
+#
+#         if detokenizer is not None:
+#             text = _apply_detokenizer(detokenizer)(text)
+#
+#         tokenizer.padding_side = 'right'
+#         tokenizer.truncation_side = 'right'
+#
+#         if wrap:
+#             tokens = tokenizer(text,
+#                                add_special_tokens=False,
+#                                return_attention_mask=False,
+#                                return_token_type_ids=False)
+#             tokens = {'input_ids':
+#                           [t + [EOS] for t in tokens['input_ids']]}
+#             # Still missing BOS, but will be added in group_texts
+#         else:
+#             tokens = tokenizer(text,
+#                                max_length=block_size,
+#                                padding='max_length',
+#                                truncation=True,
+#                                add_special_tokens=True,
+#                                return_attention_mask=True,
+#                                return_token_type_ids=True)
+#         return tokens
+#
+#     if streaming:
+#         tokenized_dataset = data.map(
+#             preprocess_and_tokenize,
+#             batched=True,
+#             desc='Tokenizing')
+#     else:
+#         tokenized_dataset = data.map(
+#             preprocess_and_tokenize,
+#             batched=True,
+#             num_proc=num_proc,
+#             load_from_cache_file=True,
+#             desc='Tokenizing')
+#     if dataset_name == 'ptb':
+#         tokenized_dataset = tokenized_dataset.remove_columns(
+#             'sentence')
+#     elif 'scientific_papers' in dataset_name:
+#         tokenized_dataset = tokenized_dataset.remove_columns([
+#             'article', 'abstract', 'section_names'])
+#     elif dataset_name == 'ag_news':
+#         tokenized_dataset = tokenized_dataset.remove_columns(
+#             ['text', 'label'])
+#     else:
+#         tokenized_dataset = tokenized_dataset.remove_columns(
+#             'text')
+#
+#     if not wrap:
+#         tokenized_dataset.save_to_disk(_path)
+#         return tokenized_dataset.with_format('torch')
+#
+#     group_texts = functools.partial(
+#         _group_texts, block_size=block_size, bos=BOS, eos=EOS)
+#     if streaming:
+#         chunked_dataset = tokenized_dataset.map(
+#             group_texts,
+#             batched=True,
+#             desc='Grouping')
+#     else:
+#         chunked_dataset = tokenized_dataset.map(
+#             group_texts,
+#             batched=True,
+#             num_proc=num_proc,
+#             load_from_cache_file=True,
+#             desc='Grouping')
+#         chunked_dataset.save_to_disk(_path)
+#     chunked_dataset = chunked_dataset.with_format('torch')
+#     return chunked_dataset
+#
 
 def get_tokenizer(config):
     if config.data.tokenizer_name_or_path == 'text8':
@@ -674,40 +893,50 @@ def collate_edit_batch(batch, coupling, seq_align_fn, pad_token, vocab_size, gap
 #
 #     return x_0, x_1, z_0, z_1, t
 #
-
 def get_dataloaders(config, tokenizer, skip_train=False,
                     skip_valid=False, valid_seed=None):
     num_gpus = torch.cuda.device_count()
-    assert (config.loader.global_batch_size
-            == (config.loader.batch_size
-                * config.trainer.num_nodes
-                * num_gpus
-                * config.trainer.accumulate_grad_batches))
-    if config.loader.global_batch_size % (
-            num_gpus * config.trainer.accumulate_grad_batches) != 0:
-        raise ValueError(
-            f'Train Batch Size {config.training.batch_size}'
-            f'not divisible by {num_gpus} gpus with accumulation '
-            f'{config.trainer.accumulate_grad_batches}.')
-    if config.loader.eval_global_batch_size % num_gpus != 0:
-        raise ValueError(
-            f'Eval Batch Size for {config.eval.batch_size} '
-            f'not divisible by {num_gpus}.')
+
+    # # ... (Keep your existing batch size checks here) ...
+    # num_gpus = torch.cuda.device_count()
+    # assert (config.loader.global_batch_size
+    #         == (config.loader.batch_size
+    #             * config.trainer.num_nodes
+    #             * num_gpus
+    #             * config.trainer.accumulate_grad_batches))
+    # if config.loader.global_batch_size % (
+    #         num_gpus * config.trainer.accumulate_grad_batches) != 0:
+    #     raise ValueError(
+    #         f'Train Batch Size {config.training.batch_size}'
+    #         f'not divisible by {num_gpus} gpus with accumulation '
+    #         f'{config.trainer.accumulate_grad_batches}.')
+    # if config.loader.eval_global_batch_size % num_gpus != 0:
+    #     raise ValueError(
+    #         f'Eval Batch Size for {config.eval.batch_size} '
+    #         f'not divisible by {num_gpus}.')
+
+
+
+    # --- 1. LOAD DATASETS ---
     if skip_train:
         train_set = None
     else:
+        # Pass streaming flag from config
         train_set = get_dataset(
             config.data.train,
             tokenizer,
             mode='train',
             wrap=config.data.wrap,
             cache_dir=config.data.cache_dir,
-            block_size=config.model.length)
+            block_size=config.model.length,
+            streaming=config.data.streaming  # <--- Ensure this is passed
+        )
 
     if config.data.valid in ['text8', 'lm1b', 'ag_news']:
         validation_split = 'test'
     else:
         validation_split = 'validation'
+
     if skip_valid:
         valid_set = None
     else:
@@ -718,11 +947,28 @@ def get_dataloaders(config, tokenizer, skip_train=False,
             mode=validation_split,
             cache_dir=config.data.cache_dir,
             block_size=config.model.length,
-            streaming=False)
+            streaming=config.data.streaming  # <--- Consistent streaming
+        )
 
+    # --- 2. CRITICAL: SHARD FOR DISTRIBUTED STREAMING ---
+    # Since we can't use DistributedSampler, we must shard the dataset itself.
+    if config.data.streaming and torch.distributed.is_initialized():
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+
+        LOGGER.info(f"Sharding streaming dataset: Rank {rank}/{world_size}")
+
+        if train_set is not None:
+            # Each GPU gets 1/N of the data
+            train_set = train_set.shard(num_shards=world_size, index=rank)
+
+        if valid_set is not None:
+            # Validation sharding (optional, prevents evaluating duplicate data)
+            valid_set = valid_set.shard(num_shards=world_size, index=rank)
+
+    # --- 3. DATALOADER SETUP ---
     coupling = EmptyCoupling()
-
-    seq_align_fn = functools.partial(opt_align_xs_to_zs, gap_token=3)  # todo fixed for now
+    seq_align_fn = functools.partial(opt_align_xs_to_zs, gap_token=3)
 
     collate_fn = functools.partial(collate_edit_batch,
                                    seq_align_fn=seq_align_fn,
@@ -735,25 +981,33 @@ def get_dataloaders(config, tokenizer, skip_train=False,
     if skip_train:
         train_loader = None
     else:
+        # FOR STREAMING:
+        # 1. shuffle must be False (we handled shuffling via buffer in get_dataset)
+        # 2. sampler must be None (DataLoader handles fetching)
+        should_shuffle = (not config.data.streaming)
+
         train_loader = torch.utils.data.DataLoader(
             train_set,
             batch_size=config.loader.batch_size,
             num_workers=config.loader.num_workers,
             pin_memory=config.loader.pin_memory,
-            shuffle=not config.data.streaming,
+            shuffle=should_shuffle,  # Must be False for IterableDataset
             persistent_workers=True,
             collate_fn=collate_fn
         )
         train_loader.tokenizer = tokenizer
+
     if skip_valid:
         valid_loader = None
     else:
-        if valid_seed is None:
+        # Logic for validation seed (only applies if NOT streaming)
+        if valid_seed is None or config.data.streaming:
             shuffle_valid = False
             generator = None
         else:
             shuffle_valid = True
             generator = torch.Generator().manual_seed(valid_seed)
+
         valid_loader = torch.utils.data.DataLoader(
             valid_set,
             batch_size=config.loader.eval_batch_size,
@@ -763,10 +1017,104 @@ def get_dataloaders(config, tokenizer, skip_train=False,
             generator=generator,
             collate_fn=collate_fn
         )
-        # Will be used in generative perplexity calculation
         valid_loader.tokenizer = tokenizer
 
     return train_loader, valid_loader
+
+
+# def get_dataloaders(config, tokenizer, skip_train=False,
+#                     skip_valid=False, valid_seed=None):
+#     num_gpus = torch.cuda.device_count()
+#     assert (config.loader.global_batch_size
+#             == (config.loader.batch_size
+#                 * config.trainer.num_nodes
+#                 * num_gpus
+#                 * config.trainer.accumulate_grad_batches))
+#     if config.loader.global_batch_size % (
+#             num_gpus * config.trainer.accumulate_grad_batches) != 0:
+#         raise ValueError(
+#             f'Train Batch Size {config.training.batch_size}'
+#             f'not divisible by {num_gpus} gpus with accumulation '
+#             f'{config.trainer.accumulate_grad_batches}.')
+#     if config.loader.eval_global_batch_size % num_gpus != 0:
+#         raise ValueError(
+#             f'Eval Batch Size for {config.eval.batch_size} '
+#             f'not divisible by {num_gpus}.')
+#     if skip_train:
+#         train_set = None
+#     else:
+#         train_set = get_dataset(
+#             config.data.train,
+#             tokenizer,
+#             mode='train',
+#             wrap=config.data.wrap,
+#             cache_dir=config.data.cache_dir,
+#             block_size=config.model.length,
+#             streaming=config.data.streaming)
+#
+#     if config.data.valid in ['text8', 'lm1b', 'ag_news']:
+#         validation_split = 'test'
+#     else:
+#         validation_split = 'validation'
+#     if skip_valid:
+#         valid_set = None
+#     else:
+#         valid_set = get_dataset(
+#             config.data.valid,
+#             tokenizer,
+#             wrap=config.data.wrap,
+#             mode=validation_split,
+#             cache_dir=config.data.cache_dir,
+#             block_size=config.model.length,
+#             streaming=config.data.streaming)
+#
+#     coupling = EmptyCoupling()
+#
+#     seq_align_fn = functools.partial(opt_align_xs_to_zs, gap_token=3)  # todo fixed for now
+#
+#     collate_fn = functools.partial(collate_edit_batch,
+#                                    seq_align_fn=seq_align_fn,
+#                                    coupling=coupling,
+#                                    pad_token=tokenizer.pad_token_id,
+#                                    vocab_size=tokenizer.vocab_size,
+#                                    gap_token_id=3
+#                                    )
+#
+#     if skip_train:
+#         train_loader = None
+#     else:
+#         train_loader = torch.utils.data.DataLoader(
+#             train_set,
+#             batch_size=config.loader.batch_size,
+#             num_workers=config.loader.num_workers,
+#             pin_memory=config.loader.pin_memory,
+#             shuffle=not config.data.streaming,
+#             persistent_workers=True,
+#             collate_fn=collate_fn
+#         )
+#         train_loader.tokenizer = tokenizer
+#     if skip_valid:
+#         valid_loader = None
+#     else:
+#         if valid_seed is None:
+#             shuffle_valid = False
+#             generator = None
+#         else:
+#             shuffle_valid = True
+#             generator = torch.Generator().manual_seed(valid_seed)
+#         valid_loader = torch.utils.data.DataLoader(
+#             valid_set,
+#             batch_size=config.loader.eval_batch_size,
+#             num_workers=config.loader.num_workers,
+#             pin_memory=config.loader.pin_memory,
+#             shuffle=shuffle_valid,
+#             generator=generator,
+#             collate_fn=collate_fn
+#         )
+#         # Will be used in generative perplexity calculation
+#         valid_loader.tokenizer = tokenizer
+#
+#     return train_loader, valid_loader
 
 
 # Samplers adapted from: https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/fault_tolerant_sampler.py

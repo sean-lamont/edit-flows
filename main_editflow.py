@@ -221,12 +221,13 @@ def _train(config, logger, tokenizer):
         default_root_dir=os.getcwd(),
         callbacks=callbacks,
         strategy=hydra.utils.instantiate(config.strategy),
-        logger=wandb_logger)
+        logger=wandb_logger,
+        accumulate_grad_batches=config.trainer.accumulate_grad_batches)
     trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
 
 
 @hydra.main(version_base=None, config_path='configs',
-            config_name='config_editflow_eval')
+            config_name='config_editflow_c4')
 def main(config):
     """Main entry point for training."""
     L.seed_everything(config.seed)
