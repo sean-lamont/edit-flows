@@ -360,10 +360,15 @@ class DITEditFlow(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             vocab_size,
             config.model.cond_dim)
 
-        self.output_layer_2 = DDitFinalLayer(  # extra layer for original edit flows for generating insert probs
-            config.model.hidden_size,
-            vocab_size,
-            config.model.cond_dim)
+        self.ins_adapter = nn.Sequential(
+            nn.Linear(config.model.hidden_size, config.model.hidden_size),
+            nn.GELU(),
+            nn.LayerNorm(config.model.hidden_size))
+        #
+        # self.output_layer_2 = DDitFinalLayer(  # extra layer for original edit flows for generating insert probs
+        #     config.model.hidden_size,
+        #     vocab_size,
+        #     config.model.cond_dim)
 
         self.scale_by_sigma = config.model.scale_by_sigma
 
@@ -385,18 +390,12 @@ class DITEditFlow(nn.Module, huggingface_hub.PyTorchModelHubMixin):
                 x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
 
             sub_logits = self.output_layer(x, c)  # bsz, seq_len, vocab
-            ins_logits = self.output_layer_2(x, c)  # bsz, seq_len, vocab
+
+            # shared vocab projection layer, but added MLP to allow for different insert probs
+            ins_logits = self.output_layer(self.ins_adapter(x), c)
+
+            # ins_logits = self.output_layer_2(x, c)  # bsz, seq_len, vocab
 
             rates = self.rate_layer(x)
-
-            # rates = F.softplus(
-            #     torch.clamp(self.rate_layer(x), max=1e6))  # (batch_size, x_seq_len, 3) - ensure positive rates
-            #
-            # if attention_mask is not None:
-            #     mask_expanded = attention_mask.unsqueeze(-1).bool()
-            #     rates = rates.masked_fill(mask_expanded, 0.0)
-            #     # Force padded logits to -Inf (so softmax=0)
-            #     sub_logits = sub_logits.masked_fill(mask_expanded, -1e9)
-            #     ins_logits = ins_logits.masked_fill(mask_expanded, -1e9)
 
         return rates, sub_logits, ins_logits
