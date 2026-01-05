@@ -777,6 +777,20 @@ def collate_edit_batch(batch, coupling, seq_align_fn, pad_token, vocab_size, gap
         n_slots = seq_len + 1
         ins_mask = torch.rand(n_slots) < del_prob
 
+        # ensure only a maximum number are allowed:
+            # Limit the number of insertions to prevent sequence explosion
+        max_allowed_ins = int(seq_len * del_prob) # Allow up to del_prob
+        if num_ins > max_allowed_ins:
+            # Randomly select a subset of insertion positions
+            ins_indices_flat = torch.nonzero(ins_mask).squeeze(1)
+            perm = torch.randperm(len(ins_indices_flat), device=_x0.device)
+            selected_ins_indices = ins_indices_flat[perm[:max_allowed_ins]]
+
+            ins_mask = torch.zeros_like(ins_mask, dtype=torch.bool)
+            ins_mask[selected_ins_indices] = True
+            num_ins = ins_mask.sum().item()
+
+
         if ins_mask.any() and t[i] > 0.8:
             num_ins = ins_mask.sum().item()
 
@@ -786,6 +800,7 @@ def collate_edit_batch(batch, coupling, seq_align_fn, pad_token, vocab_size, gap
 
             # Rejection sampling loop to ensure no Pad or Gap tokens are picked
             mask_invalid = (noise_tokens == pad_token) | (noise_tokens == gap_token_id)
+
             while mask_invalid.any():
                 # Resample only the invalid ones
                 num_invalid = mask_invalid.sum().item()
