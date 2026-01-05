@@ -752,7 +752,11 @@ def collate_edit_batch(batch, coupling, seq_align_fn, pad_token, vocab_size, gap
     x_1, x_0 = [], []
     z_1, z_0 = [], []
 
-    for _x1 in x1_list:
+
+    t = torch.rand(len(x1_list), 1)
+    t = torch.clamp(t, min=0.00, max=0.99)
+
+    for i, _x1 in enumerate(x1_list):
         # 1. Clean Inputs
         _x1 = _x1[_x1 != pad_token]
         _x1 = _x1.unsqueeze(0)
@@ -773,7 +777,7 @@ def collate_edit_batch(batch, coupling, seq_align_fn, pad_token, vocab_size, gap
         n_slots = seq_len + 1
         ins_mask = torch.rand(n_slots) < del_prob
 
-        if ins_mask.any():
+        if ins_mask.any() and t[i] > 0.8:
             num_ins = ins_mask.sum().item()
 
             # 1. Generate Noise for Source (The "Error" to delete)
@@ -845,8 +849,6 @@ def collate_edit_batch(batch, coupling, seq_align_fn, pad_token, vocab_size, gap
     z_1 = torch.stack([F.pad(x, (0, z_max_len - x.shape[0]), value=pad_token) for x in z_1], dim=0).long()
     z_0 = torch.stack([F.pad(x, (0, z_max_len - x.shape[0]), value=pad_token) for x in z_0], dim=0).long()
 
-    t = torch.rand(x_1.shape[0], 1)
-    t = torch.clamp(t, min=0.01, max=0.99)
 
     return x_0, x_1, z_0, z_1, t
 

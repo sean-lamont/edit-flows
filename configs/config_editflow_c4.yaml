@@ -66,7 +66,7 @@ wandb:
   #  notes: Mulan for text
   group: null
   job_type: null
-  offline: false
+  offline: true
   name: pef_time_dep_cnn
   tags:
     - ${data.train}
@@ -84,6 +84,7 @@ hydra:
 checkpointing:
 #  save_dir: '/home/sean/Documents/edit-flows/outputs/lm1b/2025.12.31/171732/'
 #  save_dir: "/home/sean/Documents/edit-flows/outputs/lm1b/2026.01.02/123509"
-  save_dir: ${cwd:}
+  save_dir: '/home/sean/Documents/edit-flows/outputs/c4_realnewslike/2026.01.03/185925/'
+#  save_dir: ${cwd:}
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt
