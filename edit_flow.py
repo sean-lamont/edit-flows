@@ -710,7 +710,7 @@ class EditFlow(EditFlowBase):
 
         default_h = 1 / n_steps
 
-        t_min = 0.01
+        t_min = 0.00
 
         t = t_min * torch.ones(batch_size_per_gpu, 1, device=self.device)
 
