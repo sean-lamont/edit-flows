@@ -34,9 +34,12 @@ class EditFlowBaseline(EditFlowBase):
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = self.rm_gap_tokens(z_t)
 
+        if not self.time_dependent:
+            t = torch.ones_like(t).to(self.device)
         u_t_logits, sub_vocab_logits, ins_vocab_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
         sched_coeff_z = self.get_sched_coeff(t)
+
 
         raw_sub = u_t_logits[:, :, 0]
         raw_ins = u_t_logits[:, :, 1]
