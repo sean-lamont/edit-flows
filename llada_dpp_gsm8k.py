@@ -52,7 +52,6 @@ else:
     print("Warning: Embedding matrix not found. 'embeddings' target will fail.")
 
 
-
 def apply_dpp_guidance(
         logits,
         alpha=3.0,
@@ -61,32 +60,30 @@ def apply_dpp_guidance(
         use_projection=True,
         kernel_target="logits",
         loss_type="diverseflow",
-        entropy_threshold=0.6  # NEW: Below this, we turn off the force field
+        entropy_threshold=0.6,  # Threshold: Below this, we turn off DPP
+        protected_tokens=[tokenizer.eos_token_id]   # List of IDs to ignore (EOS, Numbers)
 ):
     if logits.shape[0] < 2: return logits
 
-    # 1. Calculate Entropy (Uncertainty)
-    # Shape: [Batch, 1]
+    # 1. ENTROPY SHIELD (Confidence Check)
+    # Calculate entropy of the current step
     probs = torch.softmax(logits, dim=-1)
     log_probs = torch.log_softmax(logits, dim=-1)
     entropy = -torch.sum(probs * log_probs, dim=-1, keepdim=True)
 
-    # 2. Create the "Confidence Shield"
-    # If Entropy is high (uncertain), scale is 1.0.
-    # If Entropy is low (certain), scale drops to 0.0.
-    # We use a sigmoid to make it smooth, centered around the threshold.
-    # High steepness (10.0) makes it act like a soft switch.
-    alpha_scale = torch.sigmoid((entropy - entropy_threshold) * 10.0)
+    # Create a "Gate": 1.0 when uncertain, 0.0 when certain
+    # Steep sigmoid centered at threshold
+    gate = torch.sigmoid((entropy - entropy_threshold) * 10.0)
 
-    # If the whole batch is super confident (e.g., copying the prompt), skip entirely
-    if alpha_scale.mean() < 0.01:
+    # Optimization: If the whole batch is confident (e.g. copying prompt), skip
+    if gate.mean() < 0.05:
         return logits
 
     with torch.enable_grad():
         logits_in = logits.detach().clone().requires_grad_(True)
         probs_in = torch.softmax(logits_in, dim=-1)
 
-        # --- (Existing Feature/Kernel Logic) ---
+        # --- Kernel Logic (Same as before) ---
         if kernel_target == "embeddings" and EMBEDDING_MATRIX is not None:
             W = EMBEDDING_MATRIX.to(probs_in.device).detach()
             features = torch.matmul(probs_in, W)
@@ -94,18 +91,20 @@ def apply_dpp_guidance(
             features = probs_in
 
         if pooling_method == "max":
-            batch_vecs = features.max(dim=1).values
+            vecs = features.max(dim=1).values
         else:
-            batch_vecs = features.mean(dim=1)
+            vecs = features.mean(dim=1)
 
-        norm_vec = F.normalize(batch_vecs, p=2, dim=1)
+        norm_vec = F.normalize(vecs, p=2, dim=1)
         K = torch.mm(norm_vec, norm_vec.t())
 
-        max_conf = probs_in.max(dim=-1).values.mean(dim=1)
-        quality_matrix = torch.outer(max_conf, max_conf)
+        # --- Loss Logic ---
         identity = torch.eye(K.shape[0], device=K.device)
         jitter = 1e-4
 
+        # Quality weighting
+        max_conf = probs_in.max(dim=-1).values.mean(dim=1)
+        quality_matrix = torch.outer(max_conf, max_conf)
         L = K * (1 + quality_scale * quality_matrix)
 
         if loss_type == "diverseflow":
@@ -117,95 +116,29 @@ def apply_dpp_guidance(
 
         grad = torch.autograd.grad(loss, logits_in)[0]
 
-    # --- (Existing Projection Logic) ---
+    # 2. TOKEN PROTECTION (The "Number Shield")
+    # Zero out gradients for protected tokens (EOS, Numbers)
+    if protected_tokens is not None:
+        # We use index_fill_ to efficiently zero out columns
+        grad.index_fill_(2, torch.tensor(protected_tokens).to('cuda'), 0.0)
+
+    # 3. PROJECTION (The "Syntax Shield")
     g_norm = torch.norm(grad, p=2, dim=-1, keepdim=True)
     grad_safe = grad / (g_norm + 1e-8)
 
     if use_projection:
         u = logits.detach()
-        inner_prod = (grad_safe * u).sum(dim=-1, keepdim=True)
-        u_norm_sq = (u * u).sum(dim=-1, keepdim=True)
-        proj = (inner_prod / (u_norm_sq + 1e-8)) * u
+        inner = (grad_safe * u).sum(dim=-1, keepdim=True)
+        u_norm = (u * u).sum(dim=-1, keepdim=True)
+        proj = (inner / (u_norm + 1e-8)) * u
         grad_safe = grad_safe - proj
 
-    # 3. Apply the Confidence Shield
-    # We scale the gradient element-wise by the entropy factor.
-    # Low entropy samples get NO update.
-    effective_grad = grad_safe * alpha_scale
+    # 4. APPLY GATE
+    # Scale the gradient by the entropy gate
+    # Certain tokens get 0 force. Uncertain tokens get full force.
+    grad_final = grad_safe * gate
 
-    return logits - (alpha * effective_grad)
-
-
-# def apply_dpp_guidance(
-#         logits,
-#         alpha=3.0,
-#         quality_scale=1.0,
-#         pooling_method="mean",
-#         use_projection=True,
-#         kernel_target="logits",
-#         loss_type="diverseflow"  # 'volume' (Old) or 'diverseflow' (Correct)
-# ):
-#     if logits.shape[0] < 2: return logits
-#
-#     with torch.enable_grad():
-#         logits_in = logits.detach().clone().requires_grad_(True)
-#         probs = torch.softmax(logits_in, dim=-1)
-#
-#         # ... (Feature Extraction & Pooling same as before) ...
-#         if kernel_target == "embeddings" and EMBEDDING_MATRIX is not None:
-#             W = EMBEDDING_MATRIX.to(probs.device).detach()
-#             features = torch.matmul(probs, W)
-#         else:
-#             features = probs
-#
-#         if pooling_method == "max":
-#             batch_vecs = features.max(dim=1).values
-#         else:
-#             batch_vecs = features.mean(dim=1)
-#
-#         # Kernel Calculation
-#         norm_vec = F.normalize(batch_vecs, p=2, dim=1)
-#         K = torch.mm(norm_vec, norm_vec.t())
-#
-#         # Quality & Jitter
-#         max_conf = probs.max(dim=-1).values.mean(dim=1)
-#         quality_matrix = torch.outer(max_conf, max_conf)
-#         identity = torch.eye(K.shape[0], device=K.device)
-#         jitter = 1e-4  # Tiny jitter for stability
-#
-#         # The Kernel Matrix L
-#         L = K * (1 + quality_scale * quality_matrix)
-#
-#         # --- THE FIX: DIVERSEFLOW LOSS ---
-#         if loss_type == "diverseflow":
-#             # Maximize P(Batch) = det(L) / det(L+I)
-#             # Minimize Loss = - ( logdet(L) - logdet(L+I) )
-#
-#             # We add jitter to both for numerical safety
-#             term1 = torch.logdet(L + jitter * identity)
-#             term2 = torch.logdet(L + identity + jitter * identity)
-#             loss = -(term1 - term2)
-#         else:
-#             # Old "Volume Maximization"
-#             loss = -torch.logdet(L + jitter * identity)
-#
-#         grad = torch.autograd.grad(loss, logits_in)[0]
-#
-#
-#
-#     # ... (Projection & Update same as before) ...
-#     g_norm = torch.norm(grad, p=2, dim=-1, keepdim=True)
-#     grad_safe = grad / (g_norm + 1e-8)
-#
-#     if use_projection:
-#         u = logits.detach()
-#         inner_prod = (grad_safe * u).sum(dim=-1, keepdim=True)
-#         u_norm_sq = (u * u).sum(dim=-1, keepdim=True)
-#         proj = (inner_prod / (u_norm_sq + 1e-8)) * u
-#         grad_safe = grad_safe - proj
-#
-#     return logits - (alpha * grad_safe)
-#
+    return logits - (alpha * grad_final)
 
 # -----------------------------------------------------------------------------
 # 3. GENERATION FUNCTION
@@ -227,7 +160,9 @@ def generate_llada(
 
     # Simple Chat Template for GSM8K
     # GSM8K works best with explicit Chain-of-Thought triggers
-    formatted_prompt = f"Question: {prompt}\nLet's think step by step.\nAnswer:"
+    # formatted_prompt = f"Question: {prompt}\nLet's think step by step.\nAnswer:"
+    formatted_prompt = prompt
+
 
     messages = [{"role": "user", "content": formatted_prompt}]
     input_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
@@ -245,9 +180,7 @@ def generate_llada(
 
         curr_alpha = alpha * (1 - (step / steps))
 
-        if step < (steps * 0.3):
-            curr_alpha = alpha
-        else:
+        if step > (steps * 0.3):
             curr_alpha = 0.0  # Let the math converge naturally!
 
 
@@ -456,5 +389,56 @@ if __name__ == "__main__":
     # }
     ]
 
+    # PROMPT = "Describe the logic to prove that n*(n+1) is even. Do not use code."
+    # PROMPT = "Write a python function to check if a word is a palindrome"
+    # PROMPT = "Write a haiku about a robot realizing it is alive."
+    # PROMPT = "Explain what 'Time' is."
+    # PROMPT = "Explain a metaphor for how neural networks learn."
+    PROMPT = "Write a python program to train a neural network"
+
+    print(f"PROMPT: {PROMPT}\n")
+
+    # Define your experiments here
+    settings = [
+        {
+            "name": "Baseline (No DPP)",
+            "use_dpp": False,
+            "alpha": 0.0, "quality": 0.0, "pool": "mean", "proj": False, "target": "logits"
+        },
+        {
+            "name": "DPP (Logits, Alpha=3.0, No Projection)",
+            "use_dpp": True,
+            "alpha": 3.0, "quality": 1.0, "pool": "mean", "proj": False, "target": "logits"
+        },
+        {
+            "name": "DPP (Logits, Alpha=3.0, Projected)",
+            "use_dpp": True,
+            "alpha": 3.0, "quality": 1.0, "pool": "mean", "proj": True, "target": "logits"
+        },
+    ]
+
+    for cfg in settings:
+        print(f"--- {cfg['name']} ---")
+        start = time.time()
+
+        samples = generate_llada(
+            PROMPT,
+            batch_size=10,
+            steps=32,
+            use_dpp=cfg['use_dpp'],
+            alpha=cfg['alpha'],
+            quality=cfg['quality'],
+            pool=cfg['pool'],
+            proj=cfg['proj'],
+            target=cfg['target']
+        )
+
+        print(f"Time: {time.time() - start:.2f}s")
+        for i, s in enumerate(samples):
+            print(f"[{i + 1}] {s.strip().replace(chr(10), ' / ')}")
+        print("")
+
+
+
     # Run on 10 problems to start
-    run_gsm8k_benchmark(n_problems=300, configs=configs_to_test)
+    # run_gsm8k_benchmark(n_problems=300, configs=configs_to_test)
