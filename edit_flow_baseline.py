@@ -98,7 +98,6 @@ class EditFlowBaseline(EditFlowBase):
                 u_tot = r_ins.sum(dim=-1) + r_sub.sum(dim=-1) + r_del.sum(dim=-1)
 
             # Log Rates
-            # log_r_ins = F.logsigmoid(raw_ins)
             log_r_ins = torch.log(r_ins + 1e-9)
             log_r_sub = F.logsigmoid(raw_sub)
             log_r_del = F.logsigmoid(raw_del)
@@ -190,7 +189,6 @@ class EditFlowBaseline(EditFlowBase):
     def _sample(self, n_steps=None, eps=1e-5):
         """Generate samples from the model."""
         batch_size_per_gpu = self.config.loader.eval_batch_size
-        print (self.time_dependent)
 
         # Lightning auto-casting is not working in this method for some reason
         if n_steps is None:
@@ -207,9 +205,6 @@ class EditFlowBaseline(EditFlowBase):
         x_0 = torch.full((batch_size_per_gpu, 1), 101,
                          device=self.device).long()  # todo parameterise, currently BOS token
 
-        # x_0 = torch.empty((batch_size_per_gpu, 0),
-        #                   device=self.device).long()  # todo sample from coupling optionally given x1
-
         x_t = x_0.clone().to(self.device)
 
         x_pad_mask = (x_t == self.pad_token)  # Create padding mask for x_t
@@ -220,18 +215,17 @@ class EditFlowBaseline(EditFlowBase):
             # while t.max() <= 1:
                 u_t, sub_logits, ins_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
-                sub_probs = F.softmax(sub_logits, dim=-1)
-                ins_probs = F.softmax(ins_logits, dim=-1)
+                sub_probs = F.softmax(sub_logits.float(), dim=-1)
+                ins_probs = F.softmax(ins_logits.float(), dim=-1)
 
-                lambda_sub = u_t[:, :, 0]
-                lambda_ins = u_t[:, :, 1]
-                lambda_del = u_t[:, :, 2]
+                lambda_sub = u_t[:, :, 0].float()
+                lambda_ins = u_t[:, :, 1].float()
+                lambda_del = u_t[:, :, 2].float()
 
                 if not self.time_dependent:  # move logits to probabilities
                     lambda_sub = torch.sigmoid(lambda_sub)
-                    # lambda_ins = torch.sigmoid(lambda_ins)
-                    lambda_ins = F.softplus(torch.clamp(lambda_ins, max=1e6))
                     lambda_del = torch.sigmoid(lambda_del)
+                    lambda_ins = F.softplus(torch.clamp(lambda_ins, max=1e6))
                 else:
                     lambda_sub = F.softplus(torch.clamp(lambda_sub, max=1e6))
                     lambda_ins = F.softplus(torch.clamp(lambda_ins, max=1e6))
@@ -292,7 +286,6 @@ class EditFlowBaseline(EditFlowBase):
                 x_pad_mask = (x_t == self.pad_token)  # Update padding mask after operations
 
                 t = torch.where(t + adapt_h > 0.99, 0.99, t + adapt_h)
-                # t = t + adapt_h
                 # x_ts.append(x_t.clone())
                 pbar.update(1)
 

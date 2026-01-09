@@ -451,7 +451,7 @@ class EditFlowBase(L.LightningModule):
                 and self.config.eval.generate_samples):
 
             # steps = [1, 2, 4, 8, 16, 32, 64, 128, 1024]
-            steps = [2, 4, 8, 16, 32, 64, 128]
+            steps = [2, 4, 8, 16, 32, 64, 128, 1024]
             for step in steps:
                 self.sample_and_log(step)
 
@@ -744,8 +744,8 @@ class EditFlow(EditFlowBase):
                     lambda_del = torch.sigmoid(lambda_del)
                     lambda_ins = F.softplus(torch.clamp(lambda_ins, max=1e6))
                 else:
-                    lambda_ins = F.softplus(torch.clamp(lambda_ins, max=1e6))
                     lambda_sub = F.softplus(torch.clamp(lambda_sub, max=1e6))
+                    lambda_ins = F.softplus(torch.clamp(lambda_ins, max=1e6))
                     lambda_del = F.softplus(torch.clamp(lambda_del, max=1e6))
 
                 valid_token_mask = (~x_pad_mask)  # .float()

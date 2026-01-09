@@ -227,7 +227,7 @@ def _train(config, logger, tokenizer):
 
 
 @hydra.main(version_base=None, config_path='configs',
-            config_name='config_editflow_c4')
+            config_name='config_editflow_eval')
 def main(config):
     """Main entry point for training."""
     L.seed_everything(config.seed)

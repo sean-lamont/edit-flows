@@ -352,7 +352,6 @@ class DITEditFlow(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             nn.Linear(config.model.hidden_size, config.model.hidden_size),
             nn.SiLU(),
             nn.Linear(config.model.hidden_size, 3),
-            # Output 3 rates (insert, substitute, delete) as in original Edit Flows
         )
 
         self.output_layer = DDitFinalLayer(
@@ -363,7 +362,9 @@ class DITEditFlow(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         self.ins_adapter = nn.Sequential(
             nn.Linear(config.model.hidden_size, config.model.hidden_size),
             nn.GELU(),
-            nn.LayerNorm(config.model.hidden_size))
+            nn.Linear(config.model.hidden_size, config.model.hidden_size)
+            # nn.LayerNorm(config.model.hidden_size)
+        )
         #
         # self.output_layer_2 = DDitFinalLayer(  # extra layer for original edit flows for generating insert probs
         #     config.model.hidden_size,
