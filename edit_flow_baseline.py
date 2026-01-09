@@ -20,11 +20,20 @@ class EditFlowBaseline(EditFlowBase):
 
         self.time_conditioning = self.config.time_conditioning
 
+        self.ins_scheduler = CubicScheduler(a=3.0, b=0.0)
+
         # linear for unmasking (matches up with log linear sigma  = linear alpha with time from t = 1 to t = 0)
         self.default_scheduler = CubicScheduler(a=1.0, b=1.0)
 
-    def get_sched_coeff(self, t, eps=1e-9):
-        return (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))
+    def get_sched_coeff(self, t, z_0, z_1, z_t, eps=1e-9):
+        ins_coeff = (self.ins_scheduler.derivative(t) / (1 - self.ins_scheduler(t) + eps))
+        default_coeff = (self.default_scheduler.derivative(t) / (1 - self.default_scheduler(t) + eps))
+
+        z_ins_event = (z_0 == self.gap_token) & (z_1 != self.gap_token) & (z_0 != z_1)
+
+        sched_coeff = torch.where(z_ins_event, ins_coeff, default_coeff)
+
+        return sched_coeff
 
     def _compute_loss(self, batch):
         x_0, x_1, z_0, z_1, t = batch
@@ -38,8 +47,7 @@ class EditFlowBaseline(EditFlowBase):
             t = torch.ones_like(t).to(self.device)
         u_t_logits, sub_vocab_logits, ins_vocab_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
-        sched_coeff_z = self.get_sched_coeff(t)
-
+        sched_coeff_z = self.get_sched_coeff(t, z_0, z_1, z_t)
 
         raw_sub = u_t_logits[:, :, 0]
         raw_ins = u_t_logits[:, :, 1]
@@ -212,7 +220,7 @@ class EditFlowBaseline(EditFlowBase):
 
         with tqdm(desc="Euler Sampling") as pbar:
             for _ in range(n_steps + 1):
-            # while t.max() <= 1:
+                # while t.max() <= 1:
                 u_t, sub_logits, ins_logits = self.backbone.forward(x_t, t, x_pad_mask)
 
                 sub_probs = F.softmax(sub_logits.float(), dim=-1)
