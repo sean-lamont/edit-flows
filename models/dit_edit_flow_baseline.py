@@ -359,17 +359,17 @@ class DITEditFlow(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             vocab_size,
             config.model.cond_dim)
 
-        self.ins_adapter = nn.Sequential(
-            nn.Linear(config.model.hidden_size, config.model.hidden_size),
-            nn.GELU(),
-            nn.Linear(config.model.hidden_size, config.model.hidden_size)
-            # nn.LayerNorm(config.model.hidden_size)
-        )
+        # self.ins_adapter = nn.Sequential(
+        #     nn.Linear(config.model.hidden_size, config.model.hidden_size),
+        #     nn.GELU(),
+        #     nn.Linear(config.model.hidden_size, config.model.hidden_size)
+        #     # nn.LayerNorm(config.model.hidden_size)
+        # )
         #
-        # self.output_layer_2 = DDitFinalLayer(  # extra layer for original edit flows for generating insert probs
-        #     config.model.hidden_size,
-        #     vocab_size,
-        #     config.model.cond_dim)
+        self.output_layer_2 = DDitFinalLayer(  # extra layer for original edit flows for generating insert probs
+            config.model.hidden_size,
+            vocab_size,
+            config.model.cond_dim)
 
         self.scale_by_sigma = config.model.scale_by_sigma
 
@@ -393,9 +393,8 @@ class DITEditFlow(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             sub_logits = self.output_layer(x, c)  # bsz, seq_len, vocab
 
             # shared vocab projection layer, but added MLP to allow for different insert probs
-            ins_logits = self.output_layer(self.ins_adapter(x), c)
-
-            # ins_logits = self.output_layer_2(x, c)  # bsz, seq_len, vocab
+            # ins_logits = self.output_layer(self.ins_adapter(x), c)
+            ins_logits = self.output_layer_2(x, c)
 
             rates = self.rate_layer(x)
 

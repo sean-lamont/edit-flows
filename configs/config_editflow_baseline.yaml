@@ -2,7 +2,7 @@ defaults:
   - _self_
 #  - /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor]
   - /callbacks: [ checkpoint_monitor, learning_rate_monitor]
-  - /data: lm1b
+  - /data: c4
   - /model: small
   - /strategy: ddp
   - /noise: loglinear
@@ -18,7 +18,7 @@ rate_scaling: True
 
 
 loader:
-  global_batch_size: 64
+  global_batch_size: 48
   eval_global_batch_size: ${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**
   batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
@@ -28,7 +28,7 @@ loader:
 
 sampling:
   steps: 128
-  num_sample_batches: 1  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
+  num_sample_batches: 2  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
   num_sample_log: 64
 
 eval:
@@ -55,10 +55,10 @@ trainer:
   gradient_clip_val: 1.0
   precision: 'bf16-mixed'
   num_sanity_val_steps: 2
-  max_steps: 200_000
+  max_steps: 20_000
   log_every_n_steps: 10
   limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
-  limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
+  limit_val_batches: 0.1     # validate on full dataset, can be used to toggle quick run
   val_check_interval: 20_000
 
 wandb:
@@ -67,7 +67,7 @@ wandb:
   group: null
   job_type: null
 #  offline: true
-  name: ef_lm1b_new_arch
+  name: ef_c4_ins_sched_2_head
   tags:
     - ${data.train}
     - ${data.valid}
