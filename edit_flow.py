@@ -451,7 +451,7 @@ class EditFlowBase(L.LightningModule):
                 and self.config.eval.generate_samples):
 
             # steps = [1, 2, 4, 8, 16, 32, 64, 128, 1024]
-            steps = [2, 4, 8, 16, 32, 64, 128, 1024]
+            steps = [2, 4, 8, 16, 32, 64, 128]
             for step in steps:
                 self.sample_and_log(step)
 

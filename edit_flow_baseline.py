@@ -43,6 +43,10 @@ class EditFlowBaseline(EditFlowBase):
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = self.rm_gap_tokens(z_t)
 
+        print (f'non pads: {(~x_pad_mask).float().sum(dim=1).mean(), (~z_pad_mask).float().sum(dim=1).mean()}')
+        print (f'num gaps: {z_gap_mask.float().sum(dim=1).mean()}')
+
+
         if not self.time_dependent:
             t = torch.ones_like(t).to(self.device)
         u_t_logits, sub_vocab_logits, ins_vocab_logits = self.backbone.forward(x_t, t, x_pad_mask)
@@ -164,35 +168,42 @@ class EditFlowBaseline(EditFlowBase):
 
     def sample_zt(self, z_0, z_1, t):
         """
-        Samples z_t for Standard Edit Flows.
-        1. Interpolates directly between z_0 and z_1 using the default scheduler.
-        2. Injects 15% random noise into valid tokens.
-           (Falls back to original token if random generation hits Pad/Gap).
+        Samples z_t using the correct schedule for each transition type.
         """
         t = t.reshape(-1, 1)
-        probs_z1 = self.default_scheduler(t)
+
+        # 1. Calculate probabilities for both schedules
+        probs_default = self.default_scheduler(t)
+        probs_ins = self.ins_scheduler(t)
 
         B, L = z_0.shape
-        probs_z1 = probs_z1.expand(B, L)
+        probs_default = probs_default.expand(B, L)
+        probs_ins = probs_ins.expand(B, L)
 
+        # 2. Identify Insertion Events vs. Others
+        # Insertion: Start as GAP, End as Token
+        is_insertion = (z_0 == self.gap_token) & (z_1 != self.gap_token)
+
+        # 3. Select the correct probability for each token position
+        # If it's an insertion, use the aggressive schedule. Otherwise (Masking/Keeping), use default.
+        probs_z1 = torch.where(is_insertion, probs_ins, probs_default)
+
+        # 4. Sample z_t
         use_z1 = torch.rand(B, L, device=self.device) < probs_z1
         z_t = torch.where(use_z1, z_1, z_0)
 
+        # ... (Your existing noise injection logic remains here) ...
         is_valid_token = (z_t != self.gap_token) & (z_t != self.pad_token)
-
         noise_prob = 0.15
         noise_mask = (torch.rand_like(z_t, dtype=torch.float) < noise_prob) & is_valid_token
 
         if noise_mask.any():
             random_tokens = torch.randint(0, self.V, z_t.shape, device=self.device)
-
             invalid_random = (random_tokens == self.pad_token) | (random_tokens == self.gap_token)
             random_tokens = torch.where(invalid_random, z_t, random_tokens)
-
             z_t = torch.where(noise_mask, random_tokens, z_t)
 
         return z_t
-
     @torch.no_grad()
     def _sample(self, n_steps=None, eps=1e-5):
         """Generate samples from the model."""
