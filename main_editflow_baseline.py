@@ -225,7 +225,7 @@ def _eval(config, logger, tokenizer):
 
 
 @hydra.main(version_base=None, config_path='configs',
-            config_name='config_editflow_baseline_eval')
+            config_name='config_editflow_baseline')
 # config_name = 'config_editflow_baseline')
 
 def main(config):

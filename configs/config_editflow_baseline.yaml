@@ -23,7 +23,7 @@ loader:
   # Note: batch_size and eval_batch_size are **per machine**
   batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
   eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
-  num_workers: ${eval:"len(__import__('os').sched_getaffinity(0))"}
+  num_workers: 16 #${eval:"len(__import__('os').sched_getaffinity(0))"}
   pin_memory: True
 
 sampling:
@@ -67,12 +67,13 @@ wandb:
   group: null
   job_type: null
 #  offline: true
-  name: ef_c4_ins_sched_2_head
+  name: ef_onehead_uniform_c4
   tags:
     - ${data.train}
     - ${data.valid}
     - time_dependent:${time_dependent}
     - rate_scaling:${rate_scaling}
+    - 'uniform_noise'
 
 hydra:
   run:

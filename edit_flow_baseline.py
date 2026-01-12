@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 import models
 from edit_flow import EditFlowBase, stable_sigmoid_sum
-from flows import CubicScheduler
+from flows import CubicScheduler, UniformCoupling
 
 
 class EditFlowBaseline(EditFlowBase):
@@ -210,8 +210,14 @@ class EditFlowBaseline(EditFlowBase):
 
         t = t_min * torch.ones(batch_size_per_gpu, 1, device=self.device)
 
-        x_0 = torch.full((batch_size_per_gpu, 1), 101,
-                         device=self.device).long()  # todo parameterise, currently BOS token
+        x_0 = torch.full((batch_size_per_gpu, 1), 101,).long()  # todo parameterise, currently BOS token
+
+        # take uniform samples from vocab from length 1 to config.model
+        coupling = UniformCoupling(max_len=self.config.model.length, vocab_size=self.tokenizer.vocab_size,
+                                   pad_token=self.tokenizer.pad_token_id, min_len=1,
+                                   gap_token=3)
+
+        x_0 = coupling.sample(x_0)[0]
 
         x_t = x_0.clone().to(self.device)
 

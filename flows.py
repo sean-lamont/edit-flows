@@ -93,12 +93,14 @@ class UniformCoupling(Coupling):
         vocab_size: int = 128,
         mirror_len: bool = False,
         pad_token: int = 129,
+        gap_token: int = 3,
     ):
         self.min_len = min_len
         self.max_len = max_len
         self.vocab_size = vocab_size
         self.mirror_len = mirror_len
         self.pad_token = pad_token
+        self.gap_token = gap_token
 
     def sample(self, x1: Tensor):
         batch_size, _ = x1.shape
@@ -112,6 +114,14 @@ class UniformCoupling(Coupling):
             x0_pad_mask = torch.arange(x0_max_len, device=x1.device).expand(batch_size, -1) >= x0_seq_len.unsqueeze(1)
 
         x0 = torch.randint(0, self.vocab_size, size=(batch_size, x0_max_len), dtype=x1.dtype, device=x1.device)
+        # replace any pad or gap tokens with a random token, loop until done
+        invalid_tokens = (x0 == self.pad_token) | (x0 == self.gap_token) # Assuming self.gap_token is the gap token ID
+        while invalid_tokens.any():
+            num_invalid = invalid_tokens.sum().item()
+            x0[invalid_tokens] = torch.randint(0, self.vocab_size, size=(num_invalid,), dtype=x1.dtype, device=x1.device)
+            invalid_tokens = (x0 == self.pad_token) | (x0 == self.gap_token)
+
+
         x0[x0_pad_mask] = self.pad_token
         return x0, x1
 

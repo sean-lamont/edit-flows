@@ -19,7 +19,7 @@ import transformers
 
 import utils
 from flow_utils import opt_align_xs_to_zs
-from flows import EmptyCoupling
+from flows import EmptyCoupling, UniformCoupling
 
 os.environ["HF_HUB_ETAG_TIMEOUT"] = "300"
 os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "300"
@@ -984,8 +984,10 @@ def get_dataloaders(config, tokenizer, skip_train=False,
             # Validation sharding (optional, prevents evaluating duplicate data)
             valid_set = valid_set.shard(num_shards=world_size, index=rank)
 
-    # --- 3. DATALOADER SETUP ---
-    coupling = EmptyCoupling()
+    # coupling = EmptyCoupling()
+    coupling = UniformCoupling(max_len=config.model.length, vocab_size=tokenizer.vocab_size,
+                               pad_token=tokenizer.pad_token_id, min_len=1, gap_token=3)
+
     seq_align_fn = functools.partial(opt_align_xs_to_zs, gap_token=3)
 
     collate_fn = functools.partial(collate_edit_batch,
