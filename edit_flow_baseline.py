@@ -43,10 +43,6 @@ class EditFlowBaseline(EditFlowBase):
 
         x_t, x_pad_mask, z_gap_mask, z_pad_mask = self.rm_gap_tokens(z_t)
 
-        print (f'non pads: {(~x_pad_mask).float().sum(dim=1).mean(), (~z_pad_mask).float().sum(dim=1).mean()}')
-        print (f'num gaps: {z_gap_mask.float().sum(dim=1).mean()}')
-
-
         if not self.time_dependent:
             t = torch.ones_like(t).to(self.device)
         u_t_logits, sub_vocab_logits, ins_vocab_logits = self.backbone.forward(x_t, t, x_pad_mask)
