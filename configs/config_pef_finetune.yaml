@@ -1,0 +1,93 @@
+defaults:
+  - _self_
+  #- /callbacks: [ checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor ]
+  - /callbacks: [ checkpoint_every_n_steps, learning_rate_monitor ]
+  - /callbacks: [ learning_rate_monitor ]
+  - /data: autoformalization
+  - /model: small
+  - /strategy: ddp
+  - /noise: loglinear
+  - /lr_scheduler: constant_warmup
+
+mode: train  # train / ppl_eval / sample_eval
+time_conditioning: False
+
+time_dependent: True
+rate_scaling: True
+
+seed: 1
+
+loader:
+  global_batch_size: 16
+  eval_global_batch_size: ${.global_batch_size}
+  # Note: batch_size and eval_batch_size are **per machine**
+  batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
+  eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
+  num_workers: ${eval:"len(__import__('os').sched_getaffinity(0))"}
+  pin_memory: True
+
+sampling:
+  steps: 128
+  num_sample_batches: 1  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
+  num_sample_log: 16
+
+eval:
+  checkpoint_path: ''  # Used to evaluate a checkpoint after training.
+  compute_generative_perplexity: True
+  perplexity_batch_size: 4
+  compute_perplexity_on_sanity: True
+  gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
+  generate_samples: True
+
+optim:
+  weight_decay: 0
+  lr: 3e-4
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1e-8
+
+trainer:
+  _target_: lightning.Trainer
+  accelerator: cuda
+  num_nodes: 1
+  devices: ${device_count:}
+  accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
+  gradient_clip_val: 1.0
+  precision: 'bf16-mixed'
+  num_sanity_val_steps: 2
+  max_steps: 200_000 #1_000_000
+  log_every_n_steps: 10
+  limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
+  limit_val_batches: 1.0 #.5 #1.0     # validate on full dataset, can be used to toggle quick run
+#  val_check_interval: 500
+
+wandb:
+  project: text-diffusion
+  #  notes: Mulan for text
+  group: null
+  id: o16ara0y
+#  id: wcvdox74
+  job_type: null
+#  offline: true
+  name: pef_af_time_dep
+  tags:
+    - ${data.train}
+    - ${data.valid}
+    - time_dependent:${time_dependent}
+    - rate_scaling:${rate_scaling}
+#    - ${noise.type}
+
+hydra:
+  run:
+    dir: ./outputs/${data.train}/${now:%Y.%m.%d}/${now:%H%M%S}
+  job:
+    chdir: true
+
+checkpointing:
+  # Use custom `save_dir` if, e.g., saving to S3 bucket, otherwise leave this parameter as is
+#  save_dir: ${cwd:}
+  save_dir: '/workspace/edit-flows/outputs/autoformalization/2026.01.02/073155'
+  #  save_dir: '/workspace/edit-flows/outputs/autoformalization/2025.12.28/052111'
+  # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
+  resume_from_ckpt: true
+  resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt

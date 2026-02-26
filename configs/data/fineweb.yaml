@@ -1,0 +1,6 @@
+train: fineweb
+valid: fineweb
+tokenizer_name_or_path: bert-base-uncased
+cache_dir: /home/sean/Documents/edit-flows/data
+wrap: False
+streaming: True
